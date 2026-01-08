@@ -1,8 +1,17 @@
 # WordPress VPS管理平台 (Cloudways/SpinupWP替代方案)
 
-**wp-vps-manager** 是一个功能强大的WordPress VPS管理脚本，专门设计用来替代Cloudways和SpinupWP等付费服务。支持在单个Ubuntu服务器上部署和管理多个WordPress站点，每个站点可以使用不同的PHP版本。
+**wp-shell** 是一个功能强大的WordPress VPS管理脚本，专门设计用来替代Cloudways和SpinupWP等付费服务。支持在单个Ubuntu服务器上部署和管理多个WordPress站点，每个站点可以使用不同的PHP版本。
 
-**最新版本**: v7.0 | **更新日期**: 2026-01-08
+**GitHub仓库**: https://github.com/hwc0212/wp-shell  
+**最新版本**: v7.0 | **更新日期**: 2026-01-08  
+**作者**: [huwencai.com](https://huwencai.com)
+
+## 🔗 快速链接
+
+- **多站点管理脚本**: [wp-vps-manager.sh](https://github.com/hwc0212/wp-shell/blob/main/wp-vps-manager.sh)
+- **单站点极致性能脚本**: [deploy-single-wordpress.sh](https://github.com/hwc0212/wp-shell/blob/main/deploy-single-wordpress.sh)
+- **功能对比**: [查看下方对比表](#-替代方案对比)
+- **VPS配置要求**: [查看系统要求](#-系统要求)
 
 ## 🎯 替代方案对比
 
@@ -93,135 +102,80 @@
 - PHP 8.2/8.3/8.4 (根据需要)
 - Redis, Certbot, Fail2ban, UFW防火墙
 
-## 🚀 快速开始
+## 🚀 一键部署
 
-### 1. 下载脚本
+### 多站点管理版本
 ```bash
-# 多站点管理版本
-wget https://raw.githubusercontent.com/your-repo/wp-vps-manager/main/wp-vps-manager.sh
+wget https://raw.githubusercontent.com/hwc0212/wp-shell/main/wp-vps-manager.sh
 chmod +x wp-vps-manager.sh
-
-# 单站点极致性能版本
-wget https://raw.githubusercontent.com/your-repo/wp-vps-manager/main/deploy-single-wordpress.sh
-chmod +x deploy-single-wordpress.sh
-```
-
-### 2. 选择部署方式
-
-#### 多站点管理部署
-适合需要管理多个WordPress站点的用户：
-```bash
 sudo ./wp-vps-manager.sh
 ```
 
-**智能站点数量限制**：
-- 自动检测VPS配置并限制最大站点数
-- 高配置VPS：最多10个站点
-- 中等配置VPS：最多6个站点  
-- 标准配置VPS：最多3个站点
-- 基础配置VPS：最多2个站点
-- 低配置VPS：建议使用单站点版本
-
-#### 单站点极致性能部署
-适合只需要一个WordPress站点，追求极致性能的用户：
+### 单站点极致性能版本
 ```bash
+wget https://raw.githubusercontent.com/hwc0212/wp-shell/main/deploy-single-wordpress.sh
+chmod +x deploy-single-wordpress.sh
 sudo ./deploy-single-wordpress.sh
 ```
 
-**自动VPS配置检查**：
-- 检测VPS配置等级（高配置/中等配置/标准配置/小VPS/超小VPS）
-- 根据配置自动调整优化策略
-- 小VPS自动启用极限优化模式
-- WooCommerce智能建议和警告
+## 🎯 脚本选择指南
 
-### 3. 部署流程
+### 选择多站点版本的情况：
+- 需要管理多个WordPress站点
+- 代理商或多站点用户
+- 需要统一的管理界面
+- 替代Cloudways/SpinupWP服务
 
-**多站点版本**：
-1. VPS配置检查和站点数量限制
-2. 系统检查和初始化
-3. 收集站点信息（根据VPS配置限制数量）
-4. 自动安装所有必需软件
-5. 批量部署所有站点
+### 选择单站点版本的情况：
+- 只有一个WordPress站点
+- 追求极致性能和速度
+- 高流量网站或电商站点
+- VPS资源充足，希望全部用于单站点
+- 小VPS需要极限优化 (512MB-1GB内存)
 
-**单站点极致性能版本**：
-1. VPS配置检查和优化策略选择
-2. 系统检查和极致性能优化
-3. 收集单站点信息（含WooCommerce智能建议）
-4. VPS所有资源专用配置
-5. 极致性能WordPress部署
+## 📖 部署后管理
 
-### 4. 部署完成后管理
-
-**多站点管理命令**:
+### 多站点管理命令
 ```bash
 wp-vps-manager list        # 列出所有站点
 wp-vps-manager status      # 检查所有站点状态  
 wp-vps-manager backup-all  # 备份所有站点
 ```
 
-**单站点管理命令**:
+### 单站点管理命令
 ```bash
-manage-DOMAIN status       # 检查站点状态和性能信息
-manage-DOMAIN cache-clear  # 清除所有缓存（FastCGI+Redis+OPcache）
+manage-DOMAIN status       # 检查站点状态和性能
+manage-DOMAIN cache-clear  # 清除所有缓存
 manage-DOMAIN backup       # 创建站点备份
 manage-DOMAIN optimize     # 执行性能优化
 manage-DOMAIN monitor      # 实时监控
 ```
 
-## 📖 脚本选择指南
+## 🛠️ 常见问题
 
-### wp-vps-manager.sh - 多站点管理版
-**适用场景**：
-- 需要管理多个WordPress站点（1-10个）
-- 每个站点使用不同PHP版本
-- 需要统一的管理界面
-- 替代Cloudways/SpinupWP等服务
+### Q: 我的VPS配置很低，能用吗？
+A: 可以！脚本会自动检测VPS配置：
+- **512MB-1GB**: 建议使用单站点版本，启用极限优化
+- **2GB+**: 可以使用多站点版本，支持2-3个站点
+- **4GB+**: 完全支持多站点部署
 
-**特点**：
-- 支持多站点部署和管理
-- 每个站点独立配置
-- 完整的VPS管理功能
-- 适合代理商和多站点用户
+### Q: 如何选择PHP版本？
+A: 脚本支持PHP 8.2/8.3/8.4：
+- **PHP 8.4**: 最新版本，性能最佳，推荐新项目
+- **PHP 8.3**: 稳定版本，支持JIT编译器
+- **PHP 8.2**: 兼容性最好，适合老项目
 
-### deploy-single-wordpress.sh - 单站点极致性能版
-**适用场景**：
-- 只需要部署一个WordPress站点
-- 追求极致性能和速度
-- VPS所有资源专用于单个站点
-- 高流量网站或电商站点
+### Q: WooCommerce对VPS有什么要求？
+A: WooCommerce需要更多资源：
+- **最低**: 1GB内存
+- **推荐**: 2GB+内存
+- **小VPS**: 脚本会自动警告并提供优化建议
 
-**特点**：
-- VPS所有资源专用于单个站点
-- MariaDB使用70%内存，Redis使用15%内存
-- PHP-FPM动态进程池优化
-- 三重缓存：FastCGI + Redis + OPcache
-- PHP JIT编译器（PHP 8.3/8.4）
-- WooCommerce电商专用优化
-
-## 📖 命令行选项
-
-### 多站点管理版
-```bash
-sudo ./wp-vps-manager.sh [选项]
-
-选项:
-  无参数          交互式部署/管理模式
-  -l, --list      列出所有已配置的站点
-  -i, --import    检测并导入现有WordPress站点
-  -h, --help      显示帮助信息
-  -v, --version   显示版本信息
-```
-
-### 单站点极致性能版
-```bash
-sudo ./deploy-single-wordpress.sh
-
-功能:
-  - 自动检测系统资源并优化配置
-  - VPS所有资源专用于单个WordPress站点
-  - 极致性能优化配置
-  - 支持WooCommerce电商优化
-```
+### Q: 部署失败怎么办？
+A: 脚本有完整的错误处理：
+- 检查日志文件：`/var/log/wp-deploy-*.log`
+- 重新运行脚本会自动跳过已完成的步骤
+- 联系支持或查看GitHub Issues
 
 ## 🎛️ 管理功能
 
@@ -282,6 +236,35 @@ sudo ./deploy-single-wordpress.sh
 └── backups/                                   # 站点备份
 /usr/local/bin/manage-DOMAIN                   # 极致性能管理脚本
 ```
+
+## 🔧 性能优化详情
+
+### 小VPS专用优化 (deploy-single-wordpress.sh)
+
+#### 系统级优化
+- **内核参数调整**: 小VPS降低网络缓冲区大小 (65536→8192)
+- **文件句柄限制**: 小VPS从100万降低到10万
+- **服务禁用**: 禁用更多不必要的系统服务
+- **Swap配置**: 小VPS自动配置swap缓解内存压力
+
+#### 数据库优化 (MariaDB)
+- **内存分配**: 高配置70%，小VPS50%，超小VPS40%
+- **连接数**: 标准500，小VPS100，超小VPS50
+- **缓冲区优化**: 小VPS大幅降低各种缓冲区大小
+
+#### PHP优化
+- **内存限制**: 标准512M，小VPS256M，超小VPS128M
+- **进程池配置**: 根据VPS配置动态调整进程数和内存
+- **OPcache优化**: 标准1/4内存，小VPS1/6内存，超小VPS1/8内存
+
+#### Redis优化
+- **内存分配**: 标准15%，小VPS10%，超小VPS8%
+- **连接限制**: 标准10000，小VPS1000，超小VPS500
+
+#### WooCommerce智能警告
+- **超小VPS**: 强烈不建议安装，需要用户强制确认
+- **小VPS**: 给出详细使用建议和限制说明
+- **标准配置以上**: 正常支持，提供优化建议
 
 ## 🔧 故障排除
 
@@ -382,13 +365,14 @@ tail -f /var/www/your-domain.com/logs/nginx-error.log
 1. **查看文档**: 内置帮助 `sudo ./wp-vps-manager.sh --help`
 2. **检查日志**: 部署日志 `/var/log/wp-deploy-*.log`
 3. **运行诊断**: 语法检查 `bash -n wp-vps-manager.sh`
-4. **社区支持**: GitHub Issues 和讨论
+4. **GitHub支持**: [Issues](https://github.com/hwc0212/wp-shell/issues) 和 [Discussions](https://github.com/hwc0212/wp-shell/discussions)
 
 ### 报告问题
 提供以下信息：
 - Ubuntu版本: `lsb_release -a`
 - 错误日志内容
 - 操作步骤描述
+- 在 [GitHub Issues](https://github.com/hwc0212/wp-shell/issues) 中提交
 
 ## 📄 许可证
 
@@ -400,4 +384,6 @@ tail -f /var/www/your-domain.com/logs/nginx-error.log
 
 ---
 
+**作者**: [huwencai.com](https://huwencai.com)  
+**GitHub**: https://github.com/hwc0212/wp-shell  
 **注意**: 本脚本会修改系统配置，建议在测试环境中先行验证。使用前请确保已备份重要数据。
