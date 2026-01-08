@@ -6,7 +6,7 @@
 # ======================================================================
 # 脚本名称: wp-vps-manager
 # 版本: 7.0
-# 最后更新: 2025-01-07
+# 最后更新: 2026-01-08
 # 适用系统: Ubuntu 20.04/22.04/24.04
 # 核心目标: 完整的VPS和WordPress管理平台，替代Cloudways和SpinupWP
 # 功能特性: 多站点部署、PHP版本管理、VPS优化、现有站点导入、监控告警、自动备份
@@ -392,6 +392,18 @@ mark_complete() {
 check_system_compatibility() {
     log_message "INFO" "检查系统兼容性..."
     
+    # 检查最小内存要求
+    local total_mem=$(free -m | awk '/^Mem:/{print $2}')
+    if [[ $total_mem -lt 1024 ]]; then
+        log_message "WARNING" "系统内存不足1GB，可能影响性能"
+    fi
+    
+    # 检查磁盘空间
+    local available_space=$(df / | awk 'NR==2 {print $4}')
+    if [[ $available_space -lt 5242880 ]]; then  # 5GB in KB
+        log_message "WARNING" "根分区可用空间不足5GB，可能影响安装"
+    fi
+    
     # 检查必要的命令
     local required_commands=("curl" "wget" "tar" "gzip" "openssl")
     for cmd in "${required_commands[@]}"; do
@@ -405,6 +417,14 @@ check_system_compatibility() {
     if ! curl -s --connect-timeout 5 https://www.google.com > /dev/null; then
         log_message "WARNING" "网络连接可能有问题，请检查网络设置"
     fi
+    
+    # 检查端口占用
+    local ports=(80 443 3306 6379)
+    for port in "${ports[@]}"; do
+        if netstat -tuln | grep -q ":$port "; then
+            log_message "WARNING" "端口 $port 已被占用，可能影响服务启动"
+        fi
+    done
     
     log_message "SUCCESS" "系统兼容性检查完成"
 }
@@ -722,28 +742,40 @@ password=$root_password
 EOF
     chmod 600 /root/.my.cnf
     
+    # 动态优化配置
+    local total_mem=$(free -m | awk '/^Mem:/{print $2}')
+    local innodb_percent=50  # 多站点使用50%内存
+    local innodb_size_mb=$(( total_mem * innodb_percent / 100 ))
+    local innodb_size_gb=$(( innodb_size_mb / 1024 ))
+    [[ $innodb_size_gb -lt 1 ]] && innodb_size_gb=1
+    
     # 优化配置
-    cat > /etc/mysql/mariadb.conf.d/50-wordpress.cnf << 'MARIADBEOF'
+    cat > /etc/mysql/mariadb.conf.d/50-wordpress.cnf << EOF
 [mysqld]
-# WordPress优化配置
-max_connections = 200
-innodb_buffer_pool_size = 256M
-innodb_log_file_size = 64M
-innodb_flush_log_at_trx_commit = 2
-innodb_flush_method = O_DIRECT
-query_cache_type = 1
-query_cache_size = 32M
-query_cache_limit = 2M
-tmp_table_size = 32M
-max_heap_table_size = 32M
-
-# MariaDB特定优化
-innodb_buffer_pool_instances = 1
-innodb_read_io_threads = 4
-innodb_write_io_threads = 4
-innodb_thread_concurrency = 0
-innodb_flush_neighbors = 1
+# WordPress多站点优化配置
+max_connections = 300
+innodb_buffer_pool_size = ${innodb_size_gb}G
+innodb_log_file_size = 256M
 innodb_log_buffer_size = 16M
+innodb_flush_log_at_trx_commit = 1
+innodb_flush_method = O_DIRECT
+innodb_file_per_table = 1
+innodb_buffer_pool_instances = $(nproc)
+innodb_read_io_threads = $(nproc)
+innodb_write_io_threads = $(nproc)
+
+# 查询缓存（MariaDB 10.11+推荐关闭）
+query_cache_type = 0
+query_cache_size = 0
+
+# 临时表优化
+tmp_table_size = 128M
+max_heap_table_size = 128M
+
+# 连接优化
+thread_cache_size = 100
+table_open_cache = 4096
+table_definition_cache = 4096
 
 # 字符集设置
 character-set-server = utf8mb4
@@ -758,7 +790,11 @@ max_binlog_size = 100M
 slow_query_log = 1
 slow_query_log_file = /var/log/mysql/slow.log
 long_query_time = 2
-MARIADBEOF
+log_queries_not_using_indexes = 1
+
+# 错误日志
+log_error = /var/log/mysql/error.log
+EOF
     
     systemctl restart mariadb
     log_message "SUCCESS" "MariaDB配置完成"
@@ -822,6 +858,17 @@ http {
     access_log /var/log/nginx/access.log main;
     error_log /var/log/nginx/error.log;
     
+    # 文件缓存优化
+    open_file_cache max=200000 inactive=20s;
+    open_file_cache_valid 30s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;
+    
+    # FastCGI缓存全局配置
+    fastcgi_cache_path /var/cache/nginx/fastcgi levels=1:2 keys_zone=WORDPRESS:100m inactive=60m max_size=1g;
+    fastcgi_cache_key "$scheme$request_method$host$request_uri";
+    fastcgi_cache_use_stale error timeout invalid_header http_500 http_503;
+    
     include /etc/nginx/conf.d/*.conf;
     include /etc/nginx/sites-enabled/*;
 }
@@ -843,15 +890,74 @@ setup_redis() {
     # 生成Redis密码
     local redis_password=$(generate_password)
     
+    # 获取系统内存信息
+    local total_mem=$(free -m | awk '/^Mem:/{print $2}')
+    local redis_max_mem=$(( total_mem * 10 / 100 ))  # 多站点使用10%内存
+    [[ $redis_max_mem -lt 128 ]] && redis_max_mem=128
+    [[ $redis_max_mem -gt 1024 ]] && redis_max_mem=1024
+    
+    # 备份原配置
+    cp /etc/redis/redis.conf /etc/redis/redis.conf.backup
+    
     # 配置Redis
-    sed -i "s/# requirepass foobared/requirepass $redis_password/" /etc/redis/redis.conf
-    sed -i "s/# maxmemory <bytes>/maxmemory 256mb/" /etc/redis/redis.conf
-    sed -i "s/# maxmemory-policy noeviction/maxmemory-policy allkeys-lru/" /etc/redis/redis.conf
+    cat > /etc/redis/redis.conf << EOF
+# Redis多站点优化配置
+bind 127.0.0.1
+port 6379
+timeout 0
+tcp-keepalive 300
+tcp-backlog 511
+
+# 安全配置
+requirepass $redis_password
+
+# 内存配置
+maxmemory ${redis_max_mem}mb
+maxmemory-policy allkeys-lru
+
+# 持久化配置
+save 900 1
+save 300 10
+save 60 10000
+stop-writes-on-bgsave-error yes
+rdbcompression yes
+rdbchecksum yes
+dbfilename dump.rdb
+dir /var/lib/redis
+
+# AOF配置
+appendonly yes
+appendfilename "appendonly.aof"
+appendfsync everysec
+no-appendfsync-on-rewrite no
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# 性能优化
+hash-max-ziplist-entries 512
+hash-max-ziplist-value 64
+list-max-ziplist-size -2
+set-max-intset-entries 512
+zset-max-ziplist-entries 128
+zset-max-ziplist-value 64
+
+# 客户端配置
+maxclients 1000
+
+# 日志配置
+loglevel notice
+logfile /var/log/redis/redis-server.log
+EOF
+    
+    # 创建日志目录
+    mkdir -p /var/log/redis
+    chown redis:redis /var/log/redis
     
     systemctl restart redis-server
     
     # 保存Redis密码
     echo "REDIS_PASSWORD=\"$redis_password\"" > /root/.redis-password
+    chmod 600 /root/.redis-password
     
     log_message "SUCCESS" "Redis配置完成"
 }
@@ -1036,13 +1142,23 @@ server {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:/var/run/php/php$php_version-fpm.sock;
         
-        # FastCGI缓存
-        fastcgi_cache_path /var/www/$domain/cache/fastcgi levels=1:2 keys_zone=${domain}_cache:100m inactive=60m;
+        # FastCGI缓存设置
         fastcgi_cache ${domain}_cache;
-        fastcgi_cache_valid 200 60m;
+        fastcgi_cache_valid 200 301 302 1h;
+        fastcgi_cache_valid 404 1m;
         fastcgi_cache_bypass \$skip_cache;
         fastcgi_no_cache \$skip_cache;
+        fastcgi_cache_use_stale error timeout updating http_500 http_503;
         add_header X-FastCGI-Cache \$upstream_cache_status;
+        
+        # 连接优化
+        fastcgi_connect_timeout 60s;
+        fastcgi_send_timeout 180s;
+        fastcgi_read_timeout 180s;
+        fastcgi_buffer_size 128k;
+        fastcgi_buffers 4 256k;
+        fastcgi_busy_buffers_size 256k;
+        fastcgi_temp_file_write_size 256k;
     }
     
     # 静态文件缓存
@@ -1146,42 +1262,155 @@ install_wordpress() {
     
     log_message "TASK" "安装WordPress: $domain"
     
+    # 检查目录是否存在
+    if [[ ! -d "$wp_path" ]]; then
+        log_message "ERROR" "WordPress目录不存在: $wp_path"
+        return 1
+    fi
+    
     # 下载WordPress
     cd "/var/www/$domain"
-    sudo -u www-data wp core download --path="$wp_path"
+    if ! sudo -u www-data wp core download --path="$wp_path" --locale=en_US; then
+        log_message "ERROR" "WordPress下载失败"
+        return 1
+    fi
+    
+    # 检查下载是否成功
+    if [[ ! -f "$wp_path/wp-config-sample.php" ]]; then
+        log_message "ERROR" "WordPress下载失败，核心文件不存在"
+        return 1
+    fi
     
     # 加载数据库配置
+    if [[ ! -f "/var/www/$domain/.db-config" ]]; then
+        log_message "ERROR" "数据库配置文件不存在"
+        return 1
+    fi
+    
     source "/var/www/$domain/.db-config"
     
+    # 验证数据库连接
+    if ! mariadb -u "$DB_USER" -p"$DB_PASS" -e "SELECT 1;" "$DB_NAME" 2>/dev/null; then
+        log_message "ERROR" "数据库连接失败"
+        return 1
+    fi
+    
     # 创建wp-config.php
-    sudo -u www-data wp config create \
+    if ! sudo -u www-data wp config create \
         --path="$wp_path" \
         --dbname="$DB_NAME" \
         --dbuser="$DB_USER" \
         --dbpass="$DB_PASS" \
         --dbhost="localhost" \
-        --dbprefix="wp_"
+        --dbprefix="wp_" \
+        --extra-php << 'WPEOF'
+// 强制SSL
+define('FORCE_SSL_ADMIN', true);
+if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+    $_SERVER['HTTPS'] = 'on';
+}
+
+// 禁用文件编辑
+define('DISALLOW_FILE_EDIT', true);
+
+// 内存限制
+define('WP_MEMORY_LIMIT', '256M');
+define('WP_MAX_MEMORY_LIMIT', '512M');
+
+// Redis缓存配置
+define('WP_REDIS_HOST', '127.0.0.1');
+define('WP_REDIS_PORT', 6379);
+define('WP_REDIS_TIMEOUT', 1);
+define('WP_REDIS_READ_TIMEOUT', 1);
+
+// 自动保存优化
+define('AUTOSAVE_INTERVAL', 300);
+define('WP_POST_REVISIONS', 10);
+define('EMPTY_TRASH_DAYS', 30);
+
+// 调试设置
+define('WP_DEBUG', false);
+define('WP_DEBUG_LOG', true);
+define('WP_DEBUG_DISPLAY', false);
+define('SCRIPT_DEBUG', false);
+
+// 性能优化
+define('COMPRESS_CSS', true);
+define('COMPRESS_SCRIPTS', true);
+define('CONCATENATE_SCRIPTS', true);
+define('ENFORCE_GZIP', true);
+
+// 安全设置
+define('DISALLOW_UNFILTERED_HTML', true);
+define('FORCE_SSL_LOGIN', true);
+WPEOF
+    then
+        log_message "ERROR" "wp-config.php创建失败"
+        return 1
+    fi
+    
+    # 添加Redis密码配置
+    if [[ -f "/root/.redis-password" ]]; then
+        source "/root/.redis-password"
+        sudo -u www-data wp config set WP_REDIS_PASSWORD "$REDIS_PASSWORD" --path="$wp_path"
+    fi
+    
+    # 获取安全密钥
+    local secret_keys=$(curl -s https://api.wordpress.org/secret-key/1.1/salt/ 2>/dev/null || echo "")
+    
+    if [[ -n "$secret_keys" ]]; then
+        # 在配置文件中添加安全密钥
+        echo "$secret_keys" >> "$wp_path/wp-config.php"
+    else
+        log_message "WARNING" "无法获取安全密钥，使用本地生成"
+        # 本地生成安全密钥
+        for key in AUTH_KEY SECURE_AUTH_KEY LOGGED_IN_KEY NONCE_KEY AUTH_SALT SECURE_AUTH_SALT LOGGED_IN_SALT NONCE_SALT; do
+            local value=$(openssl rand -base64 48 | tr -d '\n')
+            echo "define('$key', '$value');" >> "$wp_path/wp-config.php"
+        done
+    fi
+    
+    # 生成管理员密码
+    local admin_password=$(generate_password)
     
     # 安装WordPress
-    sudo -u www-data wp core install \
+    if ! sudo -u www-data wp core install \
         --path="$wp_path" \
         --url="https://$domain" \
         --title="${SITE_TITLES[$site_index]}" \
         --admin_user="${SITE_ADMIN_USERS[$site_index]}" \
-        --admin_password="$(generate_password)" \
-        --admin_email="${SITE_ADMIN_EMAILS[$site_index]}"
+        --admin_password="$admin_password" \
+        --admin_email="${SITE_ADMIN_EMAILS[$site_index]}" \
+        --skip-email; then
+        log_message "ERROR" "WordPress安装失败"
+        return 1
+    fi
+    
+    # 设置固定链接
+    sudo -u www-data wp rewrite structure '/%postname%/' --hard --path="$wp_path"
+    
+    # 安装Redis缓存插件
+    if sudo -u www-data wp plugin install redis-cache --activate --path="$wp_path"; then
+        sudo -u www-data wp redis enable --path="$wp_path" || log_message "WARNING" "Redis缓存启用失败"
+    else
+        log_message "WARNING" "Redis缓存插件安装失败"
+    fi
     
     # 安装WooCommerce（如果需要）
     if [[ "${SITE_WOOCOMMERCE[$site_index]}" == "yes" ]]; then
-        sudo -u www-data wp plugin install woocommerce --activate --path="$wp_path"
+        if sudo -u www-data wp plugin install woocommerce --activate --path="$wp_path"; then
+            log_message "INFO" "WooCommerce插件已安装"
+        else
+            log_message "WARNING" "WooCommerce插件安装失败"
+        fi
     fi
     
-    # 安装推荐插件
-    sudo -u www-data wp plugin install redis-cache --activate --path="$wp_path"
-    sudo -u www-data wp plugin install wp-super-cache --path="$wp_path"
+    # 清理默认内容
+    sudo -u www-data wp post delete 1 2 3 --force --path="$wp_path" 2>/dev/null || true
+    sudo -u www-data wp plugin delete akismet hello --path="$wp_path" 2>/dev/null || true
     
     # 保存WordPress凭据
-    save_wordpress_credentials "$site_index"
+    save_wordpress_credentials "$site_index" "$admin_password"
     
     log_message "SUCCESS" "WordPress安装完成: $domain"
 }
@@ -1206,7 +1435,9 @@ setup_site_caching() {
     fi
     
     # 创建FastCGI缓存目录
+    mkdir -p "/var/cache/nginx/fastcgi"
     mkdir -p "/var/www/$domain/cache/fastcgi"
+    chown -R www-data:www-data "/var/cache/nginx/fastcgi"
     chown -R www-data:www-data "/var/www/$domain/cache"
 }
 
@@ -1225,13 +1456,18 @@ set_site_permissions() {
 
 save_wordpress_credentials() {
     local site_index="$1"
+    local admin_password="$2"
     local domain="${SITE_DOMAINS[$site_index]}"
-    
-    # 获取WordPress管理员密码
-    local wp_admin_pass=$(sudo -u www-data wp user get "${SITE_ADMIN_USERS[$site_index]}" --field=user_pass --path="/var/www/$domain/public")
     
     # 加载数据库配置
     source "/var/www/$domain/.db-config"
+    
+    # 加载Redis密码
+    local redis_password=""
+    if [[ -f "/root/.redis-password" ]]; then
+        source "/root/.redis-password"
+        redis_password="$REDIS_PASSWORD"
+    fi
     
     # 保存凭据
     cat > "/root/wordpress-credentials-$domain.txt" << EOF
@@ -1242,8 +1478,8 @@ save_wordpress_credentials() {
 === WordPress管理员 ===
 登录URL: https://$domain/wp-admin/
 用户名: ${SITE_ADMIN_USERS[$site_index]}
+密码: $admin_password
 邮箱: ${SITE_ADMIN_EMAILS[$site_index]}
-密码: [请使用忘记密码功能重置]
 
 === 数据库信息 ===
 数据库名: $DB_NAME
@@ -1251,11 +1487,15 @@ save_wordpress_credentials() {
 密码: $DB_PASS
 主机: localhost
 
+=== Redis缓存 ===
+Redis密码: $redis_password
+
 === 管理脚本 ===
 站点管理: manage-$domain
 状态检查: manage-$domain status
 缓存清理: manage-$domain cache-clear
 创建备份: manage-$domain backup
+更新WordPress: manage-$domain update
 
 === 重要文件路径 ===
 网站根目录: /var/www/$domain/public
@@ -1264,6 +1504,13 @@ Nginx配置: /etc/nginx/sites-available/$domain
 SSL证书: /etc/letsencrypt/live/$domain/
 日志目录: /var/www/$domain/logs
 备份目录: /var/www/$domain/backups
+
+=== 性能优化说明 ===
+1. FastCGI缓存: 页面级缓存，显著提升加载速度
+2. Redis缓存: 数据库查询缓存，减少数据库负载
+3. 使用 manage-$domain cache-clear 清除所有缓存
+
+保存时间: $(date)
 EOF
     
     chmod 600 "/root/wordpress-credentials-$domain.txt"
@@ -1338,20 +1585,29 @@ case "\$1" in
         echo -e "\${CYAN}清除所有缓存...\${NC}"
         
         # 清除FastCGI缓存
-        rm -rf "/var/www/\$DOMAIN/cache/fastcgi/*"
-        echo "FastCGI缓存已清除"
+        if [[ -d "/var/www/\$DOMAIN/cache/fastcgi" ]]; then
+            find "/var/www/\$DOMAIN/cache/fastcgi" -type f -delete 2>/dev/null || true
+            echo "FastCGI缓存已清除"
+        fi
+        
+        # 清除全局FastCGI缓存
+        if [[ -d "/var/cache/nginx/fastcgi" ]]; then
+            find "/var/cache/nginx/fastcgi" -type f -delete 2>/dev/null || true
+            echo "全局FastCGI缓存已清除"
+        fi
         
         # 清除Redis缓存
-        if [[ -n "\$REDIS_PASS" ]]; then
-            redis-cli -a "\$REDIS_PASS" FLUSHDB >/dev/null 2>&1
-            echo "Redis缓存已清除"
+        if [[ -n "\$REDIS_PASS" ]] && command -v redis-cli &> /dev/null; then
+            redis-cli -a "\$REDIS_PASS" FLUSHDB >/dev/null 2>&1 && echo "Redis缓存已清除" || echo "Redis缓存清除失败"
         fi
         
         # 清除WordPress缓存
         if [[ -f "\$WP_PATH/wp-config.php" ]]; then
-            sudo -u www-data wp cache flush --path="\$WP_PATH" 2>/dev/null
-            echo "WordPress缓存已清除"
+            sudo -u www-data wp cache flush --path="\$WP_PATH" 2>/dev/null && echo "WordPress缓存已清除" || echo "WordPress缓存清除失败"
         fi
+        
+        # 重启PHP-FPM以清除OPcache
+        systemctl reload "php\$PHP_VERSION-fpm" 2>/dev/null && echo "OPcache已清除" || echo "OPcache清除失败"
         
         echo -e "\${GREEN}所有缓存清除完成\${NC}"
         ;;
@@ -1489,10 +1745,20 @@ optimize_system_performance() {
             # 优化PHP-FPM配置
             local fpm_conf="/etc/php/$version/fpm/pool.d/www.conf"
             if [[ -f "$fpm_conf" ]]; then
-                sed -i 's/pm.max_children = .*/pm.max_children = 50/' "$fpm_conf"
-                sed -i 's/pm.start_servers = .*/pm.start_servers = 5/' "$fpm_conf"
-                sed -i 's/pm.min_spare_servers = .*/pm.min_spare_servers = 5/' "$fpm_conf"
-                sed -i 's/pm.max_spare_servers = .*/pm.max_spare_servers = 35/' "$fpm_conf"
+                # 动态计算进程数
+                local total_mem=$(free -m | awk '/^Mem:/{print $2}')
+                local max_children=$(( total_mem / 8 ))  # 每个进程约8MB
+                [[ $max_children -lt 10 ]] && max_children=10
+                [[ $max_children -gt 100 ]] && max_children=100
+                
+                local start_servers=$(( max_children / 4 ))
+                local min_spare=$(( max_children / 8 ))
+                local max_spare=$(( max_children / 2 ))
+                
+                sed -i "s/pm.max_children = .*/pm.max_children = $max_children/" "$fpm_conf"
+                sed -i "s/pm.start_servers = .*/pm.start_servers = $start_servers/" "$fpm_conf"
+                sed -i "s/pm.min_spare_servers = .*/pm.min_spare_servers = $min_spare/" "$fpm_conf"
+                sed -i "s/pm.max_spare_servers = .*/pm.max_spare_servers = $max_spare/" "$fpm_conf"
                 
                 systemctl restart "php$version-fpm"
             fi
@@ -1505,13 +1771,22 @@ optimize_system_performance() {
                 sed -i 's/upload_max_filesize = .*/upload_max_filesize = 64M/' "$php_ini"
                 sed -i 's/post_max_size = .*/post_max_size = 64M/' "$php_ini"
                 
-                # 启用OPcache
-                echo "opcache.enable=1" >> "$php_ini"
-                echo "opcache.memory_consumption=128" >> "$php_ini"
-                echo "opcache.interned_strings_buffer=8" >> "$php_ini"
-                echo "opcache.max_accelerated_files=4000" >> "$php_ini"
-                echo "opcache.revalidate_freq=2" >> "$php_ini"
-                echo "opcache.fast_shutdown=1" >> "$php_ini"
+                # 优化OPcache配置
+                local opcache_conf="/etc/php/$version/fpm/conf.d/10-opcache.ini"
+                if [[ ! -f "$opcache_conf" ]]; then
+                    cat > "$opcache_conf" << EOF
+zend_extension=opcache.so
+opcache.enable=1
+opcache.memory_consumption=128
+opcache.interned_strings_buffer=16
+opcache.max_accelerated_files=10000
+opcache.revalidate_freq=2
+opcache.fast_shutdown=1
+opcache.enable_cli=1
+opcache.save_comments=1
+opcache.validate_timestamps=1
+EOF
+                fi
             fi
         fi
     done
@@ -1730,6 +2005,507 @@ show_help() {
     echo "  ✓ 企业级性能优化"
 }
 
+# --- 添加新站点 ---
+add_new_site() {
+    echo -e "\n${CYAN}=== 添加新WordPress站点 ===${NC}\n"
+    
+    # 收集新站点信息
+    local new_site_index=$((SITE_COUNT + 1))
+    
+    # 域名
+    while true; do
+        read -rp "请输入新站点的域名: " domain
+        if [[ "$domain" =~ ^[a-zA-Z0-9]+([-.]?[a-zA-Z0-9]+)*\.[a-zA-Z]{2,}$ ]]; then
+            SITE_DOMAINS[$new_site_index]="$domain"
+            break
+        else
+            echo -e "${RED}[错误]${NC} 域名格式不正确，请重新输入"
+        fi
+    done
+    
+    # PHP版本选择
+    echo "请选择PHP版本:"
+    for j in "${!AVAILABLE_PHP_VERSIONS[@]}"; do
+        echo "$((j+1))) PHP ${AVAILABLE_PHP_VERSIONS[j]}"
+    done
+    
+    while true; do
+        read -rp "请选择 [1-${#AVAILABLE_PHP_VERSIONS[@]}]: " php_choice
+        if [[ "$php_choice" =~ ^[0-9]+$ ]] && 
+           [[ "$php_choice" -ge 1 ]] && 
+           [[ "$php_choice" -le "${#AVAILABLE_PHP_VERSIONS[@]}" ]]; then
+            SITE_PHP_VERSIONS[$new_site_index]="${AVAILABLE_PHP_VERSIONS[$((php_choice-1))]}"
+            break
+        else
+            echo -e "${RED}[错误]${NC} 请选择有效的PHP版本"
+        fi
+    done
+    
+    # 管理员信息
+    read -rp "请输入管理员邮箱: " admin_email
+    SITE_ADMIN_EMAILS[$new_site_index]="$admin_email"
+    
+    read -rp "请输入管理员用户名 (默认: admin): " admin_user
+    SITE_ADMIN_USERS[$new_site_index]="${admin_user:-admin}"
+    
+    read -rp "请输入站点标题 (默认: ${SITE_DOMAINS[$new_site_index]}): " site_title
+    SITE_TITLES[$new_site_index]="${site_title:-${SITE_DOMAINS[$new_site_index]}}"
+    
+    # WooCommerce
+    read -rp "是否安装WooCommerce? (y/n): " install_woo
+    if [[ "$install_woo" =~ ^[Yy]$ ]]; then
+        SITE_WOOCOMMERCE[$new_site_index]="yes"
+    else
+        SITE_WOOCOMMERCE[$new_site_index]="no"
+    fi
+    
+    # 更新站点计数
+    SITE_COUNT=$new_site_index
+    
+    # 保存配置
+    save_sites_config
+    
+    # 部署新站点
+    deploy_single_site "$new_site_index"
+    
+    log_message "SUCCESS" "新站点添加完成: ${SITE_DOMAINS[$new_site_index]}"
+}
+
+# --- 实时监控 ---
+realtime_monitor() {
+    echo -e "\n${CYAN}=== 实时监控面板 ===${NC}\n"
+    echo "按Ctrl+C退出监控..."
+    echo ""
+    
+    while true; do
+        clear
+        echo -e "${CYAN}=== WordPress VPS实时监控 ===${NC}"
+        echo "更新时间: $(date)"
+        echo ""
+        
+        # 系统负载
+        echo -e "${BLUE}系统负载:${NC}"
+        uptime
+        echo ""
+        
+        # 内存使用
+        echo -e "${BLUE}内存使用:${NC}"
+        free -h
+        echo ""
+        
+        # 磁盘使用
+        echo -e "${BLUE}磁盘使用:${NC}"
+        df -h / | head -2
+        echo ""
+        
+        # 服务状态
+        echo -e "${BLUE}服务状态:${NC}"
+        local services=("nginx" "mariadb" "redis-server")
+        for service in "${services[@]}"; do
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                echo -e "$service: ${GREEN}运行中${NC}"
+            else
+                echo -e "$service: ${RED}未运行${NC}"
+            fi
+        done
+        echo ""
+        
+        # 网络连接
+        echo -e "${BLUE}网络连接:${NC}"
+        echo "HTTP连接: $(netstat -ant | grep :80 | wc -l)"
+        echo "HTTPS连接: $(netstat -ant | grep :443 | wc -l)"
+        echo ""
+        
+        sleep 5
+    done
+}
+
+# --- 访问日志分析 ---
+analyze_access_logs() {
+    echo -e "\n${CYAN}=== 访问日志分析 ===${NC}\n"
+    
+    if [[ $SITE_COUNT -eq 0 ]]; then
+        echo -e "${YELLOW}没有配置的站点${NC}"
+        return
+    fi
+    
+    echo "选择要分析的站点:"
+    for i in $(seq 1 $SITE_COUNT); do
+        echo "$i) ${SITE_DOMAINS[$i]}"
+    done
+    
+    read -rp "请选择站点 [1-$SITE_COUNT]: " site_choice
+    
+    if [[ "$site_choice" =~ ^[0-9]+$ ]] && 
+       [[ "$site_choice" -ge 1 ]] && 
+       [[ "$site_choice" -le "$SITE_COUNT" ]]; then
+        
+        local domain="${SITE_DOMAINS[$site_choice]}"
+        local log_file="/var/www/$domain/logs/nginx-access.log"
+        
+        if [[ -f "$log_file" ]]; then
+            echo -e "\n${BLUE}=== $domain 访问日志分析 ===${NC}\n"
+            
+            echo "最近访问记录 (最后10条):"
+            tail -10 "$log_file"
+            echo ""
+            
+            echo "访问量统计:"
+            echo "今日访问: $(grep "$(date '+%d/%b/%Y')" "$log_file" | wc -l)"
+            echo "总访问量: $(wc -l < "$log_file")"
+            echo ""
+            
+            echo "热门页面 (前10):"
+            awk '{print $7}' "$log_file" | sort | uniq -c | sort -nr | head -10
+            echo ""
+            
+            echo "访问IP统计 (前10):"
+            awk '{print $1}' "$log_file" | sort | uniq -c | sort -nr | head -10
+        else
+            echo -e "${RED}日志文件不存在: $log_file${NC}"
+        fi
+    else
+        echo -e "${RED}无效选择${NC}"
+    fi
+}
+
+# --- 性能分析 ---
+performance_analysis() {
+    echo -e "\n${CYAN}=== 性能分析报告 ===${NC}\n"
+    
+    # 系统性能
+    echo -e "${BLUE}系统性能:${NC}"
+    echo "CPU核心数: $(nproc)"
+    echo "内存总量: $(free -h | awk '/^Mem:/ {print $2}')"
+    echo "当前负载: $(uptime | awk -F'load average:' '{print $2}')"
+    echo ""
+    
+    # 服务性能
+    echo -e "${BLUE}服务性能:${NC}"
+    
+    # Nginx性能
+    if systemctl is-active --quiet nginx; then
+        echo "Nginx连接数: $(netstat -ant | grep :80 | wc -l) (HTTP) + $(netstat -ant | grep :443 | wc -l) (HTTPS)"
+    fi
+    
+    # MariaDB性能
+    if systemctl is-active --quiet mariadb; then
+        local db_connections=$(mariadb -e "SHOW STATUS LIKE 'Threads_connected';" | tail -1 | awk '{print $2}')
+        echo "MariaDB连接数: $db_connections"
+    fi
+    
+    # Redis性能
+    if systemctl is-active --quiet redis-server; then
+        local redis_memory=$(redis-cli info memory 2>/dev/null | grep used_memory_human | cut -d: -f2 | tr -d '\r' || echo "N/A")
+        echo "Redis内存使用: $redis_memory"
+    fi
+    echo ""
+    
+    # 缓存性能
+    echo -e "${BLUE}缓存性能:${NC}"
+    for i in $(seq 1 $SITE_COUNT); do
+        local domain="${SITE_DOMAINS[$i]}"
+        if [[ -d "/var/www/$domain/cache/fastcgi" ]]; then
+            local cache_files=$(find "/var/www/$domain/cache/fastcgi" -type f | wc -l)
+            local cache_size=$(du -sh "/var/www/$domain/cache/fastcgi" 2>/dev/null | cut -f1)
+            echo "$domain FastCGI缓存: $cache_files 文件, $cache_size"
+        fi
+    done
+}
+
+# --- 安全扫描 ---
+security_scan() {
+    echo -e "\n${CYAN}=== 安全扫描 ===${NC}\n"
+    
+    # 检查防火墙状态
+    echo -e "${BLUE}防火墙状态:${NC}"
+    if systemctl is-active --quiet ufw; then
+        echo "UFW防火墙: 运行中"
+        ufw status | head -10
+    else
+        echo -e "${RED}UFW防火墙: 未运行${NC}"
+    fi
+    echo ""
+    
+    # 检查Fail2ban状态
+    echo -e "${BLUE}Fail2ban状态:${NC}"
+    if systemctl is-active --quiet fail2ban; then
+        echo "Fail2ban: 运行中"
+        fail2ban-client status 2>/dev/null | head -5
+    else
+        echo -e "${RED}Fail2ban: 未运行${NC}"
+    fi
+    echo ""
+    
+    # 检查SSL证书
+    echo -e "${BLUE}SSL证书状态:${NC}"
+    for i in $(seq 1 $SITE_COUNT); do
+        local domain="${SITE_DOMAINS[$i]}"
+        if [[ -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]]; then
+            local expiry=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$domain/fullchain.pem" | cut -d= -f2)
+            echo "$domain: 有效，到期时间 $expiry"
+        else
+            echo -e "$domain: ${RED}无SSL证书${NC}"
+        fi
+    done
+    echo ""
+    
+    # 检查文件权限
+    echo -e "${BLUE}文件权限检查:${NC}"
+    for i in $(seq 1 $SITE_COUNT); do
+        local domain="${SITE_DOMAINS[$i]}"
+        local wp_config="/var/www/$domain/public/wp-config.php"
+        if [[ -f "$wp_config" ]]; then
+            local perms=$(stat -c "%a" "$wp_config")
+            if [[ "$perms" == "600" ]] || [[ "$perms" == "640" ]]; then
+                echo "$domain wp-config.php: 权限正常 ($perms)"
+            else
+                echo -e "$domain wp-config.php: ${YELLOW}权限异常 ($perms)${NC}"
+            fi
+        fi
+    done
+}
+
+# --- 自动备份设置 ---
+setup_auto_backup() {
+    echo -e "\n${CYAN}=== 自动备份设置 ===${NC}\n"
+    
+    echo "选择备份频率:"
+    echo "1) 每日备份"
+    echo "2) 每周备份"
+    echo "3) 每月备份"
+    echo "4) 自定义"
+    
+    read -rp "请选择 [1-4]: " backup_choice
+    
+    local cron_schedule=""
+    case "$backup_choice" in
+        1) cron_schedule="0 2 * * *" ;;
+        2) cron_schedule="0 2 * * 0" ;;
+        3) cron_schedule="0 2 1 * *" ;;
+        4) 
+            read -rp "请输入cron表达式 (如: 0 2 * * *): " cron_schedule
+            ;;
+        *)
+            echo -e "${RED}无效选择${NC}"
+            return
+            ;;
+    esac
+    
+    # 创建备份脚本
+    cat > /usr/local/bin/wp-auto-backup << 'BACKUPEOF'
+#!/bin/bash
+
+# WordPress自动备份脚本
+SITES_CONFIG="$HOME/.vps-manager/wordpress-sites.conf"
+
+if [[ -f "$SITES_CONFIG" ]]; then
+    source "$SITES_CONFIG"
+else
+    echo "未找到站点配置文件"
+    exit 1
+fi
+
+for i in $(seq 1 $SITE_COUNT); do
+    domain="${SITE_DOMAINS[$i]}"
+    echo "备份站点: $domain"
+    manage-$domain backup
+done
+
+echo "所有站点备份完成: $(date)"
+BACKUPEOF
+    
+    chmod +x /usr/local/bin/wp-auto-backup
+    
+    # 添加到crontab
+    (crontab -l 2>/dev/null; echo "$cron_schedule /usr/local/bin/wp-auto-backup >> /var/log/wp-auto-backup.log 2>&1") | crontab -
+    
+    echo -e "${GREEN}自动备份设置完成${NC}"
+    echo "备份计划: $cron_schedule"
+    echo "备份脚本: /usr/local/bin/wp-auto-backup"
+    echo "备份日志: /var/log/wp-auto-backup.log"
+}
+
+# --- 备份恢复菜单 ---
+backup_restore_menu() {
+    echo -e "\n${CYAN}=== 备份和恢复管理 ===${NC}\n"
+    
+    echo "1) 立即备份所有站点"
+    echo "2) 备份指定站点"
+    echo "3) 恢复站点"
+    echo "4) 查看备份列表"
+    echo "0) 返回主菜单"
+    
+    read -rp "请选择 [0-4]: " backup_choice
+    
+    case "$backup_choice" in
+        1)
+            echo "开始备份所有站点..."
+            wp-vps-manager backup-all
+            ;;
+        2)
+            if [[ $SITE_COUNT -eq 0 ]]; then
+                echo -e "${YELLOW}没有配置的站点${NC}"
+                return
+            fi
+            
+            echo "选择要备份的站点:"
+            for i in $(seq 1 $SITE_COUNT); do
+                echo "$i) ${SITE_DOMAINS[$i]}"
+            done
+            
+            read -rp "请选择站点 [1-$SITE_COUNT]: " site_choice
+            
+            if [[ "$site_choice" =~ ^[0-9]+$ ]] && 
+               [[ "$site_choice" -ge 1 ]] && 
+               [[ "$site_choice" -le "$SITE_COUNT" ]]; then
+                local domain="${SITE_DOMAINS[$site_choice]}"
+                manage-$domain backup
+            else
+                echo -e "${RED}无效选择${NC}"
+            fi
+            ;;
+        3)
+            echo -e "${YELLOW}恢复功能正在开发中...${NC}"
+            ;;
+        4)
+            echo -e "${BLUE}备份文件列表:${NC}"
+            for i in $(seq 1 $SITE_COUNT); do
+                local domain="${SITE_DOMAINS[$i]}"
+                local backup_dir="/var/www/$domain/backups"
+                if [[ -d "$backup_dir" ]]; then
+                    echo ""
+                    echo "$domain 备份文件:"
+                    ls -lah "$backup_dir" | tail -n +2
+                fi
+            done
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}无效选择${NC}"
+            ;;
+    esac
+}
+
+# --- 防火墙管理 ---
+manage_firewall() {
+    echo -e "\n${CYAN}=== 防火墙管理 ===${NC}\n"
+    
+    echo "1) 查看防火墙状态"
+    echo "2) 添加允许规则"
+    echo "3) 删除规则"
+    echo "4) 重置防火墙"
+    echo "0) 返回主菜单"
+    
+    read -rp "请选择 [0-4]: " fw_choice
+    
+    case "$fw_choice" in
+        1)
+            ufw status verbose
+            ;;
+        2)
+            read -rp "请输入要允许的端口或服务: " allow_rule
+            ufw allow "$allow_rule"
+            ;;
+        3)
+            ufw status numbered
+            read -rp "请输入要删除的规则编号: " rule_num
+            ufw delete "$rule_num"
+            ;;
+        4)
+            read -rp "确认重置防火墙? (y/n): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                setup_firewall
+            fi
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}无效选择${NC}"
+            ;;
+    esac
+}
+
+# --- 系统更新 ---
+system_update() {
+    echo -e "\n${CYAN}=== 系统更新 ===${NC}\n"
+    
+    echo "1) 更新软件包列表"
+    echo "2) 升级所有软件包"
+    echo "3) 升级系统"
+    echo "4) 清理软件包缓存"
+    echo "0) 返回主菜单"
+    
+    read -rp "请选择 [0-4]: " update_choice
+    
+    case "$update_choice" in
+        1)
+            apt update
+            ;;
+        2)
+            apt update && apt upgrade -y
+            ;;
+        3)
+            apt update && apt full-upgrade -y
+            ;;
+        4)
+            apt autoremove -y && apt autoclean
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}无效选择${NC}"
+            ;;
+    esac
+}
+
+# --- 查看系统日志 ---
+view_system_logs() {
+    echo -e "\n${CYAN}=== 系统日志查看 ===${NC}\n"
+    
+    echo "1) Nginx错误日志"
+    echo "2) PHP错误日志"
+    echo "3) MariaDB错误日志"
+    echo "4) 系统日志"
+    echo "5) Fail2ban日志"
+    echo "0) 返回主菜单"
+    
+    read -rp "请选择 [0-5]: " log_choice
+    
+    case "$log_choice" in
+        1)
+            tail -50 /var/log/nginx/error.log
+            ;;
+        2)
+            if [[ $SITE_COUNT -gt 0 ]]; then
+                local php_version="${SITE_PHP_VERSIONS[1]}"
+                tail -50 "/var/log/php$php_version-fpm-error.log" 2>/dev/null || echo "PHP错误日志不存在"
+            else
+                echo "没有配置的站点"
+            fi
+            ;;
+        3)
+            tail -50 /var/log/mysql/error.log 2>/dev/null || echo "MariaDB错误日志不存在"
+            ;;
+        4)
+            journalctl -n 50 --no-pager
+            ;;
+        5)
+            tail -50 /var/log/fail2ban.log 2>/dev/null || echo "Fail2ban日志不存在"
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}无效选择${NC}"
+            ;;
+    esac
+}
+
 # --- 主程序 ---
 main() {
     init_script
@@ -1753,10 +2529,57 @@ main() {
             
             deploy_new_server
             ;;
+        "add-site")
+            add_new_site
+            ;;
+        "import-existing")
+            detect_existing_sites
+            ;;
+        "realtime-monitor")
+            realtime_monitor
+            ;;
+        "logs")
+            analyze_access_logs
+            ;;
+        "performance-report")
+            performance_analysis
+            ;;
+        "security-scan")
+            security_scan
+            ;;
+        "auto-backup")
+            setup_auto_backup
+            ;;
+        "backup-migrate")
+            backup_restore_menu
+            ;;
+        "optimize")
+            optimize_system_performance
+            ;;
+        "firewall-manage")
+            manage_firewall
+            ;;
+        "system-update")
+            system_update
+            ;;
+        "system-logs")
+            view_system_logs
+            ;;
         *)
-            echo -e "${YELLOW}[提示]${NC} 其他功能正在开发中..."
-            echo -e "当前版本主要支持新服务器部署功能"
-            echo -e "更多功能将在后续版本中添加"
+            echo -e "${YELLOW}[提示]${NC} 功能正在开发中..."
+            echo -e "当前版本支持的功能:"
+            echo -e "- 新服务器部署"
+            echo -e "- 添加新站点"
+            echo -e "- 导入现有站点"
+            echo -e "- 实时监控"
+            echo -e "- 日志分析"
+            echo -e "- 性能分析"
+            echo -e "- 安全扫描"
+            echo -e "- 自动备份设置"
+            echo -e "- 备份恢复"
+            echo -e "- 系统优化"
+            echo -e "- 防火墙管理"
+            echo -e "- 系统更新"
             ;;
     esac
 }
