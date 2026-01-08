@@ -28,6 +28,13 @@ MARIADB_VERSION="10.11"
 USE_WOOCOMMERCE="no"
 AVAILABLE_PHP_VERSIONS=("8.2" "8.3" "8.4")
 
+# --- VPS配置变量 ---
+VPS_TIER=""
+OPTIMIZATION_LEVEL=""
+VPS_MEMORY=0
+VPS_CORES=0
+VPS_STORAGE=0
+
 # --- 站点配置变量 ---
 DOMAIN=""
 PRIMARY_DOMAIN=""
@@ -72,6 +79,9 @@ init_script() {
     touch "$LOG_FILE"
     exec > >(tee -a "$LOG_FILE")
     exec 2> >(tee -a "$LOG_FILE" >&2)
+    
+    # 检查VPS配置要求
+    check_vps_requirements
 }
 
 # --- 日志函数 ---
@@ -104,6 +114,123 @@ load_progress() {
 mark_complete() {
     local step="$1"
     echo "$step" >> "$STATE_FILE"
+}
+
+# --- VPS配置要求检查 (单站点版) ---
+check_vps_requirements() {
+    log_message "INFO" "检查VPS配置要求 (单站点极致性能版)..."
+    
+    # 获取系统资源信息
+    local total_mem=$(free -m | awk '/^Mem:/{print $2}')
+    local cpu_cores=$(nproc)
+    local available_space=$(df / | awk 'NR==2 {print int($4/1024/1024)}')  # GB
+    
+    log_message "INFO" "VPS配置: ${total_mem}MB内存, ${cpu_cores}核CPU, ${available_space}GB可用空间"
+    
+    # 定义VPS等级和优化策略
+    local vps_tier=""
+    local optimization_level=""
+    
+    # 根据内存和CPU核心数确定VPS等级
+    if [[ $total_mem -ge 4096 && $cpu_cores -ge 2 ]]; then
+        vps_tier="高配置"
+        optimization_level="标准优化"
+    elif [[ $total_mem -ge 2048 && $cpu_cores -ge 2 ]]; then
+        vps_tier="中等配置"
+        optimization_level="积极优化"
+    elif [[ $total_mem -ge 1024 && $cpu_cores -ge 1 ]]; then
+        vps_tier="标准配置"
+        optimization_level="激进优化"
+    elif [[ $total_mem -ge 512 && $cpu_cores -ge 1 ]]; then
+        vps_tier="小VPS配置"
+        optimization_level="极限优化"
+    else
+        vps_tier="超小VPS"
+        optimization_level="生存模式"
+    fi
+    
+    # 检查最低要求
+    if [[ $total_mem -lt 256 ]]; then
+        log_message "ERROR" "内存不足256MB，无法运行WordPress"
+        echo -e "${RED}[错误]${NC} VPS配置过低，无法运行WordPress"
+        echo -e "最低要求: 256MB内存, 1核CPU, 5GB存储"
+        exit 1
+    fi
+    
+    if [[ $available_space -lt 3 ]]; then
+        log_message "ERROR" "可用磁盘空间不足3GB"
+        echo -e "${RED}[错误]${NC} 磁盘空间不足，WordPress需要至少3GB空间"
+        exit 1
+    fi
+    
+    # 显示VPS配置评估
+    echo -e "\n${CYAN}=== VPS配置评估 (单站点极致性能版) ===${NC}"
+    echo -e "配置等级: ${GREEN}$vps_tier${NC}"
+    echo -e "优化策略: ${YELLOW}$optimization_level${NC}"
+    
+    # 根据配置给出建议和警告
+    echo -e "\n${CYAN}=== 配置建议 ===${NC}"
+    case "$vps_tier" in
+        "高配置")
+            echo -e "✓ 配置充足，可以获得极致性能"
+            echo -e "✓ 支持WooCommerce和重型插件"
+            echo -e "✓ 可以启用所有性能优化功能"
+            ;;
+        "中等配置")
+            echo -e "✓ 配置良好，性能表现优秀"
+            echo -e "✓ 支持WooCommerce (建议限制产品数量)"
+            echo -e "✓ 启用积极缓存优化"
+            ;;
+        "标准配置")
+            echo -e "⚠ 配置适中，需要激进优化"
+            echo -e "⚠ WooCommerce可用但需谨慎配置"
+            echo -e "✓ 启用所有缓存和优化选项"
+            ;;
+        "小VPS配置")
+            echo -e "⚠ 小VPS配置，将启用极限优化"
+            echo -e "⚠ 不建议使用WooCommerce"
+            echo -e "⚠ 建议使用轻量级主题和最少插件"
+            echo -e "✓ 启用所有节省资源的优化"
+            ;;
+        "超小VPS")
+            echo -e "⚠ 超小VPS，启用生存模式优化"
+            echo -e "⚠ 严格限制功能，仅支持基础WordPress"
+            echo -e "⚠ 必须使用最轻量级配置"
+            echo -e "⚠ 定期监控资源使用情况"
+            ;;
+    esac
+    
+    # 小VPS特别警告
+    if [[ "$vps_tier" == "小VPS配置" ]] || [[ "$vps_tier" == "超小VPS" ]]; then
+        echo -e "\n${YELLOW}=== 小VPS特别提醒 ===${NC}"
+        echo -e "您的VPS配置较低，脚本将自动应用以下优化："
+        echo -e "  - 降低数据库内存使用"
+        echo -e "  - 减少PHP进程数"
+        echo -e "  - 启用更激进的缓存策略"
+        echo -e "  - 禁用不必要的功能"
+        echo -e "  - 优化系统参数以节省资源"
+        echo -e ""
+        echo -e "${RED}重要：${NC}小VPS建议："
+        echo -e "  - 使用轻量级主题 (如 Astra, GeneratePress)"
+        echo -e "  - 限制插件数量 (建议不超过10个)"
+        echo -e "  - 定期清理数据库和缓存"
+        echo -e "  - 监控内存和CPU使用情况"
+        echo -e ""
+        read -rp "了解小VPS限制，确认继续? (y/n): " CONFIRM_SMALL_VPS
+        if [[ ! "$CONFIRM_SMALL_VPS" =~ ^[Yy]$ ]]; then
+            echo -e "${CYAN}[建议]${NC} 考虑升级VPS配置以获得更好的性能"
+            exit 0
+        fi
+    fi
+    
+    # 保存VPS配置信息到全局变量
+    VPS_TIER="$vps_tier"
+    OPTIMIZATION_LEVEL="$optimization_level"
+    VPS_MEMORY="$total_mem"
+    VPS_CORES="$cpu_cores"
+    VPS_STORAGE="$available_space"
+    
+    log_message "SUCCESS" "VPS配置检查完成: $vps_tier ($optimization_level)"
 }
 
 # --- 密码生成 ---
@@ -177,11 +304,54 @@ collect_input() {
         fi
     done
     
-    # WooCommerce选项
+    # WooCommerce选项 (根据VPS配置给出建议)
+    echo -e "\n${CYAN}=== WooCommerce电商功能 ===${NC}"
+    
+    # 根据VPS配置给出WooCommerce建议
+    case "$VPS_TIER" in
+        "超小VPS")
+            echo -e "${RED}[不推荐]${NC} 您的VPS配置过低，强烈不建议安装WooCommerce"
+            echo -e "WooCommerce需要大量内存和CPU资源，可能导致网站运行缓慢"
+            ;;
+        "小VPS配置")
+            echo -e "${YELLOW}[谨慎使用]${NC} 您的VPS配置较低，WooCommerce可能影响性能"
+            echo -e "建议：限制产品数量，使用轻量级主题，定期优化数据库"
+            ;;
+        *)
+            echo -e "${GREEN}[支持]${NC} 您的VPS配置支持WooCommerce电商功能"
+            ;;
+    esac
+    
     echo -e "\n是否安装WooCommerce（电商网站）？这将启用电商专用优化配置。"
     read -rp "请选择 (y/n): " WOO_CHOICE
+    
     if [[ "$WOO_CHOICE" =~ ^[Yy]$ ]]; then
-        USE_WOOCOMMERCE="yes"
+        # 小VPS额外确认
+        if [[ "$VPS_TIER" == "超小VPS" ]]; then
+            echo -e "\n${RED}[警告]${NC} 超小VPS安装WooCommerce风险很高："
+            echo -e "  - 可能导致内存不足"
+            echo -e "  - 网站响应速度慢"
+            echo -e "  - 数据库查询超时"
+            echo -e "  - 影响整体稳定性"
+            echo -e ""
+            read -rp "仍然要安装WooCommerce? (y/n): " FORCE_WOO
+            if [[ ! "$FORCE_WOO" =~ ^[Yy]$ ]]; then
+                USE_WOOCOMMERCE="no"
+                echo -e "${GREEN}[明智选择]${NC} 已取消WooCommerce安装"
+            else
+                USE_WOOCOMMERCE="yes"
+                echo -e "${YELLOW}[风险提醒]${NC} 将尽力优化，但请密切监控性能"
+            fi
+        elif [[ "$VPS_TIER" == "小VPS配置" ]]; then
+            echo -e "\n${YELLOW}[提醒]${NC} 小VPS使用WooCommerce建议："
+            echo -e "  - 产品数量控制在100个以内"
+            echo -e "  - 使用轻量级主题"
+            echo -e "  - 定期清理数据库"
+            echo -e "  - 监控内存使用情况"
+            USE_WOOCOMMERCE="yes"
+        else
+            USE_WOOCOMMERCE="yes"
+        fi
     else
         USE_WOOCOMMERCE="no"
     fi
@@ -196,6 +366,8 @@ collect_input() {
     echo "管理员邮箱: $ADMIN_EMAIL"
     echo "MariaDB版本: $MARIADB_VERSION"
     echo "WooCommerce模式: $USE_WOOCOMMERCE"
+    echo "VPS配置等级: $VPS_TIER"
+    echo "优化策略: $OPTIMIZATION_LEVEL"
     echo "性能模式: 极致性能 (VPS所有资源专用)"
     
     read -rp "确认以上配置? (y/n): " CONFIRM
@@ -215,14 +387,14 @@ collect_input() {
     mark_complete "collect_input"
 }
 
-# --- 系统优化 (极致性能版) ---
+# --- 系统优化 (极致性能版 + 小VPS优化) ---
 system_optimization() {
     if load_progress "system_optimization"; then
         log_message "INFO" "系统优化已完成，跳过..."
         return
     fi
     
-    log_message "TASK" "执行极致性能系统优化..."
+    log_message "TASK" "执行极致性能系统优化 ($OPTIMIZATION_LEVEL)..."
     
     # 更新系统
     apt update && apt upgrade -y
@@ -239,18 +411,38 @@ system_optimization() {
     local cpu_cores=$(nproc)
     
     log_message "INFO" "系统资源: ${total_mem}MB内存, ${cpu_cores}核CPU"
+    log_message "INFO" "优化级别: $OPTIMIZATION_LEVEL"
+    
+    # 根据VPS配置调整内核优化参数
+    local somaxconn=65536
+    local netdev_max_backlog=65536
+    local tcp_max_syn_backlog=65536
+    local tcp_max_tw_buckets=400000
+    local file_max=2000000
+    local nofile_limit=1000000
+    
+    # 小VPS优化：降低参数以节省内存
+    if [[ "$VPS_TIER" == "小VPS配置" ]] || [[ "$VPS_TIER" == "超小VPS" ]]; then
+        somaxconn=8192
+        netdev_max_backlog=8192
+        tcp_max_syn_backlog=8192
+        tcp_max_tw_buckets=100000
+        file_max=500000
+        nofile_limit=100000
+        log_message "INFO" "应用小VPS优化参数"
+    fi
     
     # 极致性能内核优化
     cat >> /etc/sysctl.conf << EOF
-# WordPress单站点极致性能优化参数
-net.core.somaxconn = 65536
-net.core.netdev_max_backlog = 65536
-net.ipv4.tcp_max_syn_backlog = 65536
+# WordPress单站点极致性能优化参数 ($OPTIMIZATION_LEVEL)
+net.core.somaxconn = $somaxconn
+net.core.netdev_max_backlog = $netdev_max_backlog
+net.ipv4.tcp_max_syn_backlog = $tcp_max_syn_backlog
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_max_tw_buckets = 400000
+net.ipv4.tcp_max_tw_buckets = $tcp_max_tw_buckets
 net.ipv4.ip_local_port_range = 1024 65000
-fs.file-max = 2000000
+fs.file-max = $file_max
 vm.swappiness = 1
 vm.vfs_cache_pressure = 10
 vm.dirty_background_ratio = 5
@@ -259,24 +451,84 @@ net.ipv4.tcp_congestion_control = bbr
 net.core.default_qdisc = fq
 EOF
     
+    # 小VPS额外优化
+    if [[ "$VPS_TIER" == "小VPS配置" ]] || [[ "$VPS_TIER" == "超小VPS" ]]; then
+        cat >> /etc/sysctl.conf << EOF
+# 小VPS额外优化参数
+vm.overcommit_memory = 1
+vm.min_free_kbytes = 8192
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 3
+EOF
+        log_message "INFO" "已应用小VPS额外优化参数"
+    fi
+    
     sysctl -p
     log_message "SUCCESS" "极致性能内核参数优化完成"
     
-    # 极致性能文件句柄限制
+    # 文件句柄限制 (根据VPS配置调整)
     cat >> /etc/security/limits.conf << EOF
-* soft nofile 1000000
-* hard nofile 1000000
-www-data soft nofile 1000000
-www-data hard nofile 1000000
-root soft nofile 1000000
-root hard nofile 1000000
+* soft nofile $nofile_limit
+* hard nofile $nofile_limit
+www-data soft nofile $nofile_limit
+www-data hard nofile $nofile_limit
+root soft nofile $nofile_limit
+root hard nofile $nofile_limit
 EOF
     
     # 禁用不必要的服务以节省资源
-    systemctl disable snapd 2>/dev/null || true
-    systemctl stop snapd 2>/dev/null || true
+    local services_to_disable=("snapd")
+    
+    # 小VPS额外禁用更多服务
+    if [[ "$VPS_TIER" == "小VPS配置" ]] || [[ "$VPS_TIER" == "超小VPS" ]]; then
+        services_to_disable+=("bluetooth" "cups" "avahi-daemon" "ModemManager")
+        log_message "INFO" "小VPS模式：禁用更多不必要的服务"
+    fi
+    
+    for service in "${services_to_disable[@]}"; do
+        systemctl disable "$service" 2>/dev/null || true
+        systemctl stop "$service" 2>/dev/null || true
+    done
+    
+    # 小VPS特殊优化：配置swap
+    if [[ "$VPS_TIER" == "小VPS配置" ]] || [[ "$VPS_TIER" == "超小VPS" ]]; then
+        configure_small_vps_swap
+    fi
     
     mark_complete "system_optimization"
+}
+
+# --- 小VPS Swap配置 ---
+configure_small_vps_swap() {
+    log_message "INFO" "配置小VPS Swap优化..."
+    
+    # 检查是否已有swap
+    if swapon --show | grep -q "/"; then
+        log_message "INFO" "检测到现有swap，跳过创建"
+        return
+    fi
+    
+    # 根据内存大小决定swap大小
+    local swap_size="512M"
+    if [[ $VPS_MEMORY -lt 512 ]]; then
+        swap_size="1G"  # 超小VPS使用更大的swap
+    elif [[ $VPS_MEMORY -lt 1024 ]]; then
+        swap_size="512M"
+    else
+        return  # 1GB以上内存不需要额外swap
+    fi
+    
+    # 创建swap文件
+    fallocate -l $swap_size /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    
+    # 添加到fstab
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    
+    log_message "SUCCESS" "小VPS Swap配置完成: $swap_size"
 }
 
 # --- 安装Nginx (极致性能版) ---
@@ -417,26 +669,70 @@ install_php() {
     local total_mem=$(free -m | awk '/^Mem:/{print $2}')
     local cpu_cores=$(nproc)
     
-    # 极致性能PHP配置 (使用80%内存)
+    # 根据VPS配置调整PHP参数
     local php_memory_limit="512M"
-    local max_children=$(( total_mem * 80 / 100 / 128 ))  # 每个进程128MB
-    [[ $max_children -lt 10 ]] && max_children=10
+    local memory_percentage=80
+    local process_memory=128  # MB per process
+    
+    # 小VPS优化：降低内存使用和进程数
+    if [[ "$VPS_TIER" == "小VPS配置" ]]; then
+        php_memory_limit="256M"
+        memory_percentage=60
+        process_memory=64
+        log_message "INFO" "应用小VPS PHP优化配置"
+    elif [[ "$VPS_TIER" == "超小VPS" ]]; then
+        php_memory_limit="128M"
+        memory_percentage=50
+        process_memory=32
+        log_message "INFO" "应用超小VPS PHP极限优化配置"
+    fi
+    
+    # 计算进程数
+    local max_children=$(( total_mem * memory_percentage / 100 / process_memory ))
+    [[ $max_children -lt 2 ]] && max_children=2
     [[ $max_children -gt 200 ]] && max_children=200
     
     local start_servers=$(( max_children / 4 ))
+    [[ $start_servers -lt 1 ]] && start_servers=1
     local min_spare=$(( max_children / 8 ))
+    [[ $min_spare -lt 1 ]] && min_spare=1
     local max_spare=$(( max_children / 2 ))
+    [[ $max_spare -lt 2 ]] && max_spare=2
     
+    # WooCommerce调整（但要考虑VPS限制）
     if [[ "$USE_WOOCOMMERCE" == "yes" ]]; then
-        php_memory_limit="1024M"
-        max_children=$(( total_mem * 80 / 100 / 256 ))  # 每个进程256MB
-        [[ $max_children -lt 5 ]] && max_children=5
+        if [[ "$VPS_TIER" == "超小VPS" ]]; then
+            log_message "WARNING" "超小VPS不建议使用WooCommerce，但将尽力优化"
+            php_memory_limit="256M"
+            process_memory=64
+        elif [[ "$VPS_TIER" == "小VPS配置" ]]; then
+            php_memory_limit="512M"
+            process_memory=128
+        else
+            php_memory_limit="1024M"
+            process_memory=256
+        fi
+        
+        max_children=$(( total_mem * memory_percentage / 100 / process_memory ))
+        [[ $max_children -lt 2 ]] && max_children=2
         [[ $max_children -gt 100 ]] && max_children=100
     fi
     
-    log_message "INFO" "PHP配置: 内存限制${php_memory_limit}, 最大进程${max_children}"
+    log_message "INFO" "PHP配置 ($VPS_TIER): 内存限制${php_memory_limit}, 最大进程${max_children}"
     
-    # 配置PHP-FPM (极致性能)
+    # 根据VPS配置调整连接参数
+    local listen_backlog=65536
+    local max_requests=1000
+    local process_idle_timeout=10
+    
+    # 小VPS优化：降低连接参数
+    if [[ "$VPS_TIER" == "小VPS配置" ]] || [[ "$VPS_TIER" == "超小VPS" ]]; then
+        listen_backlog=1024
+        max_requests=500
+        process_idle_timeout=30  # 更长的空闲时间以节省资源
+    fi
+    
+    # 配置PHP-FPM (极致性能 + 小VPS优化)
     PHP_FPM_CONF="/etc/php/$PHP_VERSION/fpm/pool.d/www.conf"
     cat > "$PHP_FPM_CONF" << EOF
 [www]
@@ -446,15 +742,15 @@ listen = /run/php/php$PHP_VERSION-fpm.sock
 listen.owner = www-data
 listen.group = www-data
 listen.mode = 0660
-listen.backlog = 65536
+listen.backlog = $listen_backlog
 
 pm = dynamic
 pm.max_children = $max_children
 pm.start_servers = $start_servers
 pm.min_spare_servers = $min_spare
 pm.max_spare_servers = $max_spare
-pm.process_idle_timeout = 10s
-pm.max_requests = 1000
+pm.process_idle_timeout = ${process_idle_timeout}s
+pm.max_requests = $max_requests
 
 pm.status_path = /php-status
 ping.path = /php-ping
@@ -468,7 +764,7 @@ php_value[session.save_handler] = files
 php_value[session.save_path] = /var/lib/php/sessions
 php_value[soap.wsdl_cache_dir] = /var/lib/php/wsdlcache
 
-# 极致性能设置
+# 性能设置 (根据VPS配置优化)
 php_admin_value[memory_limit] = $php_memory_limit
 php_admin_value[max_execution_time] = 300
 php_admin_value[max_input_time] = 300
@@ -489,18 +785,32 @@ EOF
     sed -i "s/^log_errors = .*/log_errors = On/" "$PHP_INI"
     sed -i "s|^;error_log =.*|error_log = /var/log/php$PHP_VERSION-fpm-error.log|" "$PHP_INI"
     
-    # 配置OPcache (极致性能)
+    # 配置OPcache (极致性能 + 小VPS优化)
     OP_CACHE_FILE="/etc/php/$PHP_VERSION/fpm/conf.d/10-opcache.ini"
     local opcache_memory=$(( total_mem / 4 ))
-    [[ $opcache_memory -lt 128 ]] && opcache_memory=128
+    local interned_strings_buffer=64
+    local max_accelerated_files=20000
+    
+    # 小VPS优化：降低OPcache内存使用
+    if [[ "$VPS_TIER" == "小VPS配置" ]]; then
+        opcache_memory=$(( total_mem / 6 ))
+        interned_strings_buffer=32
+        max_accelerated_files=10000
+    elif [[ "$VPS_TIER" == "超小VPS" ]]; then
+        opcache_memory=$(( total_mem / 8 ))
+        interned_strings_buffer=16
+        max_accelerated_files=5000
+    fi
+    
+    [[ $opcache_memory -lt 32 ]] && opcache_memory=32
     [[ $opcache_memory -gt 512 ]] && opcache_memory=512
     
     cat > "$OP_CACHE_FILE" << EOF
 zend_extension=opcache.so
 opcache.enable=1
 opcache.memory_consumption=${opcache_memory}
-opcache.interned_strings_buffer=64
-opcache.max_accelerated_files=20000
+opcache.interned_strings_buffer=${interned_strings_buffer}
+opcache.max_accelerated_files=${max_accelerated_files}
 opcache.revalidate_freq=2
 opcache.fast_shutdown=1
 opcache.enable_cli=1
@@ -541,30 +851,101 @@ install_mariadb() {
     
     # 获取系统内存信息
     local total_mem=$(free -m | awk '/^Mem:/{print $2}')
-    local innodb_percent=70  # 单站点使用70%内存
+    local innodb_percent=70  # 单站点默认使用70%内存
+    local max_connections=500
+    local table_open_cache=8192
+    local tmp_table_size="256M"
+    local max_heap_table_size="256M"
     
+    # 小VPS优化：降低内存使用
+    if [[ "$VPS_TIER" == "小VPS配置" ]]; then
+        innodb_percent=50
+        max_connections=100
+        table_open_cache=2048
+        tmp_table_size="64M"
+        max_heap_table_size="64M"
+        log_message "INFO" "应用小VPS MariaDB优化配置"
+    elif [[ "$VPS_TIER" == "超小VPS" ]]; then
+        innodb_percent=40
+        max_connections=50
+        table_open_cache=1024
+        tmp_table_size="32M"
+        max_heap_table_size="32M"
+        log_message "INFO" "应用超小VPS MariaDB极限优化配置"
+    fi
+    
+    # WooCommerce调整（但要考虑VPS限制）
     if [[ "$USE_WOOCOMMERCE" == "yes" ]]; then
-        innodb_percent=75  # WooCommerce使用更多内存
+        if [[ "$VPS_TIER" == "超小VPS" ]]; then
+            log_message "WARNING" "超小VPS不建议使用WooCommerce"
+            innodb_percent=45  # 稍微增加但仍然保守
+        elif [[ "$VPS_TIER" == "小VPS配置" ]]; then
+            innodb_percent=60
+        else
+            innodb_percent=75  # 只有中等配置以上才使用75%
+        fi
     fi
     
     local innodb_size_mb=$(( total_mem * innodb_percent / 100 ))
     local innodb_size_gb=$(( innodb_size_mb / 1024 ))
     [[ $innodb_size_gb -lt 1 ]] && innodb_size_gb=1
     
+    # 超小VPS特殊处理：使用MB而不是GB
+    local innodb_buffer_pool_size=""
+    if [[ "$VPS_TIER" == "超小VPS" ]] && [[ $innodb_size_mb -lt 512 ]]; then
+        innodb_buffer_pool_size="${innodb_size_mb}M"
+    else
+        innodb_buffer_pool_size="${innodb_size_gb}G"
+    fi
+    
     local cpu_cores=$(nproc)
     
-    log_message "INFO" "MariaDB配置: InnoDB缓冲池${innodb_size_gb}G, CPU核心${cpu_cores}"
+    log_message "INFO" "MariaDB配置 ($VPS_TIER): InnoDB缓冲池${innodb_buffer_pool_size}, 最大连接${max_connections}"
     
-    # 极致性能MariaDB配置
+    # 根据VPS配置调整其他参数
+    local innodb_log_file_size="512M"
+    local innodb_log_buffer_size="64M"
+    local innodb_buffer_pool_instances=$cpu_cores
+    local innodb_io_capacity=2000
+    local innodb_io_capacity_max=4000
+    local sort_buffer_size="4M"
+    local read_buffer_size="2M"
+    local read_rnd_buffer_size="8M"
+    local join_buffer_size="8M"
+    
+    # 小VPS优化：降低各种缓冲区大小
+    if [[ "$VPS_TIER" == "小VPS配置" ]]; then
+        innodb_log_file_size="128M"
+        innodb_log_buffer_size="32M"
+        innodb_buffer_pool_instances=1
+        innodb_io_capacity=1000
+        innodb_io_capacity_max=2000
+        sort_buffer_size="2M"
+        read_buffer_size="1M"
+        read_rnd_buffer_size="4M"
+        join_buffer_size="4M"
+    elif [[ "$VPS_TIER" == "超小VPS" ]]; then
+        innodb_log_file_size="64M"
+        innodb_log_buffer_size="16M"
+        innodb_buffer_pool_instances=1
+        innodb_io_capacity=500
+        innodb_io_capacity_max=1000
+        sort_buffer_size="1M"
+        read_buffer_size="512K"
+        read_rnd_buffer_size="2M"
+        join_buffer_size="2M"
+    fi
+    
+    # 极致性能MariaDB配置 (根据VPS配置优化)
     cat > /etc/mysql/mariadb.conf.d/50-single-wordpress.cnf << EOF
 [mysqld]
-# 单WordPress站点极致性能配置
+# 单WordPress站点性能配置 ($VPS_TIER - $OPTIMIZATION_LEVEL)
 
 # 内存配置 (使用${innodb_percent}%内存)
-innodb_buffer_pool_size = ${innodb_size_gb}G
-innodb_log_file_size = 512M
-innodb_log_buffer_size = 64M
-innodb_buffer_pool_instances = $cpu_cores
+innodb_buffer_pool_size = ${innodb_buffer_pool_size}
+innodb_log_file_size = ${innodb_log_file_size}
+innodb_log_buffer_size = ${innodb_log_buffer_size}
+innodb_buffer_pool_instances = ${innodb_buffer_pool_instances}
 
 # 性能配置
 innodb_flush_log_at_trx_commit = 1
@@ -572,29 +953,29 @@ innodb_file_per_table = 1
 innodb_flush_method = O_DIRECT
 innodb_read_io_threads = $cpu_cores
 innodb_write_io_threads = $cpu_cores
-innodb_io_capacity = 2000
-innodb_io_capacity_max = 4000
+innodb_io_capacity = ${innodb_io_capacity}
+innodb_io_capacity_max = ${innodb_io_capacity_max}
 
-# 连接配置 (单站点优化)
-max_connections = 500
+# 连接配置 (根据VPS配置优化)
+max_connections = ${max_connections}
 thread_cache_size = 200
-table_open_cache = 8192
-table_definition_cache = 8192
+table_open_cache = ${table_open_cache}
+table_definition_cache = ${table_open_cache}
 open_files_limit = 65536
 
 # 查询缓存 (MariaDB 10.11+推荐关闭)
 query_cache_type = 0
 query_cache_size = 0
 
-# 临时表优化
-tmp_table_size = 256M
-max_heap_table_size = 256M
+# 临时表优化 (根据VPS配置调整)
+tmp_table_size = ${tmp_table_size}
+max_heap_table_size = ${max_heap_table_size}
 
-# 排序和分组优化
-sort_buffer_size = 4M
-read_buffer_size = 2M
-read_rnd_buffer_size = 8M
-join_buffer_size = 8M
+# 排序和分组优化 (根据VPS配置调整)
+sort_buffer_size = ${sort_buffer_size}
+read_buffer_size = ${read_buffer_size}
+read_rnd_buffer_size = ${read_rnd_buffer_size}
+join_buffer_size = ${join_buffer_size}
 
 # 字符集设置
 character-set-server = utf8mb4
@@ -667,28 +1048,45 @@ install_redis() {
     
     # 获取系统内存信息
     local total_mem=$(free -m | awk '/^Mem:/{print $2}')
-    local redis_max_mem=$(( total_mem * 15 / 100 ))  # 单站点使用15%内存
-    [[ $redis_max_mem -lt 256 ]] && redis_max_mem=256
+    local redis_percent=15  # 单站点默认使用15%内存
+    local tcp_backlog=65536
+    local maxclients=10000
+    
+    # 小VPS优化：降低Redis内存使用
+    if [[ "$VPS_TIER" == "小VPS配置" ]]; then
+        redis_percent=10
+        tcp_backlog=1024
+        maxclients=1000
+        log_message "INFO" "应用小VPS Redis优化配置"
+    elif [[ "$VPS_TIER" == "超小VPS" ]]; then
+        redis_percent=8
+        tcp_backlog=512
+        maxclients=500
+        log_message "INFO" "应用超小VPS Redis极限优化配置"
+    fi
+    
+    local redis_max_mem=$(( total_mem * redis_percent / 100 ))
+    [[ $redis_max_mem -lt 64 ]] && redis_max_mem=64
     [[ $redis_max_mem -gt 2048 ]] && redis_max_mem=2048
     
-    log_message "INFO" "Redis配置: 最大内存${redis_max_mem}MB"
+    log_message "INFO" "Redis配置 ($VPS_TIER): 最大内存${redis_max_mem}MB"
     
-    # 极致性能Redis配置
+    # Redis配置 (根据VPS配置优化)
     REDIS_CONF="/etc/redis/redis.conf"
     cp "$REDIS_CONF" "$REDIS_CONF.backup"
     
     cat > "$REDIS_CONF" << EOF
-# Redis单WordPress站点极致性能配置
+# Redis单WordPress站点性能配置 ($VPS_TIER - $OPTIMIZATION_LEVEL)
 bind 127.0.0.1
 port 6379
 timeout 0
 tcp-keepalive 300
-tcp-backlog 65536
+tcp-backlog ${tcp_backlog}
 
 # 安全配置
 requirepass $REDIS_PASS
 
-# 内存配置
+# 内存配置 (使用${redis_percent}%内存)
 maxmemory ${redis_max_mem}mb
 maxmemory-policy allkeys-lru
 
@@ -720,8 +1118,8 @@ zset-max-ziplist-entries 128
 zset-max-ziplist-value 64
 hll-sparse-max-bytes 3000
 
-# 客户端配置
-maxclients 10000
+# 客户端配置 (根据VPS配置调整)
+maxclients ${maxclients}
 
 # 日志配置
 loglevel notice

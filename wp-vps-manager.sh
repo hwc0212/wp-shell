@@ -34,6 +34,14 @@ OPERATION_MODE=""
 SITE_COUNT=0
 SITES_CONFIG_FILE="$HOME/.vps-manager/wordpress-sites.conf"
 
+# --- VPS配置变量 ---
+VPS_TIER=""
+MAX_SITES=0
+RECOMMENDED_SITES=0
+VPS_MEMORY=0
+VPS_CORES=0
+VPS_STORAGE=0
+
 # --- 站点配置变量 ---
 declare -A SITE_DOMAINS
 declare -A SITE_PHP_VERSIONS
@@ -107,6 +115,9 @@ init_script() {
     if [[ $SITE_COUNT -eq 0 ]]; then
         detect_existing_sites
     fi
+    
+    # 检查VPS配置要求
+    check_vps_requirements
     
     # 检查系统兼容性
     check_system_compatibility
@@ -388,6 +399,121 @@ mark_complete() {
     echo "$step" >> "$STATE_FILE"
 }
 
+# --- VPS配置要求检查 ---
+check_vps_requirements() {
+    log_message "INFO" "检查VPS配置要求..."
+    
+    # 获取系统资源信息
+    local total_mem=$(free -m | awk '/^Mem:/{print $2}')
+    local cpu_cores=$(nproc)
+    local available_space=$(df / | awk 'NR==2 {print int($4/1024/1024)}')  # GB
+    
+    log_message "INFO" "VPS配置: ${total_mem}MB内存, ${cpu_cores}核CPU, ${available_space}GB可用空间"
+    
+    # 定义配置等级和对应的站点数量限制
+    local vps_tier=""
+    local max_sites=0
+    local recommended_sites=0
+    
+    # 根据内存和CPU核心数确定VPS等级
+    if [[ $total_mem -ge 8192 && $cpu_cores -ge 4 ]]; then
+        vps_tier="高配置"
+        max_sites=10
+        recommended_sites=8
+    elif [[ $total_mem -ge 4096 && $cpu_cores -ge 2 ]]; then
+        vps_tier="中等配置"
+        max_sites=6
+        recommended_sites=4
+    elif [[ $total_mem -ge 2048 && $cpu_cores -ge 2 ]]; then
+        vps_tier="标准配置"
+        max_sites=3
+        recommended_sites=2
+    elif [[ $total_mem -ge 1024 && $cpu_cores -ge 1 ]]; then
+        vps_tier="基础配置"
+        max_sites=2
+        recommended_sites=1
+    else
+        vps_tier="低配置"
+        max_sites=1
+        recommended_sites=1
+    fi
+    
+    # 检查最低要求
+    if [[ $total_mem -lt 512 ]]; then
+        log_message "ERROR" "内存不足512MB，无法运行WordPress"
+        echo -e "${RED}[错误]${NC} VPS配置过低，建议："
+        echo -e "  - 最低要求: 512MB内存, 1核CPU, 10GB存储"
+        echo -e "  - 推荐配置: 1GB+内存, 1核+CPU, 20GB+存储"
+        exit 1
+    fi
+    
+    if [[ $available_space -lt 5 ]]; then
+        log_message "ERROR" "可用磁盘空间不足5GB"
+        echo -e "${RED}[错误]${NC} 磁盘空间不足，每个WordPress站点需要约2-3GB空间"
+        exit 1
+    fi
+    
+    # 显示VPS配置评估
+    echo -e "\n${CYAN}=== VPS配置评估 ===${NC}"
+    echo -e "配置等级: ${GREEN}$vps_tier${NC}"
+    echo -e "最大站点数: ${YELLOW}$max_sites${NC} 个"
+    echo -e "推荐站点数: ${GREEN}$recommended_sites${NC} 个"
+    
+    # 根据配置给出建议
+    echo -e "\n${CYAN}=== 配置建议 ===${NC}"
+    case "$vps_tier" in
+        "高配置")
+            echo -e "✓ 可以运行多个WordPress站点"
+            echo -e "✓ 支持WooCommerce等重型插件"
+            echo -e "✓ 可以启用所有性能优化功能"
+            ;;
+        "中等配置")
+            echo -e "✓ 可以运行多个轻量级WordPress站点"
+            echo -e "⚠ WooCommerce站点建议不超过2个"
+            echo -e "✓ 建议启用缓存优化"
+            ;;
+        "标准配置")
+            echo -e "⚠ 建议运行2-3个轻量级站点"
+            echo -e "⚠ 避免安装过多插件"
+            echo -e "✓ 必须启用缓存优化"
+            ;;
+        "基础配置")
+            echo -e "⚠ 建议只运行1-2个简单站点"
+            echo -e "⚠ 避免使用WooCommerce"
+            echo -e "✓ 启用所有优化选项"
+            ;;
+        "低配置")
+            echo -e "⚠ 只能运行1个简单站点"
+            echo -e "⚠ 建议使用单站点极致性能版脚本"
+            echo -e "⚠ 必须启用所有优化选项"
+            ;;
+    esac
+    
+    # 如果是低配置，建议使用单站点脚本
+    if [[ "$vps_tier" == "低配置" ]]; then
+        echo -e "\n${YELLOW}=== 重要建议 ===${NC}"
+        echo -e "您的VPS配置较低，强烈建议使用 ${GREEN}deploy-single-wordpress.sh${NC} 脚本"
+        echo -e "单站点极致性能版本可以更好地利用有限的资源"
+        echo -e ""
+        read -rp "是否继续使用多站点版本? (y/n): " CONTINUE_MULTI
+        if [[ ! "$CONTINUE_MULTI" =~ ^[Yy]$ ]]; then
+            echo -e "${CYAN}[建议]${NC} 请使用以下命令运行单站点版本:"
+            echo -e "  sudo ./deploy-single-wordpress.sh"
+            exit 0
+        fi
+    fi
+    
+    # 保存VPS配置信息到全局变量
+    VPS_TIER="$vps_tier"
+    MAX_SITES="$max_sites"
+    RECOMMENDED_SITES="$recommended_sites"
+    VPS_MEMORY="$total_mem"
+    VPS_CORES="$cpu_cores"
+    VPS_STORAGE="$available_space"
+    
+    log_message "SUCCESS" "VPS配置检查完成: $vps_tier (最大${max_sites}站点)"
+}
+
 # --- 系统兼容性检查 ---
 check_system_compatibility() {
     log_message "INFO" "检查系统兼容性..."
@@ -558,13 +684,54 @@ deploy_new_server() {
 collect_new_server_input() {
     echo -e "\n${CYAN}=== 新服务器初始化配置 ===${NC}\n"
     
-    # 询问要部署多少个站点
+    # 显示VPS配置和建议
+    echo -e "${CYAN}=== VPS配置信息 ===${NC}"
+    echo -e "配置等级: ${GREEN}$VPS_TIER${NC}"
+    echo -e "推荐站点数: ${GREEN}$RECOMMENDED_SITES${NC} 个"
+    echo -e "最大站点数: ${YELLOW}$MAX_SITES${NC} 个"
+    echo -e ""
+    
+    # 根据VPS配置给出具体建议
+    case "$VPS_TIER" in
+        "高配置")
+            echo -e "${GREEN}✓${NC} 您的VPS配置很好，可以运行多个WordPress站点"
+            ;;
+        "中等配置")
+            echo -e "${YELLOW}⚠${NC} 建议运行轻量级站点，避免过多重型插件"
+            ;;
+        "标准配置")
+            echo -e "${YELLOW}⚠${NC} 建议启用所有缓存优化，控制插件数量"
+            ;;
+        "基础配置")
+            echo -e "${YELLOW}⚠${NC} 强烈建议只运行简单站点，避免WooCommerce"
+            ;;
+    esac
+    
+    # 询问要部署多少个站点（基于VPS配置限制）
     while true; do
-        read -rp "请输入要部署的WordPress站点数量 (1-10): " SITES_TO_DEPLOY
-        if [[ "$SITES_TO_DEPLOY" =~ ^[1-9]$|^10$ ]]; then
+        read -rp "请输入要部署的WordPress站点数量 (1-$MAX_SITES): " SITES_TO_DEPLOY
+        if [[ "$SITES_TO_DEPLOY" =~ ^[0-9]+$ ]] && 
+           [[ "$SITES_TO_DEPLOY" -ge 1 ]] && 
+           [[ "$SITES_TO_DEPLOY" -le "$MAX_SITES" ]]; then
+            
+            # 如果超过推荐数量，给出警告
+            if [[ "$SITES_TO_DEPLOY" -gt "$RECOMMENDED_SITES" ]]; then
+                echo -e "${YELLOW}[警告]${NC} 您选择的站点数量($SITES_TO_DEPLOY)超过推荐数量($RECOMMENDED_SITES)"
+                echo -e "这可能会影响网站性能，建议："
+                echo -e "  - 使用轻量级主题"
+                echo -e "  - 限制插件数量"
+                echo -e "  - 启用所有缓存优化"
+                echo -e "  - 定期监控服务器资源使用情况"
+                echo -e ""
+                read -rp "确认继续? (y/n): " CONFIRM_EXCEED
+                if [[ ! "$CONFIRM_EXCEED" =~ ^[Yy]$ ]]; then
+                    continue
+                fi
+            fi
             break
         else
-            echo -e "${RED}[错误]${NC} 请输入1-10之间的数字"
+            echo -e "${RED}[错误]${NC} 请输入1-$MAX_SITES之间的数字"
+            echo -e "${CYAN}[提示]${NC} 基于您的VPS配置($VPS_TIER)，最多支持$MAX_SITES个站点"
         fi
     done
     
