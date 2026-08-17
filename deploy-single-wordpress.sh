@@ -820,7 +820,9 @@ list_backups() {
 clear_cache() {
     local wp_path="/var/www/$DOMAIN/public" cache_dir="/var/cache/nginx/$DOMAIN"
     [[ -d "$cache_dir" ]] && find "$cache_dir" -mindepth 1 -delete
-    [[ -f "$wp_path/wp-config.php" ]] && sudo -u www-data wp cache flush --path="$wp_path" || true
+    if [[ -f "$wp_path/wp-config.php" ]]; then
+        sudo -u www-data wp cache flush --path="$wp_path" || true
+    fi
     systemctl reload "php${PHP_VERSION}-fpm"
 }
 
@@ -839,7 +841,7 @@ restore_site() {
     (
         set -Eeuo pipefail
         local_stage="$(mktemp -d /tmp/wp-single-restore.XXXXXX)"
-        # shellcheck disable=SC2329
+        # shellcheck disable=SC2317,SC2329
         cleanup_restore() {
             rm -rf -- "$local_stage"
             rm -f "$defaults_file"

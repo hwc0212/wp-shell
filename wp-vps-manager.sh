@@ -1150,7 +1150,7 @@ restore_site() {
     (
         set -Eeuo pipefail
         local_stage="$(mktemp -d /tmp/wp-restore.XXXXXX)"
-        # shellcheck disable=SC2329
+        # shellcheck disable=SC2317,SC2329
         cleanup_restore() {
             rm -rf -- "$local_stage"
             rm -f "$defaults_file"
