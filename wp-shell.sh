@@ -1354,6 +1354,10 @@ bootstrap_server() {
         log_message INFO "UFW configuration was skipped."
     fi
     for ((i = 1; i <= SITE_COUNT; i++)); do
+        if [[ "${SITE_MODES[$i]}" == "imported" ]]; then
+            log_message INFO "Skipping imported site ${SITE_DOMAINS[$i]}; use 'wp-shell site deploy ${SITE_DOMAINS[$i]}' to transfer it to managed mode."
+            continue
+        fi
         deploy_site "$i"
     done
     install_self

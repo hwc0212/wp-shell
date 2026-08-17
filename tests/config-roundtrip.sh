@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# shellcheck disable=SC1091,SC2016,SC2034
+# shellcheck disable=SC1091,SC2016,SC2034,SC2317,SC2329
 
 set -Eeuo pipefail
 
@@ -55,5 +55,23 @@ load_sites_config
 [[ "${SITE_DOMAINS[1]}" == "legacy.example.com" ]]
 [[ -f "$DATABASE_CONFIG_DIR/legacy.example.com.v1" ]]
 find "$CONFIG_DIR/migration-backup" -type f -name sites.v2 | grep -q .
+
+SITE_COUNT=2
+SITE_DOMAINS[2]="imported.example.com"
+SITE_MODES[2]="imported"
+deploy_log="$test_root/deployed"
+prepare_stack() { :; }
+collect_yes_no() { return 1; }
+deploy_site() { printf '%s\n' "${SITE_DOMAINS[$1]}" >> "$deploy_log"; }
+install_self() { :; }
+install_backup_timer() { :; }
+install_metrics_timer() { :; }
+collect_metrics() { :; }
+bootstrap_server
+grep -qx 'legacy.example.com' "$deploy_log"
+if grep -q 'imported.example.com' "$deploy_log"; then
+    printf 'An imported site was deployed without explicit transfer.\n' >&2
+    exit 1
+fi
 
 printf 'Configuration round-trip and legacy migration tests passed.\n'

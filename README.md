@@ -179,6 +179,7 @@ sudo wp-shell security-scan
 ```
 
 `site import` registers detected WordPress paths as `imported`. It does not immediately replace their Nginx, TLS, database, or Redis configuration. Running `site deploy DOMAIN` explicitly transfers that site to managed mode.
+Global `install` runs also skip imported sites, so later maintenance cannot transfer them accidentally.
 
 ## Site layout
 
