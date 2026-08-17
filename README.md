@@ -1,389 +1,377 @@
-# WordPress VPS管理平台 (Cloudways/SpinupWP替代方案)
+# wp-shell
 
-**wp-shell** 是一个功能强大的WordPress VPS管理脚本，专门设计用来替代Cloudways和SpinupWP等付费服务。支持在单个Ubuntu服务器上部署和管理多个WordPress站点，每个站点可以使用不同的PHP版本。
+`wp-shell` 是一组面向 Ubuntu VPS 的 WordPress 部署与维护脚本。项目提供多站点管理版和单站点专用版，重点解决可重复部署、HTTPS、缓存、资源预算、备份恢复和基础安全配置。
 
-**GitHub仓库**: https://github.com/hwc0212/wp-shell  
-**最新版本**: v7.0 | **更新日期**: 2026-01-08  
-**作者**: [huwencai.com](https://huwencai.com)
+- 多站点管理器：`wp-vps-manager.sh` v8.0.0
+- 单站点部署器：`deploy-single-wordpress.sh` v2.0.0
+- 支持系统：Ubuntu 22.04 / 24.04 LTS
+- 项目地址：https://github.com/hwc0212/wp-shell
+- 作者：https://huwencai.com
 
-## 🔗 快速链接
+> 重要：脚本会安装软件包并修改 Nginx、PHP-FPM、MariaDB、Redis、Fail2ban、UFW 和 systemd 配置。请先在测试服务器验证，并在操作已有服务器前创建独立备份。
 
-- **多站点管理脚本**: [wp-vps-manager.sh](https://github.com/hwc0212/wp-shell/blob/main/wp-vps-manager.sh)
-- **单站点极致性能脚本**: [deploy-single-wordpress.sh](https://github.com/hwc0212/wp-shell/blob/main/deploy-single-wordpress.sh)
-- **功能对比**: [查看下方对比表](#-替代方案对比)
-- **VPS配置要求**: [查看系统要求](#-系统要求)
+## 选择哪个脚本
 
-## 🎯 替代方案对比
+| 场景 | 推荐脚本 | 说明 |
+|---|---|---|
+| 一台 VPS 管理多个独立 WordPress 站点 | `wp-vps-manager.sh` | 每站点可选择 PHP 版本，具有独立 FastCGI 缓存目录、Redis DB 和管理命令 |
+| 一台 VPS 只运行一个重点站点 | `deploy-single-wordpress.sh` | 使用单站点资源预算，可选择 apex 或 `www` 作为主域名 |
+| 已有 WordPress 站点需要纳入备份和状态管理 | `wp-vps-manager.sh import` | 只登记站点，不自动替换已有 Nginx、证书或数据库配置 |
 
-| 功能特性 | Cloudways | SpinupWP | wp-vps-manager |
-|---------|-----------|----------|----------------|
-| 月费成本 | $10-100+ | $12-50+ | **免费开源** |
-| 多站点管理 | ✓ | ✓ | ✓ |
-| 多PHP版本 | ✓ | ✓ | ✓ (8.2/8.3/8.4) |
-| SSL自动化 | ✓ | ✓ | ✓ |
-| 性能优化 | ✓ | ✓ | ✓ |
-| 备份管理 | ✓ | ✓ | ✓ |
-| 监控分析 | ✓ | ✓ | ✓ |
-| 完全控制 | ❌ | ❌ | ✓ |
-| 自定义配置 | 有限 | 有限 | ✓ |
+## v8/v2 的主要改进
 
-## 🚀 核心功能
+- 使用 `set -Eeuo pipefail`、进程锁和明确错误步骤，避免静默失败和并发修改。
+- 站点配置采用不可执行的数据格式，不再 `source` 用户输入生成的 Shell 文件。
+- 首次部署先启用 HTTP ACME 站点，证书成功后才原子切换完整 HTTPS 配置。
+- Nginx 配置先执行 `nginx -t`，失败会恢复原配置。
+- 不再整体覆盖 `/etc/nginx/nginx.conf`，也不会执行 `ufw reset`。
+- MariaDB、Redis 和 PHP-FPM 共用统一内存预算，避免各服务分别占用大部分系统内存。
+- 多站点使用独立 Redis DB 和域名前缀，清理一个站点不会 `FLUSHDB` 影响其他站点。
+- 管理脚本不再内嵌数据库或 Redis 密码；凭据文件均为 `0600`。
+- 备份包含文件、数据库、元数据和 SHA-256 校验，恢复前自动创建安全备份。
+- 自动备份改用 systemd timer，不再重复追加 crontab。
+- 默认关闭 PHP JIT；WordPress 常见负载优先使用 OPcache，并预留真实 PHP-FPM 内存。
+- CI 会执行 Bash 语法检查、安全模式检查和 ShellCheck。
 
-### 智能VPS配置检查
-- **自动检测VPS配置**：内存、CPU、存储空间
-- **智能站点数量限制**：根据VPS配置动态调整最大站点数
-- **配置等级评估**：从超小VPS到高配置的5个等级
-- **优化策略匹配**：为每个配置等级提供专门的优化方案
+## 系统要求
 
-### 多站点管理
-- 单服务器部署1-10个WordPress站点
-- 每个站点独立PHP版本 (8.2/8.3/8.4)
-- 智能站点检测和导入
-- 统一管理界面
+### 必需条件
 
-### 单站点极致性能版
-- **VPS所有资源专用**于单个WordPress站点
-- **智能配置优化**：根据VPS配置自动调整参数
-- **小VPS专用优化**：为512MB-1GB内存的VPS提供极限优化
-- **MariaDB动态分配**：高配置使用70%内存，小VPS使用40-50%内存
-- **PHP-FPM智能调整**：根据VPS配置动态调整进程数和内存限制
-- **三重缓存**：FastCGI + Redis + OPcache
-- **PHP JIT编译器**（PHP 8.3/8.4）
-- **WooCommerce智能警告**：小VPS自动警告WooCommerce风险
+- 全新的或可控的 Ubuntu 22.04/24.04 LTS VPS
+- 至少 1GB 内存
+- 至少 8GB 根分区可用空间
+- root 或 sudo 权限
+- 域名已解析到服务器
+- 公网可以访问 TCP 80 和 443
 
-### 性能优化
-- **FastCGI缓存**: 每个站点独立缓存
-- **Redis缓存**: 共享对象缓存
-- **PHP OPcache**: 自动优化配置
-- **MariaDB调优**: 动态内存分配
-- **Nginx优化**: 高性能配置
+不再支持 256MB/512MB VPS。现代 WordPress、PHP-FPM、MariaDB、Redis 和系统服务在这种配置下很难同时保持可预测的稳定性。
 
-### 安全防护
-- **SSL自动化**: Let's Encrypt证书自动获取和续期
-- **防火墙管理**: UFW防火墙配置
-- **Fail2ban集成**: 自动防护暴力攻击
-- **安全扫描**: 内置安全检查工具
+### 多站点建议上限
 
-### 监控和备份
-- **实时监控**: 系统资源和站点状态
-- **访问日志分析**: 详细统计和热门页面
-- **自动备份**: 支持定时备份设置
-- **完整恢复**: 快速恢复到任意备份点
+脚本会在部署前执行硬性检查：
 
-## 📋 系统要求
+| 内存 | 建议最大站点数 |
+|---|---:|
+| 1GB–2GB | 1 |
+| 2GB–4GB | 2 |
+| 4GB–8GB | 4 |
+| 8GB+ | 8 |
 
-### 基本要求
-- **操作系统**: Ubuntu 20.04/22.04/24.04 LTS
-- **网络**: 稳定的互联网连接
+实际容量仍取决于主题、插件、访问量和 WooCommerce 使用情况。高流量或电商站点应明显低于表中上限。
 
-### VPS配置要求
+## 部署前准备
 
-#### 多站点管理版 (wp-vps-manager.sh)
-| 配置等级 | 内存 | CPU | 存储 | 最大站点数 | 推荐站点数 |
-|----------|------|-----|------|------------|------------|
-| 高配置   | 8GB+ | 4核+ | 40GB+ | 10个 | 8个 |
-| 中等配置 | 4GB+ | 2核+ | 30GB+ | 6个  | 4个 |
-| 标准配置 | 2GB+ | 2核+ | 25GB+ | 3个  | 2个 |
-| 基础配置 | 1GB+ | 1核+ | 20GB+ | 2个  | 1个 |
-| 最低要求 | 512MB | 1核 | 10GB | 1个  | 1个 |
+1. 为主域名配置 A/AAAA 记录。
+2. 如果选择包含 `www`，也必须提前配置 `www` 的 DNS 记录。
+3. 确认云厂商安全组允许当前 SSH 端口、80 和 443。
+4. 已有服务器请备份 `/etc`、网站文件和数据库。
+5. 不要同时运行两个部署或管理命令；脚本也会使用 `flock` 阻止并发执行。
 
-#### 单站点极致性能版 (deploy-single-wordpress.sh)
-| 配置等级 | 内存 | CPU | 存储 | 优化策略 | WooCommerce支持 |
-|----------|------|-----|------|----------|-----------------|
-| 高配置   | 4GB+ | 2核+ | 20GB+ | 标准优化 | ✓ 完全支持 |
-| 中等配置 | 2GB+ | 2核+ | 15GB+ | 积极优化 | ✓ 支持 |
-| 标准配置 | 1GB+ | 1核+ | 10GB+ | 激进优化 | ⚠ 谨慎使用 |
-| 小VPS    | 512MB+ | 1核+ | 8GB+ | 极限优化 | ❌ 不推荐 |
-| 超小VPS  | 256MB+ | 1核+ | 5GB+ | 生存模式 | ❌ 强烈不推荐 |
+## 多站点部署
 
-**自动安装软件**:
-- Nginx (最新稳定版)
-- MariaDB 10.11
-- PHP 8.2/8.3/8.4 (根据需要)
-- Redis, Certbot, Fail2ban, UFW防火墙
-
-## 🚀 一键部署
-
-### 多站点管理版本
 ```bash
 wget https://raw.githubusercontent.com/hwc0212/wp-shell/main/wp-vps-manager.sh
 chmod +x wp-vps-manager.sh
 sudo ./wp-vps-manager.sh
 ```
 
-### 单站点极致性能版本
+首次运行会依次：
+
+1. 收集站点、PHP、管理员和可选 `www` 信息。
+2. 检查内存、磁盘和站点数量。
+3. 安装 Nginx、MariaDB、Redis、PHP-FPM、Certbot、WP-CLI、Fail2ban 等组件。
+4. 按整体内存预算配置 MariaDB、Redis 和所有 PHP-FPM 版本。
+5. 为每个站点创建独立数据库、缓存区和 Redis DB。
+6. 先部署 ACME HTTP 配置，再申请证书并切换 HTTPS。
+7. 安装 WordPress、Redis Object Cache 和可选 WooCommerce。
+8. 安装管理命令和每日自动备份 timer。
+9. 询问是否启用 UFW；启用时保留现有规则，并先允许当前 SSH 端口。
+
+### 多站点命令
+
+```bash
+sudo wp-vps-manager list
+sudo wp-vps-manager status
+sudo wp-vps-manager add-site
+sudo wp-vps-manager deploy example.com
+sudo wp-vps-manager import
+sudo wp-vps-manager optimize
+sudo wp-vps-manager security-scan
+```
+
+每个标准部署站点都会生成一个无密钥包装命令：
+
+```bash
+manage-example.com status
+manage-example.com info
+manage-example.com cache-clear
+manage-example.com backup
+manage-example.com backups
+manage-example.com restore 20260817-020000
+manage-example.com update
+manage-example.com restart
+```
+
+也可以直接使用全局命令：
+
+```bash
+sudo wp-vps-manager backup example.com
+sudo wp-vps-manager backup-all
+sudo wp-vps-manager restore example.com 20260817-020000
+sudo wp-vps-manager site example.com cache-clear
+```
+
+## 单站点部署
+
 ```bash
 wget https://raw.githubusercontent.com/hwc0212/wp-shell/main/deploy-single-wordpress.sh
 chmod +x deploy-single-wordpress.sh
 sudo ./deploy-single-wordpress.sh
 ```
 
-## 🎯 脚本选择指南
+部署过程中可以选择：
 
-### 选择多站点版本的情况：
-- 需要管理多个WordPress站点
-- 代理商或多站点用户
-- 需要统一的管理界面
-- 替代Cloudways/SpinupWP服务
+- PHP 8.2、8.3 或 8.4
+- 只使用根域名，或同时包含 `www`
+- 根域名或 `www` 作为 WordPress 主地址
+- 是否安装 WooCommerce
 
-### 选择单站点版本的情况：
-- 只有一个WordPress站点
-- 追求极致性能和速度
-- 高流量网站或电商站点
-- VPS资源充足，希望全部用于单站点
-- 小VPS需要极限优化 (512MB-1GB内存)
+部署完成后使用：
 
-## 📖 部署后管理
-
-### 多站点管理命令
 ```bash
-wp-vps-manager list        # 列出所有站点
-wp-vps-manager status      # 检查所有站点状态  
-wp-vps-manager backup-all  # 备份所有站点
+manage-example.com status
+manage-example.com cache-clear
+manage-example.com backup
+manage-example.com backups
+manage-example.com restore 20260817-020000
+manage-example.com update
+manage-example.com optimize
+manage-example.com security-scan
 ```
 
-### 单站点管理命令
+重新应用配置不会重新生成数据库或管理员密码：
+
 ```bash
-manage-DOMAIN status       # 检查站点状态和性能
-manage-DOMAIN cache-clear  # 清除所有缓存
-manage-DOMAIN backup       # 创建站点备份
-manage-DOMAIN optimize     # 执行性能优化
-manage-DOMAIN monitor      # 实时监控
+sudo ./deploy-single-wordpress.sh --reconfigure
 ```
 
-## 🛠️ 常见问题
+## 备份与恢复
 
-### Q: 我的VPS配置很低，能用吗？
-A: 可以！脚本会自动检测VPS配置：
-- **512MB-1GB**: 建议使用单站点版本，启用极限优化
-- **2GB+**: 可以使用多站点版本，支持2-3个站点
-- **4GB+**: 完全支持多站点部署
+### 备份内容
 
-### Q: 如何选择PHP版本？
-A: 脚本支持PHP 8.2/8.3/8.4：
-- **PHP 8.4**: 最新版本，性能最佳，推荐新项目
-- **PHP 8.3**: 稳定版本，支持JIT编译器
-- **PHP 8.2**: 兼容性最好，适合老项目
+每个备份目录包含：
 
-### Q: WooCommerce对VPS有什么要求？
-A: WooCommerce需要更多资源：
-- **最低**: 1GB内存
-- **推荐**: 2GB+内存
-- **小VPS**: 脚本会自动警告并提供优化建议
-
-### Q: 部署失败怎么办？
-A: 脚本有完整的错误处理：
-- 检查日志文件：`/var/log/wp-deploy-*.log`
-- 重新运行脚本会自动跳过已完成的步骤
-- 联系支持或查看GitHub Issues
-
-## 🎛️ 管理功能
-
-### VPS管理控制面板
-运行脚本后可访问完整的管理界面：
-
-**📱 应用管理**:
-- 部署新的WordPress应用
-- 导入现有WordPress站点
-- 克隆现有应用
-
-**⚙️ 应用操作**:
-- 管理应用设置
-- 升级PHP版本
-- SSL证书管理
-- 域名管理
-
-**📊 监控和分析**:
-- 实时监控面板
-- 访问日志分析
-- 性能分析报告
-- 安全扫描
-
-**💾 备份和迁移**:
-- 自动备份设置
-- 手动备份/恢复
-- 跨服务器迁移
-
-**🔧 服务器管理**:
-- 服务器优化
-- 软件包管理
-- 防火墙设置
-- 系统更新
-
-## 📁 重要文件位置
-
-### 多站点管理版
-```
-/root/wordpress-credentials-DOMAIN.txt    # 站点登录凭据
-/root/wp-vps-deployment-summary.txt       # 部署摘要
-~/.vps-manager/wordpress-sites.conf       # 站点配置
-/var/log/wp-deploy-*.log                  # 部署日志
-/var/www/DOMAIN/                          # 站点目录
-├── public/                               # WordPress文件
-├── cache/fastcgi/                        # FastCGI缓存
-├── logs/                                 # 站点日志
-└── backups/                              # 站点备份
+```text
+files.tar.gz       WordPress 文件
+database.sql.gz    MariaDB 数据库
+manifest.txt       域名、时间和 WordPress 版本
+SHA256SUMS         完整性校验
 ```
 
-### 单站点极致性能版
-```
-/root/wordpress-single-credentials-DOMAIN.txt  # 站点凭据
-/var/log/wp-single-deploy-*.log                # 部署日志
-/var/www/DOMAIN/                               # 站点目录
-├── public/                                    # WordPress文件
-├── cache/fastcgi/                             # FastCGI缓存（极致优化）
-├── logs/                                      # 站点日志
-└── backups/                                   # 站点备份
-/usr/local/bin/manage-DOMAIN                   # 极致性能管理脚本
+多站点备份位置：
+
+```text
+/var/backups/wp-shell/DOMAIN/TIMESTAMP/
 ```
 
-## 🔧 性能优化详情
+单站点备份位置：
 
-### 小VPS专用优化 (deploy-single-wordpress.sh)
+```text
+/var/backups/wp-shell-single/DOMAIN/TIMESTAMP/
+```
 
-#### 系统级优化
-- **内核参数调整**: 小VPS降低网络缓冲区大小 (65536→8192)
-- **文件句柄限制**: 小VPS从100万降低到10万
-- **服务禁用**: 禁用更多不必要的系统服务
-- **Swap配置**: 小VPS自动配置swap缓解内存压力
+默认保留 14 天。可以在执行部署脚本时设置：
 
-#### 数据库优化 (MariaDB)
-- **内存分配**: 高配置70%，小VPS50%，超小VPS40%
-- **连接数**: 标准500，小VPS100，超小VPS50
-- **缓冲区优化**: 小VPS大幅降低各种缓冲区大小
-
-#### PHP优化
-- **内存限制**: 标准512M，小VPS256M，超小VPS128M
-- **进程池配置**: 根据VPS配置动态调整进程数和内存
-- **OPcache优化**: 标准1/4内存，小VPS1/6内存，超小VPS1/8内存
-
-#### Redis优化
-- **内存分配**: 标准15%，小VPS10%，超小VPS8%
-- **连接限制**: 标准10000，小VPS1000，超小VPS500
-
-#### WooCommerce智能警告
-- **超小VPS**: 强烈不建议安装，需要用户强制确认
-- **小VPS**: 给出详细使用建议和限制说明
-- **标准配置以上**: 正常支持，提供优化建议
-
-## 🔧 故障排除
-
-### 常见问题解决
-
-**权限问题**:
 ```bash
-sudo ./wp-vps-manager.sh  # 确保使用sudo运行
+sudo BACKUP_RETENTION_DAYS=30 ./wp-vps-manager.sh
 ```
 
-**语法检查**:
+恢复流程会：
+
+1. 校验 `SHA256SUMS`。
+2. 自动为当前状态创建一份恢复前备份。
+3. 启用 WordPress 维护模式。
+4. 原样恢复网站文件和数据库。
+5. 重设文件权限并清理站点缓存。
+
+### 自动备份
+
 ```bash
-bash -n wp-vps-manager.sh  # 检查脚本语法
+systemctl status wp-vps-backup.timer     # 多站点
+systemctl status wp-single-backup.timer  # 单站点
+systemctl list-timers --all | grep wp-
 ```
 
-**SSL证书获取失败**:
+自动备份使用 systemd timer，每天约 02:00 执行，并带有随机延迟。服务器关机错过计划后，会在恢复运行时补执行。
+
+本地备份无法防范整台 VPS 或磁盘损坏。生产环境还应使用 `rclone`、对象存储或其他工具把 `/var/backups` 同步到异地，并定期执行恢复演练。
+
+## 缓存设计
+
+每个站点包含三层缓存：
+
+- Nginx FastCGI 页面缓存：独立目录和 16MB keys zone。
+- Redis Object Cache：多站点分别使用 Redis DB 0–15，并设置域名前缀。
+- PHP OPcache：默认启用，JIT 默认关闭。
+
+FastCGI 会跳过 POST、查询字符串、WordPress 后台、登录、Cron、XML-RPC、WooCommerce 购物车/结账/账户页面，以及登录和购物车 Cookie。
+
+如果使用特殊会员、支付、语言或个性化插件，应继续扩展对应站点的 Nginx 跳过规则，并在生产流量下验证缓存行为。
+
+## 资源预算
+
+脚本不会再把 70% 内存分给 MariaDB、同时把 80% 分给 PHP。新的预算会先为系统保留内存，再计算：
+
+- 多站点 MariaDB：约总内存 30%，有上下限。
+- 单站点 MariaDB：约总内存 35%，有上下限。
+- Redis：约总内存 5%，32–512MB。
+- PHP-FPM：使用剩余预算，按约 96MB/进程估算，并设置最大进程数。
+- FastCGI keys zone：每个站点 16MB。
+
+这是一套安全初始值，不替代基于真实流量的调优。上线后应观察 PHP-FPM RSS、MariaDB buffer pool 命中率、慢查询、磁盘延迟和缓存命中率。
+
+## 安全措施
+
+- 配置目录和数据库密码文件为 root `0600`。
+- Redis 只监听回环地址，启用密码和 protected mode。
+- 管理包装器不包含数据库或 Redis 密码。
+- 部署日志为 `0600`，不会输出生成的密码。
+- `wp-config.php` 使用 `0640`，禁止在线文件编辑。
+- 不公开 PHP-FPM status/ping 页面。
+- UFW 不重置现有规则，并优先识别当前 SSH 连接端口。
+- Fail2ban 只启用系统自带并可验证的 SSH/Nginx 认证规则，不使用可能误封成功登录的 WordPress POST 规则。
+- HTTPS 配置启用 TLS 1.2/1.3、HSTS（不自动 preload）和常用安全响应头。
+
+管理员密码只在首次安装时生成，并保存在：
+
+```text
+/root/wordpress-credentials-DOMAIN.txt
+/root/wordpress-single-credentials-DOMAIN.txt
+```
+
+文件权限为 `0600`。首次登录后仍建议将凭据转移到密码管理器并删除明文文件。
+
+## 重要文件
+
+### 多站点
+
+```text
+/etc/wp-vps-manager/sites.v2                 站点清单（不可执行数据格式）
+/etc/wp-vps-manager/databases/               每站点数据库凭据
+/etc/wp-vps-manager/redis.secret             Redis 密码
+/usr/local/sbin/wp-vps-manager               安装后的完整管理器
+/usr/local/bin/manage-DOMAIN                  无密钥站点包装器
+/var/www/DOMAIN/public                        标准站点目录
+/var/www/DOMAIN/logs                          Nginx 站点日志
+/var/cache/nginx/DOMAIN                       FastCGI 缓存
+/var/backups/wp-shell/DOMAIN                   备份
+/var/log/wp-shell                             部署与管理日志
+```
+
+### 单站点
+
+```text
+/etc/wp-single-deploy/site.v2                 站点配置
+/etc/wp-single-deploy/database.v1             数据库凭据
+/etc/wp-single-deploy/redis.secret            Redis 密码
+/usr/local/sbin/wp-single-manager             安装后的管理器
+/usr/local/bin/manage-DOMAIN                  无密钥站点包装器
+/var/backups/wp-shell-single/DOMAIN            备份
+/var/log/wp-shell                             部署与管理日志
+```
+
+## 从 v7/旧单站点脚本升级
+
+v8 不会执行旧版 `~/.vps-manager/wordpress-sites.conf`，因为旧格式本质上是可执行 Shell 配置，且无法安全解析任意历史输入。
+
+推荐迁移流程：
+
+1. 备份旧站点、数据库和 `/etc/nginx`。
+2. 下载新的 `wp-vps-manager.sh`。
+3. 运行 `sudo ./wp-vps-manager.sh import` 登记现有 WordPress 路径。
+4. 使用 `sudo wp-vps-manager list` 核对站点。
+5. 先执行一次手动备份并检查 `SHA256SUMS`。
+6. 不要对导入站点直接执行 `deploy`，除非确定要让脚本接管其 Nginx、证书和缓存配置。
+
+导入命令只添加管理记录和包装命令，不会自动替换现有 Nginx、SSL、数据库或 Redis 设置。
+
+## 故障排除
+
+### 查看日志
+
 ```bash
-# 检查域名DNS解析
-nslookup your-domain.com
-
-# 手动获取证书
-certbot certonly --webroot -d your-domain.com --webroot-path /var/www/your-domain.com/public
+ls -lt /var/log/wp-shell/
+tail -f /var/log/wp-shell/wp-vps-manager-*.log
+tail -f /var/log/wp-shell/wp-single-deploy-*.log
 ```
 
-**服务异常**:
+### 验证服务
+
 ```bash
-# 检查服务状态
-systemctl status nginx php8.3-fpm mariadb redis-server
-
-# 重启服务
-systemctl restart nginx php8.3-fpm mariadb redis-server
+nginx -t
+systemctl status nginx mariadb redis-server fail2ban
+systemctl status php8.3-fpm
+certbot certificates
 ```
 
-**缓存问题**:
+### 证书失败
+
 ```bash
-# 清除所有缓存
-manage-your-domain.com cache-clear
-
-# 手动清除FastCGI缓存
-rm -rf /var/www/your-domain.com/cache/fastcgi/*
+getent ahosts example.com
+getent ahosts www.example.com
+ss -ltnp | grep -E ':(80|443)\b'
+ufw status verbose
 ```
 
-### 日志分析
+如果选择了 `www`，但其 DNS 没有解析，证书申请会主动停止。修复 DNS 后重新运行：
+
 ```bash
-# 查看部署日志
-tail -f /var/log/wp-deploy-*.log
-
-# 查看访问日志
-tail -f /var/www/your-domain.com/logs/nginx-access.log
-
-# 查看错误日志
-tail -f /var/www/your-domain.com/logs/nginx-error.log
+sudo wp-vps-manager deploy example.com
+# 或单站点
+sudo ./deploy-single-wordpress.sh --reconfigure
 ```
 
-## 📈 更新日志
+### 恢复验证
 
-### v7.0 (2026-01-08) - 当前版本
-- ✅ **重大更新**: 脚本重命名为 wp-vps-manager
-- ✅ **智能VPS配置检查**: 自动检测VPS配置并限制站点数量
-- ✅ **小VPS专用优化**: 为512MB-1GB内存VPS提供极限优化
-- ✅ **新增功能**: 单站点极致性能版本 (deploy-single-wordpress.sh)
-- ✅ **数据库升级**: 替换MySQL为MariaDB 10.11，动态内存分配
-- ✅ **功能整合**: 整合多个脚本的优秀特性
-- ✅ **错误修复**: 改进WordPress安装流程，增加错误处理
-- ✅ **凭据管理**: 完善凭据保存功能，包含管理员密码
-- ✅ **SSL优化**: 优化SSL证书获取流程
-- ✅ **WooCommerce智能警告**: 小VPS自动警告WooCommerce风险
-- ✅ **测试完善**: 通过完整的语法检查和功能测试
+```bash
+cd /var/backups/wp-shell/example.com/20260817-020000
+sha256sum --check SHA256SUMS
+```
 
-### 单站点极致性能版特性 (v1.0)
-- 🚀 **VPS资源专用**: 所有系统资源专用于单个WordPress站点
-- 🚀 **动态资源分配**: MariaDB使用70%内存，Redis使用15%内存
-- 🚀 **三重缓存**: FastCGI + Redis + OPcache
-- 🚀 **PHP JIT**: PHP 8.3/8.4 JIT编译器支持
-- 🚀 **WooCommerce优化**: 电商专用性能优化
-- 🚀 **实时监控**: 内置性能监控功能
+## 开发与检查
 
-### v6.1
-- 新增跨服务器迁移功能
-- 改进PHP版本管理
-- 增强监控和日志分析
-- 优化备份和恢复功能
+本地静态检查：
 
-### v6.0
-- 重构代码架构
-- 新增实时监控功能
-- 改进用户界面
-- 增强安全特性
+```bash
+bash tests/static-checks.sh
+bash tests/config-roundtrip.sh
+bash tests/render-nginx.sh
+docker run --rm -v "$PWD:/mnt:ro" koalaman/shellcheck:stable \
+  -x /mnt/wp-vps-manager.sh /mnt/deploy-single-wordpress.sh \
+  /mnt/tests/static-checks.sh /mnt/tests/config-roundtrip.sh \
+  /mnt/tests/render-nginx.sh /mnt/tests/nginx-integration.sh \
+  /mnt/tests/service-config-integration.sh
+```
 
-### v5.x
-- 多PHP版本支持
-- 自动站点检测
-- 性能优化改进
+GitHub Actions 还会在 Ubuntu 24.04 容器中用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 解析生成的服务配置，并在每次 push 和 pull request 时执行完整检查。
 
-## 📞 技术支持
+## 当前边界
 
-### 获取帮助
-1. **查看文档**: 内置帮助 `sudo ./wp-vps-manager.sh --help`
-2. **检查日志**: 部署日志 `/var/log/wp-deploy-*.log`
-3. **运行诊断**: 语法检查 `bash -n wp-vps-manager.sh`
-4. **GitHub支持**: [Issues](https://github.com/hwc0212/wp-shell/issues) 和 [Discussions](https://github.com/hwc0212/wp-shell/discussions)
+当前版本没有 Web 控制面板，也没有宣称支持以下尚未实现的能力：
 
-### 报告问题
-提供以下信息：
-- Ubuntu版本: `lsb_release -a`
-- 错误日志内容
-- 操作步骤描述
-- 在 [GitHub Issues](https://github.com/hwc0212/wp-shell/issues) 中提交
+- 一键克隆站点
+- 自动跨服务器迁移
+- 自动域名替换
+- 交互式 PHP 大版本迁移
+- 云端/异地备份上传
+- 集群、高可用或数据库复制
 
-## 📄 许可证
+这些操作可以通过 WP-CLI、rsync、对象存储和供应商工具完成，但在没有完整验证和回滚机制前不会作为菜单中的“已完成”功能展示。
 
-本项目采用MIT许可证。
+## 免责声明
 
-## ⚠️ 免责声明
+本项目按现状提供。生产环境使用前，请在相同 Ubuntu/PHP 组合上测试，并保留可在服务器之外恢复的备份。作者不对脚本使用导致的数据丢失、停机或服务中断承担责任。
 
-本脚本仅供学习和测试使用。在生产环境中使用前，请充分测试并备份重要数据。作者不对使用本脚本造成的任何损失承担责任。
+## License
 
----
-
-**作者**: [huwencai.com](https://huwencai.com)  
-**GitHub**: https://github.com/hwc0212/wp-shell  
-**注意**: 本脚本会修改系统配置，建议在测试环境中先行验证。使用前请确保已备份重要数据。
+MIT
