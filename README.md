@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.1.0
+- 当前版本：`wp-shell.sh` v9.2.0
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -127,30 +127,17 @@ Environment: WordPress stack not detected
 sudo ./wp-shell.sh install
 ```
 
-首次安装时，向导会询问：
+环境安装向导只询问三类服务器级设置，不会询问域名或 WordPress 管理员信息：
 
-1. 需要部署多少个网站。
-2. 每个网站的不带 `www` 的基础域名。
-3. 使用 PHP 8.2、8.3 还是 8.4。
-4. WordPress 管理员邮箱。
-5. WordPress 管理员用户名。
-6. 网站标题。
-7. 是否把 `www` 加入证书。
-8. 根域名和 `www` 中哪一个作为主域名。
-9. 是否安装 WooCommerce。
-10. 是否启用并配置 UFW。
+1. 部署模式：`Single website` 或 `Multiple websites`。
+2. 环境统一使用的 PHP 版本：8.2、8.3 或 8.4。
+3. 是否启用并配置 UFW。
 
-输入域名时只输入：
+选择 `Single website` 后只能添加一个网站；适合整台 VPS 只运行一个 WordPress 的情况。选择 `Multiple websites` 后可以继续添加网站，但仍受服务器内存上限和最多 16 个 Redis DB 的限制。部署模式不是 WordPress Multisite，它表示这台 VPS 允许 wp-shell 管理一个还是多个相互独立的网站。
 
-```text
-example.com
-```
+UFW 选项只处理服务器防火墙。选择启用时，脚本会保留当前 SSH 端口，开放 SSH、HTTP 和 HTTPS，不执行 `ufw reset`；如果云厂商还提供安全组或云防火墙，仍需在云平台开放相同端口。
 
-不要输入协议、路径或末尾斜杠，例如不要输入：
-
-```text
-https://example.com/
-```
+完成三项选择后，环境设置写入 `/etc/wp-shell/environment.v1`。即使当前还没有网站，再次运行 `sudo wp-shell` 也会进入完整管理菜单。
 
 ### 3. 安装过程会执行什么
 
@@ -159,18 +146,60 @@ https://example.com/
 1. 检查 Ubuntu 版本、CPU 架构、内存和磁盘空间。
 2. 安装 Nginx、MariaDB、Redis、PHP-FPM、Certbot、WP-CLI、Fail2ban、SQLite 等组件。
 3. 根据整机内存计算 MariaDB、Redis 和 PHP-FPM 初始预算。
-4. 为每个域名创建独立 PHP-FPM pool 和 Unix socket。
-5. 为每个站点创建独立数据库、数据库用户和 Redis DB。
-6. 创建 `/var/www/DOMAIN/` 站点目录结构。
-7. 先部署临时 HTTP ACME 配置，再申请证书。
-8. 证书成功后生成完整 HTTPS 和 FastCGI 缓存配置。
-9. 安装 WordPress、Redis Object Cache 和可选的 WooCommerce。
-10. 安装每日备份 timer 和每分钟指标采集 timer。
-11. 安装统一的全局 `wp-shell` 命令。
+4. 配置选定 PHP 版本的全局安全参数；站点 PHP-FPM pool 会在添加网站时创建。
+5. 安装每日备份 timer 和每分钟指标采集 timer。
+6. 安装统一的全局 `wp-shell` 命令。
 
 Nginx 配置在启用前必须通过 `nginx -t`。验证失败时，脚本会恢复原配置。
 
-### 4. 安装完成后检查
+### 4. 添加第一个网站
+
+环境安装完成后，重新打开菜单：
+
+```bash
+sudo wp-shell
+```
+
+选择：
+
+```text
+2) Add a new website
+```
+
+也可以直接执行：
+
+```bash
+sudo wp-shell site add
+```
+
+只有添加网站时才会询问以下内容：
+
+1. 每个网站的不带 `www` 的基础域名。
+2. WordPress 管理员邮箱。
+3. WordPress 管理员用户名。
+4. 网站标题。
+5. 是否把 `www` 加入证书。
+6. 根域名和 `www` 中哪一个作为主域名。
+7. 是否安装 WooCommerce。
+
+输入基础域名时只输入：
+
+```text
+example.com
+```
+
+不要输入 `www`、协议、路径或末尾斜杠，例如不要输入：
+
+```text
+www.example.com
+https://example.com/
+```
+
+如果选择把 `www` 加入证书，脚本才会继续询问是否使用 `www.example.com` 作为主域名。未把 `www` 加入证书时，根域名自动成为主域名。
+
+添加网站时，脚本会创建独立 PHP-FPM pool、数据库账号、Redis DB、站点目录、证书和 Nginx 配置，并安装 WordPress、Redis Object Cache 以及可选的 WooCommerce。网站沿用环境安装时选择的 PHP 版本，不会再次询问 PHP。
+
+### 5. 安装完成后检查
 
 ```bash
 sudo wp-shell --version
@@ -195,12 +224,12 @@ sudo cat /root/wordpress-credentials-example.com.txt
 
 首次登录后，建议把密码保存到密码管理器，然后删除服务器上的明文凭据文件。
 
-### 5. WordPress 语言
+### 6. WordPress 语言
 
-脚本默认下载 `zh_CN` WordPress。如果需要英文版本，可以在首次安装时指定：
+脚本默认下载 `zh_CN` WordPress。如果需要为新网站安装英文版本，应在添加网站时指定：
 
 ```bash
-sudo env WORDPRESS_LOCALE=en_US ./wp-shell.sh install
+sudo env WORDPRESS_LOCALE=en_US wp-shell site add
 ```
 
 终端程序本身始终使用英文和 ASCII 字符，以避免不同 SSH 客户端的编码和字符宽度问题；这不影响 WordPress 后台语言，也不影响本 README 使用中文。
@@ -238,11 +267,11 @@ sudo ./wp-shell.sh
 0) Exit
 ```
 
-通常选择 `1`。如果尚无站点配置，会继续询问网站数量、域名、PHP 版本和管理员信息；如果之前安装中断但已保存站点配置，会直接根据已保存配置修复环境，不会重复收集域名。
+通常选择 `1`。如果尚无环境配置，脚本只询问单网站或多网站模式、PHP 版本和 UFW；不会在这里询问域名。如果之前安装中断但 `/etc/wp-shell/environment.v1` 已经保存，脚本会按保存的设置修复环境，不会重复收集信息。
 
 ### 2. 状态二：已有 Nginx、PHP-FPM 和数据库，但不是 wp-shell 安装
 
-当三个核心组件已经安装，但不存在有效的 `/etc/wp-shell/sites.v3` 站点清单时，脚本认为这是一个外部 WordPress 环境，显示导入与优化菜单：
+当三个核心组件已经安装，但不存在有效的 `/etc/wp-shell/environment.v1` 环境配置时，脚本认为这是一个尚未由 wp-shell 管理的外部 WordPress 环境，显示导入与优化菜单：
 
 ```text
 1) Import existing websites only (safe)
@@ -267,7 +296,7 @@ sudo ./wp-shell.sh
 
 ### 3. 状态三：已经由 wp-shell 管理
 
-当 `/etc/wp-shell/sites.v3` 存在且包含网站，同时 Nginx、PHP-FPM 和数据库组件齐全时，显示完整运维菜单：
+当 `/etc/wp-shell/environment.v1` 存在，并且 Nginx、PHP-FPM 和数据库组件齐全时，显示完整运维菜单。此时允许 `/etc/wp-shell/sites.v3` 不存在或网站数量为 0：
 
 ```text
 1) Dashboard
@@ -403,7 +432,23 @@ sudo wp-shell report 7d > wp-shell-report.txt
 sudo wp-shell site add
 ```
 
-命令会收集新站点信息，重新计算整机资源预算，创建 PHP-FPM pool、数据库、证书、Nginx 配置和 WordPress。
+也可以运行 `sudo wp-shell`，选择 `2) Add a new website`。这两个入口执行完全相同的流程。
+
+命令会依次询问：
+
+| 输入项 | 说明 |
+|---|---|
+| `Domain without www` | 只输入基础域名，例如 `example.com` |
+| `Administrator email` | WordPress 管理员邮箱，也用于相关站点证书操作 |
+| `Administrator username` | WordPress 管理员用户名，默认 `wpadmin` |
+| `Site title` | WordPress 网站标题，默认使用基础域名 |
+| `Include www...in the certificate` | 只有 `www` DNS 已解析到当前 VPS 时才选择 yes |
+| `Use www...as the canonical domain` | 仅在证书包含 `www` 时出现；选择网站的唯一主域名 |
+| `Install WooCommerce` | 需要电商功能时选择 yes |
+
+站点 PHP 版本由 `/etc/wp-shell/environment.v1` 决定，添加网站时不会单独询问。如果环境模式是 `single`，已有一个网站后脚本会拒绝添加第二个；如果是 `multi`，脚本会根据整机内存策略检查允许的网站数量。
+
+信息确认后，命令会重新计算整机资源预算，创建 PHP-FPM pool、数据库、证书、Nginx 配置和 WordPress。
 
 添加完成后检查：
 
@@ -764,7 +809,8 @@ sudo wp-shell optimize
 
 脚本先为操作系统预留内存，再为各服务计算安全初始值：
 
-- MariaDB：约总内存的 30%，设置上下限。
+- 单网站模式 MariaDB：约总内存的 35%，设置上下限。
+- 多网站模式 MariaDB：约总内存的 30%，设置上下限。
 - Redis：约总内存的 5%，限制为 32MB 至 512MB。
 - PHP-FPM：使用受限制的剩余预算。
 - PHP 进程：按约 96MB/进程估算。
@@ -799,6 +845,7 @@ sudo wp-shell optimize
 ## 十二、主要配置文件
 
 ```text
+/etc/wp-shell/environment.v1              环境模式、默认 PHP 版本和 UFW 选择
 /etc/wp-shell/sites.v3                    站点清单，不是可执行 Shell 配置
 /etc/wp-shell/databases/                  每站点数据库凭据
 /etc/wp-shell/redis.secret                Redis 密码

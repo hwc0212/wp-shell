@@ -23,6 +23,7 @@ if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.s
 fi
 
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
+grep -Fq "readonly ENVIRONMENT_CONFIG_FILE=\"\$CONFIG_DIR/environment.v1\"" "$repo_root/wp-shell.sh"
 grep -Fq "fastcgi_pass unix:\$pool_socket;" "$repo_root/wp-shell.sh"
 grep -Fq 'It intentionally excludes client IPs, cookies, and query strings.' "$repo_root/wp-shell.sh"
 if grep -q 'install_site_wrapper' "$repo_root/wp-shell.sh"; then

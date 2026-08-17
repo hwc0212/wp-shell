@@ -56,22 +56,21 @@ load_sites_config
 [[ -f "$DATABASE_CONFIG_DIR/legacy.example.com.v1" ]]
 find "$CONFIG_DIR/migration-backup" -type f -name sites.v2 | grep -q .
 
-SITE_COUNT=2
-SITE_DOMAINS[2]="imported.example.com"
-SITE_MODES[2]="imported"
-deploy_log="$test_root/deployed"
-prepare_stack() { :; }
-collect_yes_no() { return 1; }
-deploy_site() { printf '%s\n' "${SITE_DOMAINS[$1]}" >> "$deploy_log"; }
-install_self() { :; }
-install_backup_timer() { :; }
-install_metrics_timer() { :; }
-collect_metrics() { :; }
-bootstrap_server
-grep -qx 'legacy.example.com' "$deploy_log"
-if grep -q 'imported.example.com' "$deploy_log"; then
-    printf 'An imported site was deployed without explicit transfer.\n' >&2
-    exit 1
-fi
+ensure_environment_config
+[[ "$ENVIRONMENT_MODE" == "multi" ]]
+[[ "$DEFAULT_PHP_VERSION" == "8.3" ]]
+[[ "$ENVIRONMENT_UFW" == "no" ]]
 
-printf 'Configuration round-trip and legacy migration tests passed.\n'
+ENVIRONMENT_MODE="single"
+DEFAULT_PHP_VERSION="8.4"
+ENVIRONMENT_UFW="yes"
+save_environment_config
+ENVIRONMENT_MODE=""
+DEFAULT_PHP_VERSION="8.2"
+ENVIRONMENT_UFW="no"
+load_environment_config
+[[ "$ENVIRONMENT_MODE" == "single" ]]
+[[ "$DEFAULT_PHP_VERSION" == "8.4" ]]
+[[ "$ENVIRONMENT_UFW" == "yes" ]]
+
+printf 'Site/environment configuration and legacy migration tests passed.\n'

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.1.0
+# Version 9.2.0
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="9.1.0"
+readonly VERSION="9.2.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
 readonly CONFIG_DIR
 readonly SITES_CONFIG_FILE="$CONFIG_DIR/sites.v3"
+readonly ENVIRONMENT_CONFIG_FILE="$CONFIG_DIR/environment.v1"
 readonly DATABASE_CONFIG_DIR="$CONFIG_DIR/databases"
 readonly REDIS_SECRET_FILE="$CONFIG_DIR/redis.secret"
 readonly STATE_DIR="${WP_SHELL_STATE_DIR:-/var/lib/wp-shell}"
@@ -53,6 +54,9 @@ declare -a SITE_PHP_MAX_CHILDREN=()
 declare -A PHP_CHILD_OVERRIDES=()
 SITE_COUNT=0
 LEGACY_SINGLE_DOMAIN=""
+ENVIRONMENT_MODE=""
+DEFAULT_PHP_VERSION="8.3"
+ENVIRONMENT_UFW="no"
 CURRENT_STEP="initialization"
 MARIADB_BUFFER_MB=256
 MARIADB_MAX_CONNECTIONS=50
@@ -168,6 +172,68 @@ validate_php_version() {
         [[ "$candidate" == "$version" ]] && return 0
     done
     return 1
+}
+
+load_environment_config() {
+    ENVIRONMENT_MODE=""
+    DEFAULT_PHP_VERSION="8.3"
+    ENVIRONMENT_UFW="no"
+    [[ -f "$ENVIRONMENT_CONFIG_FILE" ]] || return 0
+    local record value version_seen="no"
+    while IFS='|' read -r record value _extra; do
+        [[ -n "$record" ]] || continue
+        case "$record" in
+            version)
+                [[ "$value" == "1" ]] || die "Unsupported environment configuration version: $value"
+                version_seen="yes"
+                ;;
+            mode)
+                [[ "$value" == "single" || "$value" == "multi" ]] || die "Invalid environment mode: $value"
+                ENVIRONMENT_MODE="$value"
+                ;;
+            php)
+                validate_php_version "$value" || die "Unsupported environment PHP version: $value"
+                DEFAULT_PHP_VERSION="$value"
+                ;;
+            firewall)
+                [[ "$value" == "yes" || "$value" == "no" ]] || die "Invalid firewall setting: $value"
+                ENVIRONMENT_UFW="$value"
+                ;;
+            \#*) ;;
+            *) die "Unknown environment configuration record: $record" ;;
+        esac
+    done < "$ENVIRONMENT_CONFIG_FILE"
+    [[ "$version_seen" == "yes" ]] || die "Environment configuration has no version record."
+    [[ -n "$ENVIRONMENT_MODE" ]] || die "Environment configuration has no deployment mode."
+}
+
+save_environment_config() {
+    [[ "$ENVIRONMENT_MODE" == "single" || "$ENVIRONMENT_MODE" == "multi" ]] || die "Cannot save an invalid environment mode."
+    validate_php_version "$DEFAULT_PHP_VERSION" || die "Cannot save an invalid environment PHP version."
+    [[ "$ENVIRONMENT_UFW" == "yes" || "$ENVIRONMENT_UFW" == "no" ]] || die "Cannot save an invalid firewall setting."
+    local temp_file
+    temp_file="$(mktemp "$CONFIG_DIR/.environment.XXXXXX")"
+    {
+        printf 'version|1\n'
+        printf 'mode|%s\n' "$ENVIRONMENT_MODE"
+        printf 'php|%s\n' "$DEFAULT_PHP_VERSION"
+        printf 'firewall|%s\n' "$ENVIRONMENT_UFW"
+    } > "$temp_file"
+    install_private_file "$temp_file" "$ENVIRONMENT_CONFIG_FILE"
+    rm -f "$temp_file"
+}
+
+ensure_environment_config() {
+    if [[ -f "$ENVIRONMENT_CONFIG_FILE" ]]; then
+        load_environment_config
+        return
+    fi
+    if ((SITE_COUNT > 0)); then
+        ENVIRONMENT_MODE="multi"
+        DEFAULT_PHP_VERSION="${SITE_PHP_VERSIONS[1]}"
+        ENVIRONMENT_UFW="no"
+        save_environment_config
+    fi
 }
 
 site_index_by_domain() {
@@ -449,7 +515,11 @@ calculate_resource_budget() {
 
     os_reserve=$((total_mem * 25 / 100))
     ((os_reserve < 384)) && os_reserve=384
-    MARIADB_BUFFER_MB=$((total_mem * 30 / 100))
+    if [[ "$ENVIRONMENT_MODE" == "single" ]]; then
+        MARIADB_BUFFER_MB=$((total_mem * 35 / 100))
+    else
+        MARIADB_BUFFER_MB=$((total_mem * 30 / 100))
+    fi
     ((MARIADB_BUFFER_MB < 192)) && MARIADB_BUFFER_MB=192
     ((MARIADB_BUFFER_MB > 4096)) && MARIADB_BUFFER_MB=4096
     REDIS_MAX_MEMORY_MB=$((total_mem * 5 / 100))
@@ -533,6 +603,10 @@ ensure_php_repository() {
 unique_php_versions() {
     local -A seen=()
     local i version
+    if validate_php_version "$DEFAULT_PHP_VERSION"; then
+        seen["$DEFAULT_PHP_VERSION"]=1
+        printf '%s\n' "$DEFAULT_PHP_VERSION"
+    fi
     for ((i = 1; i <= SITE_COUNT; i++)); do
         version="${SITE_PHP_VERSIONS[$i]}"
         if [[ -z "${seen[$version]:-}" ]]; then
@@ -590,7 +664,6 @@ site_pool_status_socket() {
 configure_php() {
     CURRENT_STEP="configure PHP-FPM"
     calculate_resource_budget
-    ((SITE_COUNT > 0)) || return 0
     local version memory_limit i domain pool_id pool_file max_children
     memory_limit="256M"
     (( $(memory_mb) >= 4096 )) && memory_limit="512M"
@@ -666,7 +739,11 @@ EOF
         systemctl enable "php${version}-fpm"
         systemctl restart "php${version}-fpm"
     done < <(unique_php_versions)
-    log_message SUCCESS "Configured one PHP-FPM pool per site within a shared ${PHP_TOTAL_BUDGET_MB}MB budget."
+    if ((SITE_COUNT > 0)); then
+        log_message SUCCESS "Configured one PHP-FPM pool per site within a shared ${PHP_TOTAL_BUDGET_MB}MB budget."
+    else
+        log_message SUCCESS "Configured PHP ${DEFAULT_PHP_VERSION}-FPM. Site pools will be created when websites are added."
+    fi
 }
 
 configure_mariadb() {
@@ -1267,8 +1344,11 @@ collect_yes_no() {
 }
 
 collect_site_input() {
-    local next_index=$((SITE_COUNT + 1)) domain php_choice email admin title www woo primary redis_db max_sites
+    local next_index=$((SITE_COUNT + 1)) domain email admin title www woo primary redis_db max_sites
     max_sites="$(max_sites_for_memory "$(memory_mb)")"
+    if [[ "$ENVIRONMENT_MODE" == "single" ]]; then
+        max_sites=1
+    fi
     ((next_index <= max_sites)) || die "The current memory policy allows at most $max_sites managed site(s)."
 
     while true; do
@@ -1279,18 +1359,6 @@ collect_site_input() {
             log_message WARNING "That domain is already managed."
             continue
         fi
-        break
-    done
-
-    printf 'PHP version:\n'
-    local i
-    for i in "${!AVAILABLE_PHP_VERSIONS[@]}"; do
-        printf '  %d) PHP %s\n' "$((i + 1))" "${AVAILABLE_PHP_VERSIONS[$i]}"
-    done
-    while true; do
-        read -r -p "Select [1-${#AVAILABLE_PHP_VERSIONS[@]}]: " php_choice
-        [[ "$php_choice" =~ ^[0-9]+$ ]] || continue
-        ((php_choice >= 1 && php_choice <= ${#AVAILABLE_PHP_VERSIONS[@]})) || continue
         break
     done
 
@@ -1315,7 +1383,7 @@ collect_site_input() {
     SITE_COUNT=$next_index
     SITE_DOMAINS[next_index]="$domain"
     SITE_PRIMARY_DOMAINS[next_index]="$primary"
-    SITE_PHP_VERSIONS[next_index]="${AVAILABLE_PHP_VERSIONS[$((php_choice - 1))]}"
+    SITE_PHP_VERSIONS[next_index]="$DEFAULT_PHP_VERSION"
     SITE_WOOCOMMERCE[next_index]="$woo"
     SITE_WWW[next_index]="$www"
     SITE_REDIS_DATABASES[next_index]="$redis_db"
@@ -1342,23 +1410,12 @@ prepare_stack() {
 }
 
 bootstrap_server() {
-    local configure_ufw="no" i
     prepare_stack
-    if collect_yes_no "Enable and configure UFW (existing rules are preserved)" yes; then
-        configure_ufw=yes
-    fi
-    if [[ "$configure_ufw" == "yes" ]]; then
+    if [[ "$ENVIRONMENT_UFW" == "yes" ]]; then
         configure_firewall
     else
         log_message INFO "UFW configuration was skipped."
     fi
-    for ((i = 1; i <= SITE_COUNT; i++)); do
-        if [[ "${SITE_MODES[$i]}" == "imported" ]]; then
-            log_message INFO "Skipping imported site ${SITE_DOMAINS[$i]}; use 'wp-shell site deploy ${SITE_DOMAINS[$i]}' to transfer it to managed mode."
-            continue
-        fi
-        deploy_site "$i"
-    done
     install_self
     install_backup_timer
     install_metrics_timer
@@ -2303,6 +2360,7 @@ import_existing_sites() {
         log_message SUCCESS "Imported $domain from $wp_path."
     done < <(find /var/www /home -xdev -type f -name wp-config.php -print0 2>/dev/null)
     save_sites_config
+    ensure_environment_config
     log_message INFO "Import completed; $imported site(s) added."
 }
 
@@ -2341,6 +2399,8 @@ security_scan() {
 
 add_site_command() {
     local index
+    [[ -f "$ENVIRONMENT_CONFIG_FILE" ]] || die "Install or adopt the WordPress environment before adding a website."
+    wordpress_environment_detected || die "The Nginx/PHP-FPM/database environment is incomplete. Repair it before adding a website."
     collect_site_input
     index="$SITE_COUNT"
     prepare_stack
@@ -2351,18 +2411,39 @@ add_site_command() {
 }
 
 new_server_wizard() {
-    local site_count i
-    printf '\nwp-shell v%s setup\n\n' "$VERSION"
-    read -r -p "How many sites should be deployed? " site_count
-    if [[ ! "$site_count" =~ ^[0-9]+$ ]] || ((site_count < 1)); then
-        die "Invalid site count."
-    fi
-    for ((i = 1; i <= site_count; i++)); do
-        printf '\nConfigure site %d/%d\n' "$i" "$site_count"
-        collect_site_input
+    local mode_choice php_choice i
+    printf '\nwp-shell v%s environment setup\n\n' "$VERSION"
+    printf 'Deployment mode:\n  1) Single website\n  2) Multiple websites\n'
+    while true; do
+        read -r -p "Select [1-2]: " mode_choice
+        case "$mode_choice" in
+            1) ENVIRONMENT_MODE="single"; break ;;
+            2) ENVIRONMENT_MODE="multi"; break ;;
+            *) log_message WARNING "Invalid selection." ;;
+        esac
     done
+
+    printf '\nPHP version:\n'
+    for i in "${!AVAILABLE_PHP_VERSIONS[@]}"; do
+        printf '  %d) PHP %s\n' "$((i + 1))" "${AVAILABLE_PHP_VERSIONS[$i]}"
+    done
+    while true; do
+        read -r -p "Select [1-${#AVAILABLE_PHP_VERSIONS[@]}]: " php_choice
+        [[ "$php_choice" =~ ^[0-9]+$ ]] || { log_message WARNING "Invalid selection."; continue; }
+        ((php_choice >= 1 && php_choice <= ${#AVAILABLE_PHP_VERSIONS[@]})) || { log_message WARNING "Invalid selection."; continue; }
+        DEFAULT_PHP_VERSION="${AVAILABLE_PHP_VERSIONS[$((php_choice - 1))]}"
+        break
+    done
+
+    if collect_yes_no "Enable and configure UFW (existing rules are preserved)" yes; then
+        ENVIRONMENT_UFW="yes"
+    else
+        ENVIRONMENT_UFW="no"
+    fi
+    save_environment_config
     bootstrap_server
-    log_message SUCCESS "The server and $SITE_COUNT site(s) are ready. Credentials are in /root/wordpress-credentials-*.txt."
+    log_message SUCCESS "The WordPress environment is ready in $ENVIRONMENT_MODE mode with PHP $DEFAULT_PHP_VERSION."
+    log_message INFO "Run 'sudo wp-shell' and choose 'Add a new website' to create the first site."
 }
 
 nginx_installed() {
@@ -2389,11 +2470,12 @@ wordpress_environment_detected() {
 }
 
 wp_shell_environment_managed() {
-    [[ -f "$SITES_CONFIG_FILE" ]] && ((SITE_COUNT > 0)) && wordpress_environment_detected
+    [[ -f "$ENVIRONMENT_CONFIG_FILE" ]] && wordpress_environment_detected
 }
 
 install_or_repair_environment() {
-    if ((SITE_COUNT > 0)); then
+    if [[ -f "$ENVIRONMENT_CONFIG_FILE" ]]; then
+        load_environment_config
         bootstrap_server
     else
         new_server_wizard
@@ -2509,7 +2591,8 @@ adoption_menu() {
 management_menu() {
     install_self
     printf '\nwp-shell v%s\n' "$VERSION"
-    printf 'Environment: installed | Sites: %s\n\n' "$SITE_COUNT"
+    printf 'Environment: installed | Mode: %s | PHP: %s | Sites: %s\n\n' \
+        "$ENVIRONMENT_MODE" "$DEFAULT_PHP_VERSION" "$SITE_COUNT"
     printf '1) Dashboard\n2) Add a new website\n3) Website list\n4) Website status\n5) Deploy or repair a website\n6) Back up one website\n7) Back up all websites\n8) Restore a website\n9) Import existing websites\n10) Traffic and resource report\n11) Analyze resource usage\n12) Apply safe tuning recommendations\n13) Reapply service resource budget\n14) Security scan\n15) Repair backup and metrics timers\n0) Exit\n'
     local choice domain backup_id range
     read -r -p "Select [0-15]: " choice
@@ -2588,7 +2671,7 @@ wp-shell v$VERSION - WordPress VPS operations without a web control panel
 
 Usage:
   sudo wp-shell                                 Open the context-aware main menu
-  sudo wp-shell install                         Configure the server and deploy sites
+  sudo wp-shell install                         Install or repair the server environment
   sudo wp-shell dashboard                       Open the compact SSH dashboard
   sudo wp-shell report [1h|6h|24h|7d|14d|30d]   Print a non-interactive metrics report
   sudo wp-shell analyze [range]                  Analyze collected resource evidence
@@ -2666,7 +2749,7 @@ execute_command() {
     case "$command" in
         "") interactive_menu ;;
         install)
-            if ((SITE_COUNT == 0)); then new_server_wizard; else bootstrap_server; fi
+            install_or_repair_environment
             ;;
         dashboard) dashboard ;;
         report) metrics_report "${2:-24h}" ;;
@@ -2720,6 +2803,7 @@ main() {
             init_paths
             migrate_legacy_configs
             load_sites_config
+            ensure_environment_config
             load_tuning_config
             execute_command "$@"
             ;;
@@ -2727,6 +2811,7 @@ main() {
             init_runtime
             migrate_legacy_configs
             load_sites_config
+            ensure_environment_config
             load_tuning_config
             execute_command "$@"
             ;;
