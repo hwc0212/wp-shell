@@ -2507,6 +2507,7 @@ adoption_menu() {
 }
 
 management_menu() {
+    install_self
     printf '\nwp-shell v%s\n' "$VERSION"
     printf 'Environment: installed | Sites: %s\n\n' "$SITE_COUNT"
     printf '1) Dashboard\n2) Add a new website\n3) Website list\n4) Website status\n5) Deploy or repair a website\n6) Back up one website\n7) Back up all websites\n8) Restore a website\n9) Import existing websites\n10) Traffic and resource report\n11) Analyze resource usage\n12) Apply safe tuning recommendations\n13) Reapply service resource budget\n14) Security scan\n15) Repair backup and metrics timers\n0) Exit\n'

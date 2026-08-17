@@ -30,10 +30,12 @@ grep -q 'DETECTION_CALLED' <<< "$output"
 
 wp_shell_environment_managed() { return 0; }
 SITE_COUNT=1
+install_self() { printf 'INSTALL_SELF_CALLED\n'; }
 list_sites() { printf 'LIST_CALLED\n'; }
 output="$(interactive_menu <<< '3')"
 grep -q 'Dashboard' <<< "$output"
 grep -q 'Back up all websites' <<< "$output"
+grep -q 'INSTALL_SELF_CALLED' <<< "$output"
 grep -q 'LIST_CALLED' <<< "$output"
 
 printf 'Context-aware menu routing tests passed.\n'
