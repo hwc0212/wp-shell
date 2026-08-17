@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.0.0
+# Version 9.1.0
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="9.0.0"
+readonly VERSION="9.1.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -1150,10 +1150,11 @@ set_site_permissions() {
 
 install_wordpress_site() {
     CURRENT_STEP="install WordPress"
-    local index="$1" domain primary wp_path admin_password credentials_file redis_password memory_limit
+    local index="$1" domain primary wp_path admin_password credentials_file redis_password memory_limit initial_mode
     domain="${SITE_DOMAINS[$index]}"
     primary="${SITE_PRIMARY_DOMAINS[$index]}"
     wp_path="${SITE_PATHS[$index]}"
+    initial_mode="${SITE_MODES[$index]}"
     load_or_create_redis_secret
     redis_password="$REDIS_PASSWORD"
 
@@ -1198,27 +1199,18 @@ install_wordpress_site() {
         chmod 0600 "$credentials_file"
     fi
 
-    sudo -u www-data wp rewrite structure '/%postname%/' --hard --path="$wp_path"
+    if [[ "$initial_mode" == "managed" ]]; then
+        sudo -u www-data wp rewrite structure '/%postname%/' --hard --path="$wp_path"
+    fi
     sudo -u www-data wp plugin install redis-cache --activate --path="$wp_path"
     sudo -u www-data wp redis enable --path="$wp_path"
     if [[ "${SITE_WOOCOMMERCE[$index]}" == "yes" ]]; then
         sudo -u www-data wp plugin install woocommerce --activate --path="$wp_path"
     fi
-    sudo -u www-data wp plugin delete hello akismet --path="$wp_path" 2>/dev/null || true
+    if [[ "$initial_mode" == "managed" ]]; then
+        sudo -u www-data wp plugin delete hello akismet --path="$wp_path" 2>/dev/null || true
+    fi
     set_site_permissions "$domain"
-}
-
-install_site_wrapper() {
-    local domain="$1" wrapper="/usr/local/bin/manage-$1"
-    cat > "$wrapper" <<EOF
-#!/usr/bin/env bash
-set -Eeuo pipefail
-if [[ \$EUID -eq 0 ]]; then
-    exec $MANAGED_SCRIPT site "$domain" "\$@"
-fi
-exec sudo $MANAGED_SCRIPT site "$domain" "\$@"
-EOF
-    chmod 0755 "$wrapper"
 }
 
 install_self() {
@@ -1229,15 +1221,20 @@ install_self() {
     ln -sfn "$MANAGED_SCRIPT" /usr/local/bin/wp-vps-manager
     ln -sfn "$MANAGED_SCRIPT" /usr/local/sbin/wp-vps-manager
     ln -sfn "$MANAGED_SCRIPT" /usr/local/sbin/wp-single-manager
-    local i
+    local i legacy_wrapper
     for ((i = 1; i <= SITE_COUNT; i++)); do
-        install_site_wrapper "${SITE_DOMAINS[$i]}"
+        legacy_wrapper="/usr/local/bin/manage-${SITE_DOMAINS[$i]}"
+        if [[ -f "$legacy_wrapper" || -L "$legacy_wrapper" ]]; then
+            rm -f -- "$legacy_wrapper"
+            log_message INFO "Removed legacy site shortcut: $legacy_wrapper"
+        fi
     done
 }
 
 deploy_site() {
-    local index="$1" domain
+    local index="$1" domain initial_mode
     domain="${SITE_DOMAINS[$index]}"
+    initial_mode="${SITE_MODES[$index]}"
     log_message INFO "Deploying $domain with PHP ${SITE_PHP_VERSIONS[$index]}."
     create_site_directories "$domain" "${SITE_PATHS[$index]}"
     if [[ ! -f "${SITE_PATHS[$index]}/wp-config.php" ]]; then
@@ -1248,10 +1245,12 @@ deploy_site() {
     fi
     issue_ssl_certificate "$index"
     configure_https_site "$index"
+    if [[ "$initial_mode" == "imported" ]]; then
+        set_site_permissions "$domain"
+    fi
     install_wordpress_site "$index"
     SITE_MODES[index]="managed"
     save_sites_config
-    install_site_wrapper "$domain"
     log_message SUCCESS "$domain deployment is complete."
 }
 
@@ -1529,7 +1528,7 @@ site_action() {
         cache-clear) clear_site_cache "$index"; log_message SUCCESS "$domain cache was cleared." ;;
         backup) backup_site "$index" ;;
         backups) list_backups "$index" ;;
-        restore) [[ -n "${3:-}" ]] || die "Usage: manage-$domain restore BACKUP_ID"; restore_site "$index" "$3" ;;
+        restore) [[ -n "${3:-}" ]] || die "Usage: wp-shell restore $domain BACKUP_ID"; restore_site "$index" "$3" ;;
         update) update_site "$index" ;;
         restart)
             systemctl restart "php${SITE_PHP_VERSIONS[$index]}-fpm"
@@ -2259,12 +2258,24 @@ status_all_sites() {
 
 import_existing_sites() {
     CURRENT_STEP="detect existing WordPress sites"
-    local wp_config wp_path url host domain primary www php_version next_index redis_db imported=0
+    if ! command -v wp >/dev/null 2>&1; then
+        log_message INFO "WP-CLI is required for discovery and will be installed."
+        apt-get update
+        apt_install ca-certificates curl php-cli
+        install_wp_cli
+    fi
+    local wp_config wp_path wp_owner url host domain primary www php_version next_index redis_db imported=0
     while IFS= read -r -d '' wp_config; do
         wp_path="$(dirname "$wp_config")"
         [[ ! "$wp_path" =~ [[:space:]] ]] || { log_message WARNING "Skipping a path containing whitespace: $wp_path"; continue; }
         [[ -f "$wp_path/wp-includes/version.php" ]] || continue
-        url="$(sudo -u www-data wp option get home --path="$wp_path" 2>/dev/null || true)"
+        wp_owner="$(stat -c '%U' "$wp_config" 2>/dev/null || printf 'www-data')"
+        id "$wp_owner" >/dev/null 2>&1 || wp_owner="www-data"
+        if [[ "$wp_owner" == "root" ]]; then
+            url="$(wp --allow-root option get home --path="$wp_path" 2>/dev/null || true)"
+        else
+            url="$(sudo -u "$wp_owner" wp option get home --path="$wp_path" 2>/dev/null || true)"
+        fi
         host="$(printf '%s' "$url" | sed -E 's#^https?://([^/]+).*$#\1#')"
         primary="$host"
         domain="${host#www.}"
@@ -2288,7 +2299,6 @@ import_existing_sites() {
         SITE_TITLES[next_index]="$domain"
         SITE_PATHS[next_index]="$wp_path"
         SITE_MODES[next_index]="imported"
-        install_site_wrapper "$domain"
         imported=$((imported + 1))
         log_message SUCCESS "Imported $domain from $wp_path."
     done < <(find /var/www /home -xdev -type f -name wp-config.php -print0 2>/dev/null)
@@ -2355,40 +2365,220 @@ new_server_wizard() {
     log_message SUCCESS "The server and $SITE_COUNT site(s) are ready. Credentials are in /root/wordpress-credentials-*.txt."
 }
 
-interactive_menu() {
-    if ((SITE_COUNT == 0)); then
+nginx_installed() {
+    command -v nginx >/dev/null 2>&1 || [[ -x /usr/sbin/nginx ]]
+}
+
+php_fpm_installed() {
+    compgen -G '/etc/php/*/fpm/pool.d' >/dev/null || compgen -G '/usr/sbin/php-fpm*' >/dev/null
+}
+
+database_server_installed() {
+    command -v mariadb >/dev/null 2>&1 || command -v mysql >/dev/null 2>&1 || \
+        [[ -x /usr/sbin/mariadbd || -x /usr/sbin/mysqld ]]
+}
+
+service_state() {
+    local state
+    state="$(systemctl is-active "$1" 2>/dev/null || true)"
+    printf '%s' "${state:-unknown}"
+}
+
+wordpress_environment_detected() {
+    nginx_installed && php_fpm_installed && database_server_installed
+}
+
+wp_shell_environment_managed() {
+    [[ -f "$SITES_CONFIG_FILE" ]] && ((SITE_COUNT > 0)) && wordpress_environment_detected
+}
+
+install_or_repair_environment() {
+    if ((SITE_COUNT > 0)); then
+        bootstrap_server
+    else
         new_server_wizard
-        return
     fi
+}
+
+installation_menu() {
     printf '\nwp-shell v%s\n' "$VERSION"
-    printf '1) Dashboard\n2) Add site\n3) Deploy or repair site\n4) List sites\n5) Site status\n6) Back up all sites\n7) Restore a site\n8) Import existing sites\n9) Analyze resources\n10) Security scan\n0) Exit\n'
-    local choice domain backup_id index
-    read -r -p "Select [0-10]: " choice
+    printf 'Environment: WordPress stack not detected\n\n'
+    printf '1) Install WordPress environment\n2) Import an existing WordPress site\n3) Show command help\n0) Exit\n'
+    local choice
+    read -r -p "Select [0-3]: " choice
     case "$choice" in
-        1) dashboard </dev/tty >/dev/tty ;;
+        1) install_or_repair_environment ;;
+        2) import_existing_sites; install_self ;;
+        3) show_help ;;
+        0) return ;;
+        *) die "Invalid selection." ;;
+    esac
+}
+
+show_detected_environment() {
+    printf '\nDetected WordPress stack\n'
+    if nginx_installed; then
+        printf '  %-14s installed (%s)\n' "Nginx" "$(service_state nginx)"
+    else
+        printf '  %-14s not installed\n' "Nginx"
+    fi
+    if php_fpm_installed; then
+        printf '  %-14s installed (%s)\n' "PHP-FPM" "$(find /etc/php -mindepth 2 -maxdepth 2 -type d -name fpm -printf '%h\n' 2>/dev/null | xargs -r -n1 basename | sort -Vu | paste -sd, -)"
+    else
+        printf '  %-14s not installed\n' "PHP-FPM"
+    fi
+    if database_server_installed; then
+        if command -v mariadb >/dev/null 2>&1 || [[ -x /usr/sbin/mariadbd ]]; then
+            printf '  %-14s installed (%s)\n' "Database" "$(service_state mariadb)"
+        else
+            printf '  %-14s installed (%s)\n' "Database" "$(service_state mysql)"
+        fi
+    else
+        printf '  %-14s not installed\n' "Database"
+    fi
+    printf '\nDetected WordPress configuration files\n'
+    find /var/www /home -xdev -maxdepth 6 -type f -name wp-config.php -print 2>/dev/null | sed -n '1,20p'
+}
+
+prepare_imported_monitoring() {
+    import_existing_sites
+    ((SITE_COUNT > 0)) || die "No WordPress sites could be imported. Check file ownership and WP-CLI access."
+    apt-get update
+    apt_install ca-certificates curl python3 sqlite3 jq libfcgi-bin
+    install_self
+    install_metrics_timer
+    collect_metrics
+    log_message SUCCESS "Imported sites and local monitoring are ready. Existing Nginx and PHP routing were not changed."
+    log_message INFO "Traffic and per-pool PHP metrics become complete after a site is explicitly transferred to wp-shell management."
+}
+
+transfer_imported_site() {
+    local domain index email php_version
+    ((SITE_COUNT > 0)) || import_existing_sites
+    ((SITE_COUNT > 0)) || die "No WordPress sites could be imported."
+    list_sites
+    read -r -p "Domain to transfer to wp-shell: " domain
+    index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
+    if [[ "${SITE_MODES[$index]}" != "imported" ]]; then
+        die "$domain is already managed by wp-shell."
+    fi
+    printf '\nThis operation will replace the site Nginx/PHP-FPM/cache configuration and enable wp-shell Redis settings.\n'
+    printf 'Create an independent server backup before continuing.\n'
+    collect_yes_no "Transfer $domain to wp-shell management" no || { log_message INFO "No changes were applied."; return; }
+    read -r -p "PHP version [${SITE_PHP_VERSIONS[$index]}]: " php_version
+    php_version="${php_version:-${SITE_PHP_VERSIONS[$index]}}"
+    validate_php_version "$php_version" || die "Unsupported PHP version: $php_version"
+    SITE_PHP_VERSIONS[index]="$php_version"
+    if [[ "${SITE_PRIMARY_DOMAINS[$index]}" == "www.$domain" ]]; then
+        SITE_WWW[index]="yes"
+    elif collect_yes_no "Include www.$domain in Nginx and the certificate" no; then
+        SITE_WWW[index]="yes"
+    else
+        SITE_WWW[index]="no"
+    fi
+    if [[ "${SITE_ADMIN_EMAILS[$index]}" == unknown@* ]]; then
+        while true; do
+            read -r -p "Certificate administrator email: " email
+            validate_email "$email" && break
+            log_message WARNING "Invalid email address."
+        done
+        SITE_ADMIN_EMAILS[index]="$email"
+    fi
+    save_sites_config
+    deploy_domain "$domain"
+    collect_metrics
+}
+
+adoption_menu() {
+    printf '\nwp-shell v%s\n' "$VERSION"
+    printf 'Environment: existing WordPress stack detected, not managed by wp-shell\n\n'
+    printf '1) Import existing websites only (safe)\n2) Import websites and enable local monitoring\n3) Import and transfer one website for wp-shell optimization\n4) Show detected environment\n5) Show command help\n0) Exit\n'
+    local choice
+    read -r -p "Select [0-5]: " choice
+    case "$choice" in
+        1) import_existing_sites; install_self ;;
+        2) prepare_imported_monitoring ;;
+        3) transfer_imported_site ;;
+        4) show_detected_environment ;;
+        5) show_help ;;
+        0) return ;;
+        *) die "Invalid selection." ;;
+    esac
+}
+
+management_menu() {
+    printf '\nwp-shell v%s\n' "$VERSION"
+    printf 'Environment: installed | Sites: %s\n\n' "$SITE_COUNT"
+    printf '1) Dashboard\n2) Add a new website\n3) Website list\n4) Website status\n5) Deploy or repair a website\n6) Back up one website\n7) Back up all websites\n8) Restore a website\n9) Import existing websites\n10) Traffic and resource report\n11) Analyze resource usage\n12) Apply safe tuning recommendations\n13) Reapply service resource budget\n14) Security scan\n15) Repair backup and metrics timers\n0) Exit\n'
+    local choice domain backup_id range
+    read -r -p "Select [0-15]: " choice
+    case "$choice" in
+        1)
+            if [[ ! -s "$METRICS_DB" ]]; then
+                install_self
+                install_metrics_timer
+                collect_metrics
+            fi
+            dashboard </dev/tty >/dev/tty
+            ;;
         2) add_site_command ;;
-        3)
+        3) list_sites ;;
+        4)
+            if ((SITE_COUNT == 0)); then
+                log_message WARNING "No sites are registered. Use option 2 or 9 first."
+                return
+            fi
+            list_sites
+            read -r -p "Domain (leave empty for all sites): " domain
+            if [[ -n "$domain" ]]; then site_action "$domain" status; else status_all_sites; fi
+            ;;
+        5)
+            ((SITE_COUNT > 0)) || die "No sites are registered. Use option 2 or 9 first."
             list_sites
             read -r -p "Domain to deploy or repair: " domain
-            index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
-            prepare_stack
-            deploy_site "$index"
+            deploy_domain "$domain"
             ;;
-        4) list_sites ;;
-        5) status_all_sites ;;
-        6) backup_all_sites ;;
-        7)
+        6)
+            ((SITE_COUNT > 0)) || die "No sites are registered."
+            list_sites
+            read -r -p "Domain to back up: " domain
+            site_action "$domain" backup
+            ;;
+        7) ((SITE_COUNT > 0)) || die "No sites are registered."; backup_all_sites ;;
+        8)
+            ((SITE_COUNT > 0)) || die "No sites are registered."
+            list_sites
             read -r -p "Domain: " domain
             site_action "$domain" backups
             read -r -p "Backup ID: " backup_id
             site_action "$domain" restore "$backup_id"
             ;;
-        8) import_existing_sites; install_self ;;
-        9) analyze_metrics 7d ;;
-        10) security_scan ;;
+        9) import_existing_sites; install_self ;;
+        10)
+            read -r -p "Range [24h]: " range
+            metrics_report "${range:-24h}"
+            ;;
+        11)
+            read -r -p "Range [7d]: " range
+            analyze_metrics "${range:-7d}"
+            ;;
+        12) apply_tuning ;;
+        13) configure_mariadb; configure_redis; configure_php ;;
+        14) security_scan ;;
+        15) install_self; install_backup_timer; install_metrics_timer ;;
         0) return ;;
         *) die "Invalid selection." ;;
     esac
+}
+
+interactive_menu() {
+    if wp_shell_environment_managed; then
+        management_menu
+    elif wordpress_environment_detected; then
+        adoption_menu
+    else
+        installation_menu
+    fi
 }
 
 show_help() {
@@ -2396,6 +2586,7 @@ show_help() {
 wp-shell v$VERSION - WordPress VPS operations without a web control panel
 
 Usage:
+  sudo wp-shell                                 Open the context-aware main menu
   sudo wp-shell install                         Configure the server and deploy sites
   sudo wp-shell dashboard                       Open the compact SSH dashboard
   sudo wp-shell report [1h|6h|24h|7d|14d|30d]   Print a non-interactive metrics report
@@ -2524,18 +2715,6 @@ main() {
     check_platform
     require_command base64
     case "${1:-}" in
-        "")
-            init_paths
-            migrate_legacy_configs
-            load_sites_config
-            load_tuning_config
-            if ((SITE_COUNT > 0)) && [[ -s "$METRICS_DB" && -t 0 && -t 1 ]]; then
-                dashboard
-            else
-                init_runtime
-                interactive_menu
-            fi
-            ;;
         dashboard|report|analyze|tune|metrics)
             init_paths
             migrate_legacy_configs

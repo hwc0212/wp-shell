@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.0.0
+- 当前版本：`wp-shell.sh` v9.1.0
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -102,7 +102,26 @@ git clone https://github.com/hwc0212/wp-shell.git
 cd wp-shell
 ```
 
-### 2. 启动安装向导
+### 2. 启动主菜单
+
+```bash
+sudo ./wp-shell.sh
+```
+
+在全新 VPS 上，脚本检测不到完整的 Nginx、PHP-FPM 和数据库环境时，会显示：
+
+```text
+Environment: WordPress stack not detected
+
+1) Install WordPress environment
+2) Import an existing WordPress site
+3) Show command help
+0) Exit
+```
+
+选择 `1` 开始安装 WordPress 环境。
+
+如果不需要菜单，也可以直接启动安装向导：
 
 ```bash
 sudo ./wp-shell.sh install
@@ -147,7 +166,7 @@ https://example.com/
 8. 证书成功后生成完整 HTTPS 和 FastCGI 缓存配置。
 9. 安装 WordPress、Redis Object Cache 和可选的 WooCommerce。
 10. 安装每日备份 timer 和每分钟指标采集 timer。
-11. 安装全局 `wp-shell` 命令以及每个域名的快捷命令。
+11. 安装统一的全局 `wp-shell` 命令。
 
 Nginx 配置在启用前必须通过 `nginx -t`。验证失败时，脚本会恢复原配置。
 
@@ -186,20 +205,101 @@ sudo env WORDPRESS_LOCALE=en_US ./wp-shell.sh install
 
 终端程序本身始终使用英文和 ASCII 字符，以避免不同 SSH 客户端的编码和字符宽度问题；这不影响 WordPress 后台语言，也不影响本 README 使用中文。
 
-## 三、日常启动方式
+## 三、无参数启动和环境识别菜单
 
-安装完成后，可以直接运行：
+日常管理时直接运行：
 
 ```bash
 sudo wp-shell
 ```
 
-如果已经有站点和指标数据，并且当前是交互式终端，它会直接打开终端看板。
+在源码目录中也可以运行：
 
-也可以明确指定命令：
+```bash
+sudo ./wp-shell.sh
+```
+
+脚本不会立即修改服务器，而是先判断环境属于以下哪一种状态。
+
+### 1. 状态一：没有完整 WordPress 运行环境
+
+脚本同时检查：
+
+- Nginx 是否已经安装
+- PHP-FPM 是否已经安装
+- MariaDB 或 MySQL 是否已经安装
+
+只要缺少其中一项，就显示安装/修复菜单：
+
+```text
+1) Install WordPress environment
+2) Import an existing WordPress site
+3) Show command help
+0) Exit
+```
+
+通常选择 `1`。如果尚无站点配置，会继续询问网站数量、域名、PHP 版本和管理员信息；如果之前安装中断但已保存站点配置，会直接根据已保存配置修复环境，不会重复收集域名。
+
+### 2. 状态二：已有 Nginx、PHP-FPM 和数据库，但不是 wp-shell 安装
+
+当三个核心组件已经安装，但不存在有效的 `/etc/wp-shell/sites.v3` 站点清单时，脚本认为这是一个外部 WordPress 环境，显示导入与优化菜单：
+
+```text
+1) Import existing websites only (safe)
+2) Import websites and enable local monitoring
+3) Import and transfer one website for wp-shell optimization
+4) Show detected environment
+5) Show command help
+0) Exit
+```
+
+各选项含义：
+
+- `1`：只扫描和登记现有网站，不改写 Nginx、PHP-FPM、数据库或 Redis 配置。这是推荐的第一步。
+- `2`：导入网站，并安装本地 SQLite 指标采集器。不会替换现有 Nginx 和 PHP 路由。
+- `3`：先导入，再明确选择一个域名交给 wp-shell 接管和优化。执行前会再次确认。
+- `4`：显示检测到的 Nginx、PHP-FPM、数据库状态和 `wp-config.php` 路径。
+- `5`：显示命令帮助。
+
+建议先选择 `1`，运行备份并核对网站列表。确认无误后，再重新运行 `sudo wp-shell`，通过管理菜单或 `site deploy DOMAIN` 接管单个网站。
+
+选择 `3` 接管站点时，脚本还会询问目标 PHP 版本、是否包含 `www` 和证书管理员邮箱。接管会生成新的 Nginx/PHP-FPM/缓存配置，启用 wp-shell Redis 设置，并把站点文件权限统一为 `www-data`。该操作前必须准备独立的网站和数据库备份。
+
+### 3. 状态三：已经由 wp-shell 管理
+
+当 `/etc/wp-shell/sites.v3` 存在且包含网站，同时 Nginx、PHP-FPM 和数据库组件齐全时，显示完整运维菜单：
+
+```text
+1) Dashboard
+2) Add a new website
+3) Website list
+4) Website status
+5) Deploy or repair a website
+6) Back up one website
+7) Back up all websites
+8) Restore a website
+9) Import existing websites
+10) Traffic and resource report
+11) Analyze resource usage
+12) Apply safe tuning recommendations
+13) Reapply service resource budget
+14) Security scan
+15) Repair backup and metrics timers
+0) Exit
+```
+
+这个菜单把日常使用频率最高的看板、建站、列表、备份、恢复和资源分析集中在一屏内。每次选择完成后脚本退出，避免在 SSH 中保留不必要的长期管理进程；需要继续操作时重新执行 `sudo wp-shell` 即可。
+
+### 4. 直接执行命令
+
+菜单只是常用功能入口，所有功能仍可直接调用：
+
 
 ```bash
 sudo wp-shell dashboard
+sudo wp-shell site list
+sudo wp-shell backup-all
+sudo wp-shell report 24h
 sudo wp-shell --help
 ```
 
@@ -358,33 +458,10 @@ sudo wp-shell site deploy example.com
 
 在已有生产站点执行前，仍建议先创建备份。
 
-### 5. 每站点快捷命令
-
-标准部署或被脚本接管的站点会生成：
-
-```text
-/usr/local/bin/manage-DOMAIN
-```
-
-例如：
+### 5. 更新 WordPress
 
 ```bash
-manage-example.com status
-manage-example.com info
-manage-example.com cache-clear
-manage-example.com backup
-manage-example.com backups
-manage-example.com restore 20260817-020000
-manage-example.com update
-manage-example.com restart
-```
-
-这些快捷命令不会保存数据库密码或 Redis 密码。
-
-### 6. 更新 WordPress
-
-```bash
-manage-example.com update
+sudo wp-shell site example.com update
 ```
 
 更新前会先创建备份，然后执行：
@@ -397,13 +474,30 @@ manage-example.com update
 
 生产网站建议先在测试环境确认插件和主题兼容性。
 
-### 7. 清理单站点缓存
+### 6. 清理单站点缓存
 
 ```bash
-manage-example.com cache-clear
+sudo wp-shell site example.com cache-clear
 ```
 
 它只会清理该域名的 FastCGI 缓存和 WordPress 对象缓存，不会执行 Redis `FLUSHDB`，因此不会影响其他网站。
+
+### 7. 统一站点操作语法
+
+不再生成 `manage-DOMAIN` 类型的每站点脚本。所有站点操作统一使用：
+
+```bash
+sudo wp-shell site example.com status
+sudo wp-shell site example.com info
+sudo wp-shell site example.com cache-clear
+sudo wp-shell site example.com backup
+sudo wp-shell site example.com backups
+sudo wp-shell site example.com restore 20260817-020000
+sudo wp-shell site example.com update
+sudo wp-shell site example.com restart
+```
+
+升级时，wp-shell 会删除已登记域名对应的旧 `/usr/local/bin/manage-DOMAIN` 脚本，避免同一功能存在多个入口。
 
 ## 六、导入已有 WordPress 网站
 
@@ -456,12 +550,6 @@ sudo wp-shell site deploy example.com
 sudo wp-shell backup example.com
 ```
 
-或者：
-
-```bash
-manage-example.com backup
-```
-
 ### 2. 备份所有网站
 
 ```bash
@@ -471,7 +559,7 @@ sudo wp-shell backup-all
 ### 3. 查看可用备份
 
 ```bash
-manage-example.com backups
+sudo wp-shell site example.com backups
 ```
 
 备份编号格式类似：
@@ -484,12 +572,6 @@ manage-example.com backups
 
 ```bash
 sudo wp-shell restore example.com 20260817-020000
-```
-
-或者：
-
-```bash
-manage-example.com restore 20260817-020000
 ```
 
 恢复流程会：
@@ -724,12 +806,11 @@ sudo wp-shell optimize
 /etc/nginx/conf.d/wp-shell-log-format.conf
 /usr/local/sbin/wp-shell                  安装后的主程序
 /usr/local/bin/wp-shell                   全局命令链接
-/usr/local/bin/manage-DOMAIN              每站点快捷命令
 /var/lib/wp-shell/metrics.sqlite3         本地指标数据库
 /var/log/wp-shell/                        部署和管理日志
 ```
 
-配置和密码文件使用 root `0600` 权限。站点快捷命令中不包含数据库密码或 Redis 密码。
+配置和密码文件使用 root `0600` 权限。所有站点操作统一通过 `wp-shell` 执行，命令行中不包含数据库密码或 Redis 密码。
 
 ## 十三、从旧版本升级
 
@@ -830,7 +911,7 @@ sudo wp-shell ...
 - 站点配置采用不可执行的数据格式，不会 `source` 用户输入生成的配置。
 - Redis 只监听 loopback，并启用 protected mode 和随机密码。
 - 每个站点使用不同 Redis DB 和域名前缀。
-- 数据库和 Redis 密码不会写入站点快捷命令。
+- 数据库和 Redis 密码不会出现在 `wp-shell` 命令行中。
 - `wp-config.php` 使用 `0640` 权限。
 - WordPress 在线文件编辑默认关闭。
 - PHP-FPM status 使用本地 Unix socket，不通过 Nginx 暴露。
@@ -932,6 +1013,7 @@ bash tests/render-nginx.sh
 bash tests/storage-layout.sh
 bash tests/metrics-roundtrip.sh
 bash tests/dashboard-smoke.sh
+bash tests/menu-routing.sh
 ```
 
 ShellCheck：

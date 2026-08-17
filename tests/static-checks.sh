@@ -25,6 +25,10 @@ fi
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
 grep -Fq "fastcgi_pass unix:\$pool_socket;" "$repo_root/wp-shell.sh"
 grep -Fq 'It intentionally excludes client IPs, cookies, and query strings.' "$repo_root/wp-shell.sh"
+if grep -q 'install_site_wrapper' "$repo_root/wp-shell.sh"; then
+    printf 'Per-domain command generation must not be reintroduced.\n' >&2
+    exit 1
+fi
 if LC_ALL=C grep -nP '[^\x00-\x7F]' "${scripts[@]}"; then
     printf 'Non-ASCII text was found in terminal scripts.\n' >&2
     exit 1

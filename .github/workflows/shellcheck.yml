@@ -24,6 +24,7 @@ jobs:
           bash tests/storage-layout.sh
           bash tests/metrics-roundtrip.sh
           bash tests/dashboard-smoke.sh
+          bash tests/menu-routing.sh
 
       - name: ShellCheck
         run: >-
@@ -40,6 +41,7 @@ jobs:
           /mnt/tests/storage-layout.sh
           /mnt/tests/metrics-roundtrip.sh
           /mnt/tests/dashboard-smoke.sh
+          /mnt/tests/menu-routing.sh
           /mnt/tests/nginx-integration.sh
           /mnt/tests/service-config-integration.sh
 
