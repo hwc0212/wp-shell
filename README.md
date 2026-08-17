@@ -1,161 +1,372 @@
 # wp-shell
 
-`wp-shell` is a lightweight WordPress VPS deployment and operations tool for Ubuntu. It is designed to cover the practical single-server workflows commonly handled by Cloudways or SpinupWP, without a web control panel or its permanent resource overhead.
+`wp-shell` 是一个面向 Ubuntu VPS 的 WordPress 部署与运维脚本，目标是在不安装 Web 控制面板的前提下，覆盖 Cloudways、SpinupWP 等托管面板中最常用的单机部署、站点管理、监控、备份和资源调优能力。
 
-- One canonical script: `wp-shell.sh` v9.0.0
-- Supported systems: Ubuntu 22.04 and 24.04 LTS
-- Architectures: x86_64 and aarch64
-- Project: <https://github.com/hwc0212/wp-shell>
-- Author: <https://huwencai.com>
+项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-The previous `wp-vps-manager.sh` and `deploy-single-wordpress.sh` filenames remain as small compatibility wrappers. New installations should use `wp-shell.sh`.
+- 当前版本：`wp-shell.sh` v9.0.0
+- 支持系统：Ubuntu 22.04 / 24.04 LTS
+- 支持架构：x86_64、aarch64
+- GitHub：<https://github.com/hwc0212/wp-shell>
+- 作者：<https://huwencai.com>
 
-> `wp-shell` installs packages and changes Nginx, PHP-FPM, MariaDB, Redis, Fail2ban, UFW, Certbot, logrotate, and systemd configuration. Test it on a disposable server first and keep an off-server backup before adopting an existing production VPS.
+> 重要：脚本会安装软件包，并修改 Nginx、PHP-FPM、MariaDB、Redis、Certbot、Fail2ban、UFW、logrotate 和 systemd 配置。首次使用请优先在测试 VPS 上验证。接管已有生产服务器前，务必准备服务器外部备份和可用的恢复方案。
 
-## What v9 provides
+## 项目特点
 
-- Repeatable single-site and multi-site deployment through one command.
-- A separate PHP-FPM pool, socket, status socket, process limit, and PHP log for every site.
-- Per-site FastCGI cache, Redis database, database credentials, logs, and backups.
-- A local SQLite metrics store and a one-minute systemd collector.
-- An English, ASCII-only, `htop`-style terminal dashboard designed to fit one SSH screen.
-- Per-domain traffic, latency, cache, PHP, disk, TLS, HTTP, and backup visibility.
-- Evidence-based resource analysis and guarded PHP-FPM tuning.
-- Safe migration from the v8 multi-site and v2 single-site configuration formats.
-- Atomic Nginx validation and rollback, checksummed backups, and pre-restore safety backups.
-- No web panel, panel database, telemetry service, or externally exposed metrics endpoint.
+- 使用一个统一入口 `wp-shell.sh` 管理单站点和多站点环境。
+- 每个网站拥有独立的 PHP-FPM pool、Unix socket、状态 socket、进程额度和 PHP 日志。
+- 每个网站拥有独立的 FastCGI 缓存目录、Redis DB、数据库账号、日志和备份目录。
+- 通过本地 SQLite 保存服务器和各网站的历史指标。
+- 提供适合 SSH 单屏显示的 `htop` 风格终端看板。
+- 可按域名查看请求量、状态码、P95 延迟、缓存命中率、PHP 内存、磁盘占用、TLS 和备份状态。
+- 可根据一段时间的历史数据生成资源分析和安全的 PHP-FPM 调整建议。
+- 自动迁移旧版多站点脚本和单站点脚本的配置。
+- 不提供 Web 控制面板，不开放远程监控端口，不上传遥测数据。
 
-## Requirements
+旧文件名 `wp-vps-manager.sh` 和 `deploy-single-wordpress.sh` 仍然保留，但它们现在只是兼容包装器。新安装和新自动化任务应统一使用 `wp-shell.sh` 或安装后的 `wp-shell` 命令。
 
-- Ubuntu 22.04 or 24.04 LTS
-- At least 1GB RAM
-- At least 8GB free space on `/`
-- Root or sudo access
-- DNS already pointing to the VPS
-- TCP 80 and 443 reachable from the internet
+## 一、使用前准备
 
-The default site-count guard is intentionally conservative:
+### 1. VPS 最低要求
 
-| RAM | Maximum managed sites |
+- Ubuntu 22.04 或 Ubuntu 24.04 LTS
+- 至少 1GB 内存
+- 根分区至少有 8GB 可用空间
+- 可以使用 root 或 sudo
+- 域名已经解析到当前 VPS
+- 云厂商安全组允许 TCP 80 和 443
+- SSH 端口没有被云防火墙阻止
+
+不建议在 512MB 或更小的 VPS 上运行现代 WordPress、MariaDB、Redis 和 PHP-FPM 组合。
+
+### 2. 建议站点数量
+
+脚本会根据物理内存限制可以管理的站点数量：
+
+| VPS 内存 | 默认允许的最大站点数 |
 |---|---:|
-| 1GB to 2GB | 1 |
-| 2GB to 4GB | 2 |
-| 4GB to 8GB | 4 |
-| 8GB and above | 8 |
+| 1GB 至 2GB | 1 |
+| 2GB 至 4GB | 2 |
+| 4GB 至 8GB | 4 |
+| 8GB 及以上 | 8 |
 
-Traffic, plugins, themes, WooCommerce, and uncached requests can reduce the practical capacity substantially.
+这是安全上限，不代表一定能承受对应数量的高流量网站。WooCommerce、页面构建器、大量插件、未命中缓存的动态请求都会显著降低实际容量。
 
-## Install
+### 3. DNS 准备
+
+假设需要部署 `example.com`：
+
+```text
+example.com      A      VPS_IPV4
+www.example.com  A      VPS_IPV4
+```
+
+如果不使用 `www`，只需要配置根域名。如果在安装时选择证书包含 `www.example.com`，则 `www` 必须提前解析成功，否则 Certbot 会停止申请证书。
+
+可以在部署前检查：
+
+```bash
+getent ahosts example.com
+getent ahosts www.example.com
+```
+
+### 4. 已有服务器备份
+
+接管已有服务器前，至少备份：
+
+```text
+/etc/nginx/
+/etc/php/
+/etc/mysql/
+/etc/redis/
+/var/www/
+所有 WordPress 数据库
+```
+
+本地备份无法防止整台 VPS 或磁盘损坏，因此生产环境还应把备份复制到对象存储或其他服务器。
+
+## 二、在全新 VPS 上安装
+
+### 1. 下载主脚本
 
 ```bash
 wget https://raw.githubusercontent.com/hwc0212/wp-shell/main/wp-shell.sh
 chmod +x wp-shell.sh
+```
+
+也可以使用 Git：
+
+```bash
+git clone https://github.com/hwc0212/wp-shell.git
+cd wp-shell
+```
+
+### 2. 启动安装向导
+
+```bash
 sudo ./wp-shell.sh install
 ```
 
-The setup wizard collects each domain, canonical hostname, PHP version, WordPress administrator, optional `www`, and optional WooCommerce choice. It then installs and configures the stack, obtains certificates, deploys WordPress, installs backup and metrics timers, and optionally configures UFW.
+首次安装时，向导会询问：
 
-The installed command is:
+1. 需要部署多少个网站。
+2. 每个网站的不带 `www` 的基础域名。
+3. 使用 PHP 8.2、8.3 还是 8.4。
+4. WordPress 管理员邮箱。
+5. WordPress 管理员用户名。
+6. 网站标题。
+7. 是否把 `www` 加入证书。
+8. 根域名和 `www` 中哪一个作为主域名。
+9. 是否安装 WooCommerce。
+10. 是否启用并配置 UFW。
+
+输入域名时只输入：
+
+```text
+example.com
+```
+
+不要输入协议、路径或末尾斜杠，例如不要输入：
+
+```text
+https://example.com/
+```
+
+### 3. 安装过程会执行什么
+
+脚本会依次：
+
+1. 检查 Ubuntu 版本、CPU 架构、内存和磁盘空间。
+2. 安装 Nginx、MariaDB、Redis、PHP-FPM、Certbot、WP-CLI、Fail2ban、SQLite 等组件。
+3. 根据整机内存计算 MariaDB、Redis 和 PHP-FPM 初始预算。
+4. 为每个域名创建独立 PHP-FPM pool 和 Unix socket。
+5. 为每个站点创建独立数据库、数据库用户和 Redis DB。
+6. 创建 `/var/www/DOMAIN/` 站点目录结构。
+7. 先部署临时 HTTP ACME 配置，再申请证书。
+8. 证书成功后生成完整 HTTPS 和 FastCGI 缓存配置。
+9. 安装 WordPress、Redis Object Cache 和可选的 WooCommerce。
+10. 安装每日备份 timer 和每分钟指标采集 timer。
+11. 安装全局 `wp-shell` 命令以及每个域名的快捷命令。
+
+Nginx 配置在启用前必须通过 `nginx -t`。验证失败时，脚本会恢复原配置。
+
+### 4. 安装完成后检查
 
 ```bash
 sudo wp-shell --version
+sudo wp-shell site list
+sudo wp-shell site status
+sudo wp-shell metrics status
+systemctl status wp-shell-backup.timer
+systemctl status wp-shell-metrics.timer
+```
+
+首次生成的 WordPress 管理员密码保存在：
+
+```text
+/root/wordpress-credentials-DOMAIN.txt
+```
+
+例如：
+
+```bash
+sudo cat /root/wordpress-credentials-example.com.txt
+```
+
+首次登录后，建议把密码保存到密码管理器，然后删除服务器上的明文凭据文件。
+
+### 5. WordPress 语言
+
+脚本默认下载 `zh_CN` WordPress。如果需要英文版本，可以在首次安装时指定：
+
+```bash
+sudo env WORDPRESS_LOCALE=en_US ./wp-shell.sh install
+```
+
+终端程序本身始终使用英文和 ASCII 字符，以避免不同 SSH 客户端的编码和字符宽度问题；这不影响 WordPress 后台语言，也不影响本 README 使用中文。
+
+## 三、日常启动方式
+
+安装完成后，可以直接运行：
+
+```bash
+sudo wp-shell
+```
+
+如果已经有站点和指标数据，并且当前是交互式终端，它会直接打开终端看板。
+
+也可以明确指定命令：
+
+```bash
+sudo wp-shell dashboard
 sudo wp-shell --help
 ```
 
-## Terminal dashboard
+## 四、SSH 终端看板
 
-Open the dashboard over SSH:
+### 1. 打开看板
 
 ```bash
 sudo wp-shell dashboard
 ```
 
-It refreshes in place and adjusts columns to the current terminal width and height. It does not scroll continuously like a log viewer.
+看板会原地刷新，不会像 `tail -f` 一样不断向下滚动。列宽会根据 SSH 窗口宽度自动缩减，行数会根据终端高度自动限制。
 
-| Key | View or action |
+建议终端至少为 `64x14`。如果窗口过小，看板会显示调整窗口的提示，而不是输出错位内容。
+
+### 2. 看板快捷键
+
+| 按键 | 功能 |
 |---|---|
-| `F1` or `1` | Overview |
-| `F2` or `2` | Traffic |
-| `F3` or `3` | Resources |
-| `F4` or `4` | Operations |
-| `F5` or `5` | Alerts |
-| Arrow keys or `h/j/k/l` | Change view or selected site |
-| `r` | Refresh immediately |
-| `q` | Quit |
+| `F1` 或 `1` | Overview：总体情况 |
+| `F2` 或 `2` | Traffic：请求和状态码 |
+| `F3` 或 `3` | Resources：PHP 和磁盘资源 |
+| `F4` 或 `4` | Operations：HTTP、TLS、备份等运维状态 |
+| `F5` 或 `5` | Alerts：只关注异常项 |
+| `←` / `→` 或 `h` / `l` | 切换视图 |
+| `↑` / `↓` 或 `k` / `j` | 选择站点 |
+| `r` | 立即刷新 |
+| `q` | 退出看板 |
 
-The dashboard uses a compact header for CPU, memory, load, swap, and disk, followed by one site per row and a fixed shortcut footer. A terminal smaller than 64x14 receives a resize message instead of a broken layout.
+### 3. 各视图主要字段
 
-For scripts, narrow terminals, or saved SSH output, use the plain report:
+Overview 主要显示：
+
+- 最近五分钟请求数
+- P95 响应时间
+- FastCGI 缓存命中率
+- PHP 活跃进程和进程上限
+- PHP RSS 内存
+- HTTP 状态
+- 综合健康提示
+
+Traffic 主要显示：
+
+- 请求总数
+- 2xx、4xx、5xx 数量
+- 返回流量大小
+- P95 响应时间
+- FastCGI 缓存命中率
+
+Resources 主要显示：
+
+- PHP 活跃进程
+- PHP 空闲进程
+- PHP 请求队列
+- PHP 最大进程数
+- PHP RSS 内存
+- WordPress 文件、缓存和日志占用
+
+Operations 主要显示：
+
+- HTTP 探测结果
+- TLS 剩余天数
+- 最近备份时间
+- 备份目录大小
+- PHP 版本
+- managed 或 imported 管理模式
+
+Alerts 会集中显示：
+
+- HTTP 不可用
+- PHP 请求排队
+- PHP 达到进程上限
+- TLS 即将过期
+- 缺少备份或备份过旧
+- 5xx 比例异常
+
+### 4. 非交互式报告
+
+如果终端太窄、需要保存输出，或者准备在脚本中调用，可以使用普通文本报告：
 
 ```bash
+sudo wp-shell report 1h
+sudo wp-shell report 6h
 sudo wp-shell report 24h
 sudo wp-shell report 7d
+sudo wp-shell report 14d
+sudo wp-shell report 30d
 ```
 
-## Metrics and privacy
-
-The local collector is installed as `wp-shell-metrics.timer` and runs once per minute:
+例如保存最近七天报告：
 
 ```bash
-systemctl status wp-shell-metrics.timer
-sudo wp-shell metrics status
-sudo wp-shell metrics collect
+sudo wp-shell report 7d > wp-shell-report.txt
 ```
 
-Collected system fields include CPU, load, available memory, swap, root disk usage, and network byte counters. Per-site fields include:
+## 五、添加和管理网站
 
-- Requests and HTTP 2xx, 4xx, and 5xx totals
-- Response bytes, average latency, and P95 latency
-- FastCGI cache hits, misses, bypasses, and stale responses
-- PHP-FPM active/idle processes, queue, saturation counter, and RSS
-- Site files, cache, logs, and backup sizes
-- HTTP response, TLS days remaining, and latest backup age
-- Shared MariaDB connection/slow-query counters and Redis memory/cache counters
-
-Operational data is stored only on the VPS:
-
-```text
-/var/lib/wp-shell/metrics.sqlite3
-```
-
-Raw samples are retained for 30 days. The structured Nginx access format intentionally excludes client IP addresses, cookies, referrers, user agents, and query strings. It retains the URI path because route-level behavior is useful for diagnosing WordPress and WooCommerce workloads.
-
-## Resource analysis and tuning
-
-Use collected evidence after the server has handled representative traffic:
-
-```bash
-sudo wp-shell analyze 7d
-sudo wp-shell analyze 14d
-sudo wp-shell tune --apply
-```
-
-The initial budget reserves memory for the operating system, then assigns approximately 30% to MariaDB, 5% to Redis with a 32-512MB limit, and a bounded remainder to PHP-FPM. PHP capacity is estimated at roughly 96MB per process. WooCommerce sites receive twice the initial pool weight of standard sites.
-
-Automatic tuning is deliberately narrow:
-
-- It changes only per-site PHP-FPM child limits.
-- It requires at least 1,000 samples and at least 20% observed memory headroom.
-- An increase requires a PHP queue or pool saturation signal.
-- A decrease requires approximately 14 days of low peak utilization.
-- One change is limited to about 20%, with a range of 2-50 children.
-- Recommendations are shown before application unless `--yes` is supplied.
-- Overrides are stored in `/etc/wp-shell/tuning.v1` and can be reviewed or removed.
-
-MariaDB and Redis findings remain advisory because aggregate counters alone are not enough to safely rewrite their memory settings automatically.
-
-## Site commands
+### 1. 添加新网站
 
 ```bash
 sudo wp-shell site add
-sudo wp-shell site list
-sudo wp-shell site status
-sudo wp-shell site status example.com
-sudo wp-shell site deploy example.com
-sudo wp-shell site import
 ```
 
-Each managed site also receives a convenience wrapper:
+命令会收集新站点信息，重新计算整机资源预算，创建 PHP-FPM pool、数据库、证书、Nginx 配置和 WordPress。
+
+添加完成后检查：
+
+```bash
+sudo wp-shell site list
+sudo wp-shell site status example.com
+```
+
+### 2. 列出所有网站
+
+```bash
+sudo wp-shell site list
+```
+
+列表会显示：
+
+- 基础域名
+- WordPress 主域名
+- PHP 版本
+- managed 或 imported 模式
+- Redis DB 编号
+- PHP-FPM 进程上限
+
+### 3. 查看所有网站状态
+
+```bash
+sudo wp-shell site status
+```
+
+只查看一个网站：
+
+```bash
+sudo wp-shell site status example.com
+```
+
+### 4. 重新部署或修复网站
+
+```bash
+sudo wp-shell site deploy example.com
+```
+
+该命令按幂等方式重新应用服务配置，不会在已有 WordPress 数据库和配置存在时重新生成数据库密码或管理员密码。
+
+它会重新检查和应用：
+
+- 软件包和资源预算
+- MariaDB、Redis 和 PHP-FPM 配置
+- 站点目录和权限
+- 证书
+- Nginx HTTPS 和 FastCGI 缓存配置
+- WordPress Redis Object Cache
+
+在已有生产站点执行前，仍建议先创建备份。
+
+### 5. 每站点快捷命令
+
+标准部署或被脚本接管的站点会生成：
+
+```text
+/usr/local/bin/manage-DOMAIN
+```
+
+例如：
 
 ```bash
 manage-example.com status
@@ -168,127 +379,551 @@ manage-example.com update
 manage-example.com restart
 ```
 
-Global equivalents remain available:
+这些快捷命令不会保存数据库密码或 Redis 密码。
+
+### 6. 更新 WordPress
+
+```bash
+manage-example.com update
+```
+
+更新前会先创建备份，然后执行：
+
+- WordPress 核心更新
+- 数据库升级
+- 所有插件更新
+- 所有主题更新
+- 缓存清理
+
+生产网站建议先在测试环境确认插件和主题兼容性。
+
+### 7. 清理单站点缓存
+
+```bash
+manage-example.com cache-clear
+```
+
+它只会清理该域名的 FastCGI 缓存和 WordPress 对象缓存，不会执行 Redis `FLUSHDB`，因此不会影响其他网站。
+
+## 六、导入已有 WordPress 网站
+
+### 1. 扫描并登记网站
+
+```bash
+sudo wp-shell site import
+```
+
+脚本会在 `/var/www` 和 `/home` 下查找 `wp-config.php`，通过 WP-CLI 读取 WordPress 地址，然后把发现的网站登记为 `imported`。
+
+导入操作不会自动修改：
+
+- 已有 Nginx 配置
+- 已有证书
+- 已有数据库账号
+- 已有 Redis 设置
+- WordPress 文件内容
+
+### 2. 核对导入结果
+
+```bash
+sudo wp-shell site list
+sudo wp-shell site status example.com
+```
+
+导入站点会显示为：
+
+```text
+MODE imported
+```
+
+即使以后执行全局 `install`，脚本也会跳过 imported 站点，避免意外接管。
+
+### 3. 明确交给 wp-shell 管理
+
+确认备份和配置后，执行：
+
+```bash
+sudo wp-shell site deploy example.com
+```
+
+只有这个显式命令才会把对应站点从 `imported` 转换为 `managed`，并由 wp-shell 生成其 Nginx、PHP-FPM、缓存和相关配置。
+
+## 七、备份和恢复
+
+### 1. 备份一个网站
 
 ```bash
 sudo wp-shell backup example.com
+```
+
+或者：
+
+```bash
+manage-example.com backup
+```
+
+### 2. 备份所有网站
+
+```bash
 sudo wp-shell backup-all
+```
+
+### 3. 查看可用备份
+
+```bash
+manage-example.com backups
+```
+
+备份编号格式类似：
+
+```text
+20260817-020000
+```
+
+### 4. 恢复备份
+
+```bash
 sudo wp-shell restore example.com 20260817-020000
-sudo wp-shell optimize
-sudo wp-shell security-scan
 ```
 
-`site import` registers detected WordPress paths as `imported`. It does not immediately replace their Nginx, TLS, database, or Redis configuration. Running `site deploy DOMAIN` explicitly transfers that site to managed mode.
-Global `install` runs also skip imported sites, so later maintenance cannot transfer them accidentally.
+或者：
 
-## Site layout
+```bash
+manage-example.com restore 20260817-020000
+```
 
-Every standard site is contained under one domain directory:
+恢复流程会：
+
+1. 校验 `SHA256SUMS`。
+2. 为当前网站自动创建一份恢复前安全备份。
+3. 启用 WordPress 维护模式。
+4. 恢复网站文件。
+5. 恢复数据库。
+6. 重设文件权限。
+7. 清理缓存并关闭维护模式。
+
+### 5. 备份文件内容
+
+每个备份目录包含：
 
 ```text
-/var/www/DOMAIN/public/       WordPress document root
-/var/www/DOMAIN/logs/         Nginx and PHP-FPM logs
-/var/www/DOMAIN/cache/        Nginx FastCGI cache
-/var/www/DOMAIN/backups/      Local backup archives
+files.tar.gz       WordPress 文件
+database.sql.gz    MariaDB 数据库
+manifest.txt       域名、时间和 WordPress 版本
+SHA256SUMS         完整性校验
 ```
 
-Backups are outside the public document root and use root-only permissions. Each timestamped backup contains:
+备份位置：
 
 ```text
-files.tar.gz
-database.sql.gz
-manifest.txt
-SHA256SUMS
+/var/www/DOMAIN/backups/TIMESTAMP/
 ```
 
-The `wp-shell-backup.timer` runs daily around 02:00 with a randomized delay. Backups default to 14-day retention:
+该目录位于 WordPress `public` 目录之外，并使用 root-only 权限，不会被 Nginx 公开访问。
+
+### 6. 自动备份
 
 ```bash
 systemctl status wp-shell-backup.timer
-sudo BACKUP_RETENTION_DAYS=30 wp-shell backup-all
+systemctl list-timers --all | grep wp-shell
 ```
 
-Local backups do not protect against complete VPS or disk loss. Replicate `/var/www/*/backups` to object storage or another server and test restores regularly.
+默认每天约 02:00 执行，带有随机延迟，并保留 14 天。
 
-## Configuration and installed files
-
-```text
-/etc/wp-shell/sites.v3                    Non-executable site inventory
-/etc/wp-shell/databases/                  Per-site database credentials
-/etc/wp-shell/redis.secret                Redis password
-/etc/wp-shell/tuning.v1                   Optional PHP-FPM overrides
-/etc/nginx/conf.d/wp-shell-log-format.conf
-/usr/local/sbin/wp-shell                  Installed manager
-/usr/local/bin/wp-shell                   Command symlink
-/usr/local/bin/manage-DOMAIN              Site wrapper
-/var/lib/wp-shell/metrics.sqlite3         Local metrics database
-/var/log/wp-shell/                        Deployment and command logs
-```
-
-Secrets and configuration data are stored with `0600` permissions. Generated WordPress administrator credentials are written once to `/root/wordpress-credentials-DOMAIN.txt`; move them into a password manager and remove the plaintext file after first login.
-
-## Upgrade from the previous scripts
-
-Download v9 and run any normal command:
+手动备份时临时使用 30 天保留期：
 
 ```bash
-sudo ./wp-shell.sh site list
+sudo env BACKUP_RETENTION_DAYS=30 wp-shell backup-all
 ```
 
-If `/etc/wp-shell/sites.v3` does not exist, v9 safely reads these non-executable legacy formats:
+如果希望自动 timer 永久使用不同保留期，应为 `wp-shell-backup.service` 创建 systemd override，而不是直接修改脚本生成的 unit。
+
+## 八、指标采集
+
+### 1. 检查采集器
+
+```bash
+sudo wp-shell metrics status
+systemctl status wp-shell-metrics.timer
+```
+
+### 2. 手动采集一次
+
+```bash
+sudo wp-shell metrics collect
+```
+
+### 3. 重新安装或修复 timer
+
+```bash
+sudo wp-shell metrics install
+```
+
+### 4. 指标保存位置
+
+```text
+/var/lib/wp-shell/metrics.sqlite3
+```
+
+原始指标默认保存 30 天。所有数据只保存在当前 VPS，不会上传到远程服务。
+
+采集的系统数据包括：
+
+- CPU 使用率和 load
+- 总内存和可用内存
+- Swap 使用量
+- 根分区使用率
+- 网络收发字节计数
+
+采集的站点数据包括：
+
+- 请求总数
+- 2xx、4xx、5xx 数量
+- 响应流量
+- 平均响应时间和 P95 响应时间
+- FastCGI 缓存命中、未命中和绕过数量
+- PHP 活跃、空闲和排队进程
+- PHP 达到最大进程数的状态
+- PHP-FPM RSS 内存
+- HTTP 探测结果
+- TLS 剩余有效天数
+- 最近备份年龄
+- 网站文件、缓存、日志和备份目录大小
+
+MariaDB 和 Redis 作为共享服务，还会采集连接数、慢查询计数、Redis 内存、命中、未命中和淘汰计数。
+
+### 5. 访问日志隐私
+
+Nginx 使用专门的结构化日志格式，故意不保存：
+
+- 客户端 IP
+- Cookie
+- Query String
+- Referrer
+- User-Agent
+
+日志保留 URI 路径，用于判断 WordPress、WooCommerce 和特定路由的性能情况，但不会保存查询参数。
+
+## 九、资源分析与调优
+
+### 1. 查看资源分析
+
+建议网站运行并积累具有代表性的真实流量后执行：
+
+```bash
+sudo wp-shell analyze 7d
+sudo wp-shell analyze 14d
+sudo wp-shell analyze 30d
+```
+
+分析结果包含：
+
+- 峰值 CPU
+- 最低可用内存比例
+- 峰值磁盘占用
+- 每个站点的 PHP 峰值活跃进程
+- PHP 请求队列
+- PHP 达到最大进程数的记录
+- PHP 峰值 RSS
+- P95 响应时间
+- MariaDB 连接和慢查询变化
+- Redis 峰值内存和淘汰数量
+
+### 2. 查看并应用自动建议
+
+```bash
+sudo wp-shell tune --apply
+```
+
+脚本会先列出：
+
+```text
+DOMAIN  CURRENT  PROPOSED  REASON
+```
+
+确认后才会写入配置并重启相关 PHP-FPM 服务。
+
+无人值守确认：
+
+```bash
+sudo wp-shell tune --apply --yes
+```
+
+不建议在第一次运行时使用 `--yes`，应先人工检查建议和服务器可用内存。
+
+### 3. 自动调优的安全限制
+
+自动调优目前只修改每个站点的 PHP-FPM `pm.max_children`：
+
+- 至少需要 1,000 个历史样本。
+- 增加进程数前要求观察到至少 20% 内存余量。
+- 增加额度必须有 PHP 排队或进程池饱和证据。
+- 降低额度需要接近 14 天的持续低峰值使用。
+- 单次调整约为 20%。
+- 每站点限制在 2 至 50 个 PHP 子进程。
+
+自动覆盖值保存在：
+
+```text
+/etc/wp-shell/tuning.v1
+```
+
+MariaDB 和 Redis 的分析结果目前只作为建议展示，不会仅凭聚合计数自动改写它们的内存配置。这样可以避免在缺少 buffer pool 命中率、业务峰值和磁盘延迟背景时做出危险调整。
+
+### 4. 重新应用初始资源预算
+
+```bash
+sudo wp-shell optimize
+```
+
+该命令会重新计算并应用 MariaDB、Redis 和 PHP-FPM 配置。它适合在升级 VPS 内存后使用。
+
+## 十、资源预算逻辑
+
+脚本先为操作系统预留内存，再为各服务计算安全初始值：
+
+- MariaDB：约总内存的 30%，设置上下限。
+- Redis：约总内存的 5%，限制为 32MB 至 512MB。
+- PHP-FPM：使用受限制的剩余预算。
+- PHP 进程：按约 96MB/进程估算。
+- WooCommerce：初始 pool 权重是普通网站的两倍。
+- FastCGI keys zone：每个网站 16MB。
+- 每个网站至少 2 个 PHP 子进程，默认上限 50。
+
+这些值是安全起点，不是所有网站的最终最佳值。主题、插件、流量结构、缓存命中率和 WooCommerce 请求比例都会改变实际内存需求。
+
+## 十一、站点目录结构
+
+每个标准站点统一放在：
+
+```text
+/var/www/DOMAIN/public/       WordPress 文档根目录
+/var/www/DOMAIN/logs/         Nginx 和 PHP-FPM 日志
+/var/www/DOMAIN/cache/        Nginx FastCGI 缓存
+/var/www/DOMAIN/backups/      本地备份
+```
+
+例如：
+
+```text
+/var/www/example.com/public/
+/var/www/example.com/logs/
+/var/www/example.com/cache/
+/var/www/example.com/backups/
+```
+
+日志每天轮转，默认保留 14 个压缩轮转文件。
+
+## 十二、主要配置文件
+
+```text
+/etc/wp-shell/sites.v3                    站点清单，不是可执行 Shell 配置
+/etc/wp-shell/databases/                  每站点数据库凭据
+/etc/wp-shell/redis.secret                Redis 密码
+/etc/wp-shell/tuning.v1                   可选 PHP-FPM 调优覆盖值
+/etc/nginx/conf.d/wp-shell-log-format.conf
+/usr/local/sbin/wp-shell                  安装后的主程序
+/usr/local/bin/wp-shell                   全局命令链接
+/usr/local/bin/manage-DOMAIN              每站点快捷命令
+/var/lib/wp-shell/metrics.sqlite3         本地指标数据库
+/var/log/wp-shell/                        部署和管理日志
+```
+
+配置和密码文件使用 root `0600` 权限。站点快捷命令中不包含数据库密码或 Redis 密码。
+
+## 十三、从旧版本升级
+
+### 1. 拉取最新代码
+
+如果使用 Git：
+
+```bash
+cd /path/to/wp-shell
+git pull --ff-only
+sudo ./wp-shell.sh install
+```
+
+如果之前只下载了单个脚本：
+
+```bash
+wget -O wp-shell.sh https://raw.githubusercontent.com/hwc0212/wp-shell/main/wp-shell.sh
+chmod +x wp-shell.sh
+sudo ./wp-shell.sh install
+```
+
+### 2. 自动迁移的旧配置
+
+当 `/etc/wp-shell/sites.v3` 不存在时，v9 会读取：
 
 ```text
 /etc/wp-vps-manager/sites.v2
 /etc/wp-single-deploy/site.v2
 ```
 
-It merges the inventories, preserves database and Redis secret files, writes the v3 configuration, and copies the original configuration directories to:
+迁移过程会：
+
+1. 合并旧的多站点和单站点清单。
+2. 保留域名、PHP 版本、管理员信息、站点路径和 Redis DB。
+3. 复制数据库凭据。
+4. 复制已有 Redis 密钥。
+5. 写入新的 `/etc/wp-shell/sites.v3`。
+6. 把旧配置完整备份到迁移目录。
+
+迁移备份位置：
 
 ```text
 /etc/wp-shell/migration-backup/TIMESTAMP/
 ```
 
-Legacy files are not deleted. Old backups under `/var/backups/wp-shell/DOMAIN` and `/var/backups/wp-shell-single/DOMAIN` are copied without overwriting newer archives when the site backup storage is first used. Old cache content under `/var/cache/nginx/DOMAIN` is cleared during the transition but new cache data lives only under `/var/www/DOMAIN/cache`.
+旧文件不会被自动删除。
 
-The old command names continue to work through wrappers, but documentation and new automation should use `wp-shell`.
-When the unified backup timer is installed, the two legacy backup timers are disabled to prevent duplicate daily archives; their unit files are left in place for audit or manual removal.
+### 3. 旧备份和缓存迁移
 
-## Security notes
+旧备份可能位于：
 
-- Redis listens only on loopback, uses protected mode and a generated password.
-- Database and Redis credentials are never embedded in site wrapper commands.
-- Nginx configuration must pass `nginx -t`; a failed replacement is rolled back.
-- PHP-FPM status sockets are local Unix sockets and are not exposed by Nginx.
-- `wp-config.php` is set to `0640`, and WordPress file editing is disabled.
-- UFW preserves existing rules and allows the detected SSH port before enabling HTTP/HTTPS rules.
-- Fail2ban uses validated SSH and Nginx authentication jails.
-- TLS 1.2/1.3, HSTS, and standard security headers are enabled.
-- Site logs rotate daily and retain 14 compressed rotations.
-
-## Troubleshooting
-
-```bash
-sudo wp-shell site status example.com
-sudo wp-shell metrics status
-nginx -t
-systemctl status nginx mariadb redis-server php8.3-fpm
-systemctl status wp-shell-metrics.timer wp-shell-backup.timer
-certbot certificates
-ls -lt /var/log/wp-shell/
-tail -f /var/www/example.com/logs/nginx-error.log
-tail -f /var/www/example.com/logs/php-error.log
+```text
+/var/backups/wp-shell/DOMAIN
+/var/backups/wp-shell-single/DOMAIN
 ```
 
-If certificate issuance fails, verify both DNS names selected during setup:
+首次使用新备份目录时，脚本会把旧备份复制到：
+
+```text
+/var/www/DOMAIN/backups
+```
+
+迁移不会覆盖同名的新备份，也不会删除旧目录。确认新备份完整后，可以人工删除旧备份目录。
+
+旧缓存目录：
+
+```text
+/var/cache/nginx/DOMAIN
+```
+
+重新部署后，新缓存只保存在：
+
+```text
+/var/www/DOMAIN/cache
+```
+
+迁移阶段执行缓存清理时会同时处理新旧缓存目录。
+
+### 4. 旧命令兼容
+
+以下旧文件名仍然可以运行：
+
+```bash
+sudo ./wp-vps-manager.sh list
+sudo ./deploy-single-wordpress.sh --reconfigure
+```
+
+安装后旧的 `/usr/local/sbin/wp-single-manager` 调用也会自动进入兼容模式。但建议逐步把自动化、文档和运维习惯改为统一的：
+
+```bash
+sudo wp-shell ...
+```
+
+安装统一备份 timer 时，脚本会禁用旧的 `wp-vps-backup.timer` 和 `wp-single-backup.timer`，避免同一天重复生成备份。旧 unit 文件会保留，方便审计或人工清理。
+
+## 十四、安全设计
+
+- 站点配置采用不可执行的数据格式，不会 `source` 用户输入生成的配置。
+- Redis 只监听 loopback，并启用 protected mode 和随机密码。
+- 每个站点使用不同 Redis DB 和域名前缀。
+- 数据库和 Redis 密码不会写入站点快捷命令。
+- `wp-config.php` 使用 `0640` 权限。
+- WordPress 在线文件编辑默认关闭。
+- PHP-FPM status 使用本地 Unix socket，不通过 Nginx 暴露。
+- Nginx 配置必须验证成功后才会生效。
+- UFW 不执行 reset，并在启用前保留当前 SSH 端口。
+- Fail2ban 使用可验证的 SSH 和 Nginx 认证规则。
+- HTTPS 启用 TLS 1.2/1.3、HSTS 和常用安全响应头。
+- 恢复前自动生成安全备份。
+- 备份使用 SHA-256 校验。
+
+## 十五、故障排除
+
+### 1. 查看 wp-shell 日志
+
+```bash
+ls -lt /var/log/wp-shell/
+sudo tail -n 200 /var/log/wp-shell/wp-shell-*.log
+```
+
+### 2. 查看网站日志
+
+```bash
+sudo tail -f /var/www/example.com/logs/nginx-error.log
+sudo tail -f /var/www/example.com/logs/php-error.log
+sudo tail -f /var/www/example.com/logs/php-fpm-slow.log
+```
+
+### 3. 检查服务
+
+```bash
+nginx -t
+systemctl status nginx
+systemctl status mariadb
+systemctl status redis-server
+systemctl status php8.3-fpm
+systemctl status fail2ban
+```
+
+### 4. 检查站点对应 PHP-FPM pool
+
+```bash
+sudo wp-shell site list
+ls -l /run/php/wp_*.sock
+grep -R '^pm.max_children' /etc/php/*/fpm/pool.d/wp-shell-*.conf
+```
+
+### 5. 看板没有数据
+
+```bash
+sudo wp-shell metrics status
+sudo wp-shell metrics collect
+sudo wp-shell report 1h
+journalctl -u wp-shell-metrics.service -n 100 --no-pager
+```
+
+首次安装后可能需要等待一分钟，才会出现第一批自动采集数据。
+
+### 6. 证书申请失败
 
 ```bash
 getent ahosts example.com
 getent ahosts www.example.com
 ss -ltnp | grep -E ':(80|443)\b'
 ufw status verbose
+certbot certificates
 ```
 
-## Development and verification
+如果选择了 `www`，根域名和 `www` 都必须正确解析到 VPS。
+
+### 7. Nginx 配置失败
+
+```bash
+nginx -t
+ls -l /etc/nginx/sites-enabled/
+sed -n '1,240p' /etc/nginx/sites-available/example.com
+```
+
+wp-shell 在生成配置失败时会回滚对应站点配置。修复问题后可以重新执行：
+
+```bash
+sudo wp-shell site deploy example.com
+```
+
+### 8. 手动验证备份
+
+```bash
+cd /var/www/example.com/backups/20260817-020000
+sha256sum --check SHA256SUMS
+```
+
+## 十六、开发和测试
+
+本地测试：
 
 ```bash
 bash tests/static-checks.sh
@@ -299,11 +934,33 @@ bash tests/metrics-roundtrip.sh
 bash tests/dashboard-smoke.sh
 ```
 
-GitHub Actions additionally runs ShellCheck and validates generated Nginx, MariaDB, Redis, and PHP-FPM configuration inside Ubuntu 24.04 containers.
+ShellCheck：
 
-## Scope
+```bash
+shellcheck -x wp-shell.sh wp-vps-manager.sh deploy-single-wordpress.sh tests/*.sh
+```
 
-The lack of a web control panel is intentional. `wp-shell` focuses on one Ubuntu VPS and does not claim to provide clustering, high availability, database replication, cross-server migration, site cloning, cloud backup upload, or a hosted control plane.
+GitHub Actions 还会在 Ubuntu 24.04 容器中使用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 验证生成的配置。
+
+## 十七、当前边界
+
+不提供 Web 控制面板是项目的明确设计目标，而不是缺失功能。
+
+项目专注于一台 Ubuntu VPS，不宣称支持：
+
+- 集群和高可用
+- 数据库复制
+- 自动跨服务器迁移
+- 一键克隆网站
+- 自动上传云端备份
+- 托管式控制平面
+- 自动完成所有 MariaDB 和 Redis 性能调优
+
+这些能力可以结合 WP-CLI、rsync、rclone、对象存储和云厂商工具实现，但在缺少完整验证和回滚机制前，不会作为已经完成的菜单功能提供。
+
+## 免责声明
+
+本项目按现状提供。生产环境使用前，请在相同 Ubuntu 和 PHP 组合上测试，并保留可以在服务器之外恢复的备份。作者不对脚本使用导致的数据丢失、停机或服务中断承担责任。
 
 ## License
 

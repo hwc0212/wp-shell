@@ -2240,6 +2240,7 @@ list_sites() {
         printf 'No sites are managed.\n'
         return
     fi
+    calculate_resource_budget quiet
     local i
     printf '%-3s %-28s %-28s %-5s %-8s %-8s %-5s\n' "ID" "DOMAIN" "PRIMARY" "PHP" "MODE" "REDIS" "POOL"
     for ((i = 1; i <= SITE_COUNT; i++)); do
