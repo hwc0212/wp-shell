@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # WordPress VPS Manager
-# Version 8.0.0
+# Version 8.1.0
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="8.0.0"
+readonly VERSION="8.1.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_VPS_CONFIG_DIR:-/etc/wp-vps-manager}"
@@ -16,7 +16,8 @@ readonly SITES_CONFIG_FILE="$CONFIG_DIR/sites.v2"
 readonly DATABASE_CONFIG_DIR="$CONFIG_DIR/databases"
 readonly REDIS_SECRET_FILE="$CONFIG_DIR/redis.secret"
 readonly STATE_DIR="/var/lib/wp-vps-manager"
-readonly BACKUP_ROOT="/var/backups/wp-shell"
+readonly LEGACY_BACKUP_ROOT="/var/backups/wp-shell"
+readonly LEGACY_CACHE_ROOT="/var/cache/nginx"
 readonly LOG_DIR="/var/log/wp-shell"
 LOG_FILE="$LOG_DIR/wp-vps-manager-$(date +%Y%m%d-%H%M%S).log"
 readonly LOG_FILE
@@ -99,7 +100,7 @@ ensure_root() {
 
 init_runtime() {
     install -d -m 0700 "$CONFIG_DIR" "$DATABASE_CONFIG_DIR" "$STATE_DIR"
-    install -d -m 0700 "$BACKUP_ROOT"
+    install -d -m 0755 /var/www
     install -d -m 0750 "$LOG_DIR"
     touch "$LOG_FILE"
     chmod 0600 "$LOG_FILE"
@@ -743,7 +744,7 @@ configure_https_site() {
     site_temp="$(mktemp /tmp/nginx-site.XXXXXX)"
     cache_temp="$(mktemp /tmp/nginx-cache.XXXXXX)"
     cat > "$cache_temp" <<EOF
-fastcgi_cache_path /var/cache/nginx/$domain levels=1:2 keys_zone=${zone}:16m inactive=60m max_size=512m use_temp_path=off;
+fastcgi_cache_path $(site_cache_dir "$domain") levels=1:2 keys_zone=${zone}:16m inactive=60m max_size=512m use_temp_path=off;
 EOF
     cat > "$site_temp" <<EOF
 server {
@@ -838,7 +839,7 @@ server {
     }
 }
 EOF
-    install -d -o www-data -g www-data -m 0750 "/var/cache/nginx/$domain"
+    install -d -o www-data -g www-data -m 0750 "$(site_cache_dir "$domain")"
     install_nginx_files "$domain" "$site_temp" "$cache_temp"
     rm -f "$site_temp" "$cache_temp"
 }
@@ -847,7 +848,33 @@ create_site_directories() {
     local domain="$1" wp_path="$2"
     install -d -o www-data -g www-data -m 0755 "$wp_path"
     install -d -o www-data -g www-data -m 0750 "/var/www/$domain/logs"
-    install -d -o root -g root -m 0700 "$BACKUP_ROOT/$domain"
+    ensure_site_storage "$domain"
+}
+
+site_cache_dir() {
+    printf '/var/www/%s/cache' "$1"
+}
+
+site_backup_dir() {
+    printf '/var/www/%s/backups' "$1"
+}
+
+migrate_legacy_backups() {
+    local legacy_dir="$1" destination="$2" marker="$2/.legacy-backups-imported"
+    [[ -d "$legacy_dir" && ! -e "$marker" ]] || return 0
+    rsync -a --ignore-existing --exclude='.incomplete.*' "$legacy_dir/" "$destination/"
+    printf 'copied_from=%s\ncopied_at=%s\n' "$legacy_dir" "$(date --iso-8601=seconds)" > "$marker"
+    chmod 0600 "$marker"
+    log_message INFO "旧备份已安全复制到 $destination；确认无误后可手动删除 $legacy_dir"
+}
+
+ensure_site_storage() {
+    local domain="$1" cache_dir backup_dir
+    cache_dir="$(site_cache_dir "$domain")"
+    backup_dir="$(site_backup_dir "$domain")"
+    install -d -o www-data -g www-data -m 0750 "$cache_dir"
+    install -d -o root -g root -m 0700 "$backup_dir"
+    migrate_legacy_backups "$LEGACY_BACKUP_ROOT/$domain" "$backup_dir"
 }
 
 set_site_permissions() {
@@ -1103,8 +1130,8 @@ backup_site() {
     wp_path="$(site_wp_path "$domain")"
     [[ -f "$wp_path/wp-config.php" ]] || die "$domain 尚未安装 WordPress"
     timestamp="$(date +%Y%m%d-%H%M%S)"
-    site_backup_root="$BACKUP_ROOT/$domain"
-    install -d -o root -g root -m 0700 "$site_backup_root"
+    ensure_site_storage "$domain"
+    site_backup_root="$(site_backup_dir "$domain")"
     temp_dir="$(mktemp -d "$site_backup_root/.incomplete.XXXXXX")"
     final_dir="$site_backup_root/$timestamp"
     defaults_file="$(create_mysql_defaults_file "$wp_path")"
@@ -1139,7 +1166,8 @@ restore_site() {
     domain="${SITE_DOMAINS[$index]}"
     wp_path="$(site_wp_path "$domain")"
     [[ "$backup_id" =~ ^20[0-9]{6}-[0-9]{6}$ ]] || die "备份编号格式无效"
-    backup_dir="$BACKUP_ROOT/$domain/$backup_id"
+    ensure_site_storage "$domain"
+    backup_dir="$(site_backup_dir "$domain")/$backup_id"
     [[ -d "$backup_dir" ]] || die "备份不存在：$backup_dir"
     (cd "$backup_dir" && sha256sum --check SHA256SUMS)
     log_message INFO "恢复前创建安全备份"
@@ -1169,11 +1197,13 @@ restore_site() {
 }
 
 clear_site_cache() {
-    local index="$1" domain wp_path cache_dir
+    local index="$1" domain wp_path cache_dir legacy_cache_dir
     domain="${SITE_DOMAINS[$index]}"
     wp_path="$(site_wp_path "$domain")"
-    cache_dir="/var/cache/nginx/$domain"
+    cache_dir="$(site_cache_dir "$domain")"
+    legacy_cache_dir="$LEGACY_CACHE_ROOT/$domain"
     [[ -d "$cache_dir" ]] && find "$cache_dir" -mindepth 1 -delete
+    [[ -d "$legacy_cache_dir" ]] && find "$legacy_cache_dir" -mindepth 1 -delete
     if [[ -f "$wp_path/wp-config.php" ]]; then
         sudo -u www-data wp cache flush --path="$wp_path" || true
     fi
@@ -1195,7 +1225,8 @@ update_site() {
 list_backups() {
     local index="$1" domain backup_dir
     domain="${SITE_DOMAINS[$index]}"
-    backup_dir="$BACKUP_ROOT/$domain"
+    ensure_site_storage "$domain"
+    backup_dir="$(site_backup_dir "$domain")"
     printf '可用备份（%s）：\n' "$domain"
     find "$backup_dir" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' -printf '  %f\n' 2>/dev/null | sort -r || true
 }

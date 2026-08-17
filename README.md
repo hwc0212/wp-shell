@@ -2,8 +2,10 @@
 
 `wp-shell` 是一组面向 Ubuntu VPS 的 WordPress 部署与维护脚本。项目提供多站点管理版和单站点专用版，重点解决可重复部署、HTTPS、缓存、资源预算、备份恢复和基础安全配置。
 
-- 多站点管理器：`wp-vps-manager.sh` v8.0.0
-- 单站点部署器：`deploy-single-wordpress.sh` v2.0.0
+项目定位是以轻量 CLI 和 systemd 工作流替代 Cloudways、SpinupWP 一类托管面板的常用部署与运维能力。它刻意不提供 Web 控制面板，不需要为面板常驻额外的 Web 服务、数据库或后台进程。
+
+- 多站点管理器：`wp-vps-manager.sh` v8.1.0
+- 单站点部署器：`deploy-single-wordpress.sh` v2.1.0
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 项目地址：https://github.com/hwc0212/wp-shell
 - 作者：https://huwencai.com
@@ -29,6 +31,7 @@
 - 多站点使用独立 Redis DB 和域名前缀，清理一个站点不会 `FLUSHDB` 影响其他站点。
 - 管理脚本不再内嵌数据库或 Redis 密码；凭据文件均为 `0600`。
 - 备份包含文件、数据库、元数据和 SHA-256 校验，恢复前自动创建安全备份。
+- 每个站点的 `public`、日志、FastCGI 缓存和备份统一收纳在 `/var/www/DOMAIN/` 下。
 - 自动备份改用 systemd timer，不再重复追加 crontab。
 - 默认关闭 PHP JIT；WordPress 常见负载优先使用 OPcache，并预留真实 PHP-FPM 内存。
 - CI 会执行 Bash 语法检查、安全模式检查和 ShellCheck。
@@ -168,17 +171,13 @@ manifest.txt       域名、时间和 WordPress 版本
 SHA256SUMS         完整性校验
 ```
 
-多站点备份位置：
+多站点和单站点使用相同的站点内备份布局：
 
 ```text
-/var/backups/wp-shell/DOMAIN/TIMESTAMP/
+/var/www/DOMAIN/backups/TIMESTAMP/
 ```
 
-单站点备份位置：
-
-```text
-/var/backups/wp-shell-single/DOMAIN/TIMESTAMP/
-```
+备份目录位于站点的 `public` 文档根目录之外，并使用 root `0700` 权限，不会由 Nginx 对外提供。
 
 默认保留 14 天。可以在执行部署脚本时设置：
 
@@ -204,7 +203,7 @@ systemctl list-timers --all | grep wp-
 
 自动备份使用 systemd timer，每天约 02:00 执行，并带有随机延迟。服务器关机错过计划后，会在恢复运行时补执行。
 
-本地备份无法防范整台 VPS 或磁盘损坏。生产环境还应使用 `rclone`、对象存储或其他工具把 `/var/backups` 同步到异地，并定期执行恢复演练。
+本地备份无法防范整台 VPS 或磁盘损坏。生产环境还应使用 `rclone`、对象存储或其他工具把 `/var/www/*/backups` 同步到异地，并定期执行恢复演练。
 
 ## 缓存设计
 
@@ -263,8 +262,8 @@ FastCGI 会跳过 POST、查询字符串、WordPress 后台、登录、Cron、XM
 /usr/local/bin/manage-DOMAIN                  无密钥站点包装器
 /var/www/DOMAIN/public                        标准站点目录
 /var/www/DOMAIN/logs                          Nginx 站点日志
-/var/cache/nginx/DOMAIN                       FastCGI 缓存
-/var/backups/wp-shell/DOMAIN                   备份
+/var/www/DOMAIN/cache                         FastCGI 缓存
+/var/www/DOMAIN/backups                       本地备份
 /var/log/wp-shell                             部署与管理日志
 ```
 
@@ -276,7 +275,10 @@ FastCGI 会跳过 POST、查询字符串、WordPress 后台、登录、Cron、XM
 /etc/wp-single-deploy/redis.secret            Redis 密码
 /usr/local/sbin/wp-single-manager             安装后的管理器
 /usr/local/bin/manage-DOMAIN                  无密钥站点包装器
-/var/backups/wp-shell-single/DOMAIN            备份
+/var/www/DOMAIN/public                        WordPress 目录
+/var/www/DOMAIN/logs                          Nginx 站点日志
+/var/www/DOMAIN/cache                         FastCGI 缓存
+/var/www/DOMAIN/backups                       本地备份
 /var/log/wp-shell                             部署与管理日志
 ```
 
@@ -294,6 +296,8 @@ v8 不会执行旧版 `~/.vps-manager/wordpress-sites.conf`，因为旧格式本
 6. 不要对导入站点直接执行 `deploy`，除非确定要让脚本接管其 Nginx、证书和缓存配置。
 
 导入命令只添加管理记录和包装命令，不会自动替换现有 Nginx、SSL、数据库或 Redis 设置。
+
+如果旧版本已在 `/var/backups/wp-shell/DOMAIN` 或 `/var/backups/wp-shell-single/DOMAIN` 保存备份，新脚本首次访问该站点的备份功能时会把旧备份安全复制到 `/var/www/DOMAIN/backups`，且不会覆盖同名新备份或删除旧目录。重新部署或重配后，Nginx 会改用 `/var/www/DOMAIN/cache`；缓存清理命令在迁移期间会同时清理新旧缓存目录。
 
 ## 故障排除
 
@@ -334,7 +338,7 @@ sudo ./deploy-single-wordpress.sh --reconfigure
 ### 恢复验证
 
 ```bash
-cd /var/backups/wp-shell/example.com/20260817-020000
+cd /var/www/example.com/backups/20260817-020000
 sha256sum --check SHA256SUMS
 ```
 
@@ -346,18 +350,22 @@ sha256sum --check SHA256SUMS
 bash tests/static-checks.sh
 bash tests/config-roundtrip.sh
 bash tests/render-nginx.sh
+bash tests/storage-layout.sh
 docker run --rm -v "$PWD:/mnt:ro" koalaman/shellcheck:stable \
   -x /mnt/wp-vps-manager.sh /mnt/deploy-single-wordpress.sh \
   /mnt/tests/static-checks.sh /mnt/tests/config-roundtrip.sh \
-  /mnt/tests/render-nginx.sh /mnt/tests/nginx-integration.sh \
+  /mnt/tests/render-nginx.sh /mnt/tests/storage-layout.sh \
+  /mnt/tests/nginx-integration.sh \
   /mnt/tests/service-config-integration.sh
 ```
 
 GitHub Actions 还会在 Ubuntu 24.04 容器中用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 解析生成的服务配置，并在每次 push 和 pull request 时执行完整检查。
 
-## 当前边界
+## 设计取舍与当前边界
 
-当前版本没有 Web 控制面板，也没有宣称支持以下尚未实现的能力：
+不提供 Web 控制面板是本项目的明确设计目标，而不是待补功能。站点管理通过 Shell 命令、WP-CLI 和 systemd 完成，以减少常驻资源、额外攻击面和面板自身的升级维护工作。
+
+项目目标是覆盖单机 WordPress VPS 的常用部署与运维流程，不会复制托管平台的完整控制平面，也没有宣称支持以下能力：
 
 - 一键克隆站点
 - 自动跨服务器迁移

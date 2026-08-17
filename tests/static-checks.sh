@@ -16,7 +16,7 @@ for script in "${scripts[@]}"; do
     bash "$script" --help >/dev/null
 done
 
-if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.state|FLUSHDB|php-status|php-ping|apt-cache[[:space:]]+policy' "${scripts[@]}"; then
+if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.state|FLUSHDB|php-status|php-ping|apt-cache[[:space:]]+policy|fastcgi_cache_path[[:space:]]+/var/cache/nginx' "${scripts[@]}"; then
     printf '发现已禁止的高风险模式。\n' >&2
     exit 1
 fi

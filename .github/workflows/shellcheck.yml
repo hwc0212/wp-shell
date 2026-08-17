@@ -19,6 +19,7 @@ jobs:
           bash tests/static-checks.sh
           bash tests/config-roundtrip.sh
           bash tests/render-nginx.sh
+          bash tests/storage-layout.sh
 
       - name: ShellCheck
         run: >-
@@ -31,6 +32,7 @@ jobs:
           /mnt/tests/static-checks.sh
           /mnt/tests/config-roundtrip.sh
           /mnt/tests/render-nginx.sh
+          /mnt/tests/storage-layout.sh
           /mnt/tests/nginx-integration.sh
           /mnt/tests/service-config-integration.sh
 

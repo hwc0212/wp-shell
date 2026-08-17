@@ -29,6 +29,7 @@ trap 'rm -rf -- "$test_root"' EXIT
     }
 
     configure_https_site 1
+    grep -q 'fastcgi_cache_path /var/www/example.com/cache ' "$test_root/multi-cache.conf"
     grep -q 'keys_zone=wp_example_com:16m' "$test_root/multi-cache.conf"
     grep -q 'fastcgi_cache wp_example_com;' "$test_root/multi-site.conf"
     grep -q 'fastcgi_pass unix:/run/php/php8.3-fpm.sock;' "$test_root/multi-site.conf"
@@ -57,6 +58,7 @@ trap 'rm -rf -- "$test_root"' EXIT
     }
 
     configure_https_site
+    grep -q 'fastcgi_cache_path /var/www/single.example.com/cache ' "$test_root/single-cache.conf"
     grep -q 'keys_zone=wp_single_example_com:16m' "$test_root/single-cache.conf"
     grep -q 'fastcgi_cache wp_single_example_com;' "$test_root/single-site.conf"
     grep -q 'fastcgi_pass unix:/run/php/php8.4-fpm.sock;' "$test_root/single-site.conf"
