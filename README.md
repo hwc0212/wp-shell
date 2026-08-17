@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.2.0
+- 当前版本：`wp-shell.sh` v9.2.1
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -226,10 +226,10 @@ sudo cat /root/wordpress-credentials-example.com.txt
 
 ### 6. WordPress 语言
 
-脚本默认下载 `zh_CN` WordPress。如果需要为新网站安装英文版本，应在添加网站时指定：
+脚本默认下载 `en_US` WordPress。如果需要为新网站安装简体中文版，应在添加网站时指定：
 
 ```bash
-sudo env WORDPRESS_LOCALE=en_US wp-shell site add
+sudo env WORDPRESS_LOCALE=zh_CN wp-shell site add
 ```
 
 终端程序本身始终使用英文和 ASCII 字符，以避免不同 SSH 客户端的编码和字符宽度问题；这不影响 WordPress 后台语言，也不影响本 README 使用中文。

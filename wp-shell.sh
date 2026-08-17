@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.2.0
+# Version 9.2.1
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="9.2.0"
+readonly VERSION="9.2.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -29,7 +29,7 @@ LOG_FILE="$LOG_DIR/wp-shell-$(date +%Y%m%d-%H%M%S).log"
 readonly LOG_FILE
 readonly MANAGED_SCRIPT="/usr/local/sbin/wp-shell"
 readonly WP_CLI_VERSION="${WP_CLI_VERSION:-2.12.0}"
-readonly WORDPRESS_LOCALE="${WORDPRESS_LOCALE:-zh_CN}"
+readonly WORDPRESS_LOCALE="${WORDPRESS_LOCALE:-en_US}"
 readonly BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
 
 readonly RED=$'\033[0;31m'
