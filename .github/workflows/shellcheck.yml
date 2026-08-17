@@ -16,10 +16,14 @@ jobs:
 
       - name: Syntax and safety checks
         run: |
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y sqlite3 jq >/dev/null
           bash tests/static-checks.sh
           bash tests/config-roundtrip.sh
           bash tests/render-nginx.sh
           bash tests/storage-layout.sh
+          bash tests/metrics-roundtrip.sh
+          bash tests/dashboard-smoke.sh
 
       - name: ShellCheck
         run: >-
@@ -27,12 +31,15 @@ jobs:
           -v "$PWD:/mnt:ro"
           koalaman/shellcheck:stable
           -x
+          /mnt/wp-shell.sh
           /mnt/wp-vps-manager.sh
           /mnt/deploy-single-wordpress.sh
           /mnt/tests/static-checks.sh
           /mnt/tests/config-roundtrip.sh
           /mnt/tests/render-nginx.sh
           /mnt/tests/storage-layout.sh
+          /mnt/tests/metrics-roundtrip.sh
+          /mnt/tests/dashboard-smoke.sh
           /mnt/tests/nginx-integration.sh
           /mnt/tests/service-config-integration.sh
 
@@ -53,5 +60,5 @@ jobs:
           ubuntu:24.04
           bash -c
           'apt-get update >/dev/null &&
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mariadb-server redis-server php8.3-fpm openssl >/dev/null &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mariadb-server redis-server php8.3-fpm openssl sqlite3 jq >/dev/null &&
           bash /mnt/tests/service-config-integration.sh'

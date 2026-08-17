@@ -5,9 +5,9 @@
 set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-[[ $EUID -eq 0 ]] || { printf '此测试必须在隔离容器内以 root 运行。\n' >&2; exit 1; }
-command -v nginx >/dev/null 2>&1 || { printf '缺少 nginx。\n' >&2; exit 1; }
-command -v openssl >/dev/null 2>&1 || { printf '缺少 openssl。\n' >&2; exit 1; }
+[[ $EUID -eq 0 ]] || { printf 'This test must run as root in an isolated container.\n' >&2; exit 1; }
+command -v nginx >/dev/null 2>&1 || { printf 'nginx is missing.\n' >&2; exit 1; }
+command -v openssl >/dev/null 2>&1 || { printf 'openssl is missing.\n' >&2; exit 1; }
 
 rm -f /etc/nginx/sites-enabled/default
 install -d -m 0755 /var/www/example.com/public /var/www/example.com/logs
@@ -17,34 +17,32 @@ make_certificate() {
     local domain="$1" cert_dir="/etc/letsencrypt/live/$1"
     install -d -m 0755 "$cert_dir"
     openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-        -subj "/CN=$domain" \
-        -keyout "$cert_dir/privkey.pem" \
+        -subj "/CN=$domain" -keyout "$cert_dir/privkey.pem" \
         -out "$cert_dir/fullchain.pem" >/dev/null 2>&1
 }
 
 make_certificate example.com
 make_certificate single.example.com
 
-(
-    source "$repo_root/wp-vps-manager.sh"
-    systemctl() { return 0; }
-    SITE_COUNT=1
-    SITE_DOMAINS[1]="example.com"
-    SITE_PHP_VERSIONS[1]="8.3"
-    SITE_WWW[1]="yes"
-    SITE_PATHS[1]="/var/www/example.com/public"
-    configure_https_site 1
-)
-
-(
-    source "$repo_root/deploy-single-wordpress.sh"
-    systemctl() { return 0; }
-    DOMAIN="single.example.com"
-    PRIMARY_DOMAIN="www.single.example.com"
-    INCLUDE_WWW="yes"
-    PHP_VERSION="8.4"
-    configure_https_site
-)
+source "$repo_root/wp-shell.sh"
+systemctl() { return 0; }
+SITE_COUNT=2
+SITE_DOMAINS[1]="example.com"
+SITE_PRIMARY_DOMAINS[1]="example.com"
+SITE_PHP_VERSIONS[1]="8.3"
+SITE_WOOCOMMERCE[1]="no"
+SITE_WWW[1]="yes"
+SITE_PATHS[1]="/var/www/example.com/public"
+SITE_MODES[1]="managed"
+SITE_DOMAINS[2]="single.example.com"
+SITE_PRIMARY_DOMAINS[2]="www.single.example.com"
+SITE_PHP_VERSIONS[2]="8.3"
+SITE_WOOCOMMERCE[2]="no"
+SITE_WWW[2]="yes"
+SITE_PATHS[2]="/var/www/single.example.com/public"
+SITE_MODES[2]="managed"
+configure_https_site 1
+configure_https_site 2
 
 nginx -t
-printf '真实 Nginx 配置验证通过。\n'
+printf 'Real Nginx configuration validation passed.\n'
