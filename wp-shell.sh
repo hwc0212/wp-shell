@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.2.1
+# Version 9.2.2
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="9.2.1"
+readonly WP_SHELL_VERSION="9.2.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -2412,7 +2412,7 @@ add_site_command() {
 
 new_server_wizard() {
     local mode_choice php_choice i
-    printf '\nwp-shell v%s environment setup\n\n' "$VERSION"
+    printf '\nwp-shell v%s environment setup\n\n' "$WP_SHELL_VERSION"
     printf 'Deployment mode:\n  1) Single website\n  2) Multiple websites\n'
     while true; do
         read -r -p "Select [1-2]: " mode_choice
@@ -2483,7 +2483,7 @@ install_or_repair_environment() {
 }
 
 installation_menu() {
-    printf '\nwp-shell v%s\n' "$VERSION"
+    printf '\nwp-shell v%s\n' "$WP_SHELL_VERSION"
     printf 'Environment: WordPress stack not detected\n\n'
     printf '1) Install WordPress environment\n2) Import an existing WordPress site\n3) Show command help\n0) Exit\n'
     local choice
@@ -2572,7 +2572,7 @@ transfer_imported_site() {
 }
 
 adoption_menu() {
-    printf '\nwp-shell v%s\n' "$VERSION"
+    printf '\nwp-shell v%s\n' "$WP_SHELL_VERSION"
     printf 'Environment: existing WordPress stack detected, not managed by wp-shell\n\n'
     printf '1) Import existing websites only (safe)\n2) Import websites and enable local monitoring\n3) Import and transfer one website for wp-shell optimization\n4) Show detected environment\n5) Show command help\n0) Exit\n'
     local choice
@@ -2590,7 +2590,7 @@ adoption_menu() {
 
 management_menu() {
     install_self
-    printf '\nwp-shell v%s\n' "$VERSION"
+    printf '\nwp-shell v%s\n' "$WP_SHELL_VERSION"
     printf 'Environment: installed | Mode: %s | PHP: %s | Sites: %s\n\n' \
         "$ENVIRONMENT_MODE" "$DEFAULT_PHP_VERSION" "$SITE_COUNT"
     printf '1) Dashboard\n2) Add a new website\n3) Website list\n4) Website status\n5) Deploy or repair a website\n6) Back up one website\n7) Back up all websites\n8) Restore a website\n9) Import existing websites\n10) Traffic and resource report\n11) Analyze resource usage\n12) Apply safe tuning recommendations\n13) Reapply service resource budget\n14) Security scan\n15) Repair backup and metrics timers\n0) Exit\n'
@@ -2667,7 +2667,7 @@ interactive_menu() {
 
 show_help() {
     cat <<EOF
-wp-shell v$VERSION - WordPress VPS operations without a web control panel
+wp-shell v$WP_SHELL_VERSION - WordPress VPS operations without a web control panel
 
 Usage:
   sudo wp-shell                                 Open the context-aware main menu
@@ -2738,7 +2738,7 @@ legacy_single_command() {
     case "$command" in
         deploy|--reconfigure) deploy_domain "$domain" ;;
         manage) site_action "$domain" "${2:-status}" "${3:-}" ;;
-        --version|-v) printf 'wp-shell %s\n' "$VERSION" ;;
+        --version|-v) printf 'wp-shell %s\n' "$WP_SHELL_VERSION" ;;
         --help|-h) show_help ;;
         *) die "Unknown legacy single-site command: $command" ;;
     esac
@@ -2792,7 +2792,7 @@ main() {
     fi
     case "${1:-}" in
         --help|-h) show_help; return ;;
-        --version|-v) printf 'wp-shell %s\n' "$VERSION"; return ;;
+        --version|-v) printf 'wp-shell %s\n' "$WP_SHELL_VERSION"; return ;;
     esac
 
     ensure_root "$@"

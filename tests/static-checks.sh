@@ -17,12 +17,19 @@ for script in "${scripts[@]}"; do
     bash "$script" --help >/dev/null
 done
 
+bash -c 'source "$1"; check_platform' _ "$repo_root/wp-shell.sh"
+
 if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.state|FLUSHDB|fastcgi_cache_path[[:space:]]+/var/cache/nginx' "${scripts[@]}"; then
     printf 'A prohibited high-risk pattern was found.\n' >&2
     exit 1
 fi
 
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
+grep -Fq 'readonly WP_SHELL_VERSION="9.2.2"' "$repo_root/wp-shell.sh"
+if grep -q '^readonly VERSION=' "$repo_root/wp-shell.sh"; then
+    printf 'The generic VERSION variable conflicts with /etc/os-release.\n' >&2
+    exit 1
+fi
 grep -Fq "readonly ENVIRONMENT_CONFIG_FILE=\"\$CONFIG_DIR/environment.v1\"" "$repo_root/wp-shell.sh"
 grep -Fq "readonly WORDPRESS_LOCALE=\"\${WORDPRESS_LOCALE:-en_US}\"" "$repo_root/wp-shell.sh"
 grep -Fq "fastcgi_pass unix:\$pool_socket;" "$repo_root/wp-shell.sh"
