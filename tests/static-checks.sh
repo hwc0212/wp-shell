@@ -25,7 +25,7 @@ if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.s
 fi
 
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
-grep -Fq 'readonly WP_SHELL_VERSION="9.3.0"' "$repo_root/wp-shell.sh"
+grep -Fq 'readonly WP_SHELL_VERSION="9.3.1"' "$repo_root/wp-shell.sh"
 if grep -q '^readonly VERSION=' "$repo_root/wp-shell.sh"; then
     printf 'The generic VERSION variable conflicts with /etc/os-release.\n' >&2
     exit 1
@@ -38,6 +38,15 @@ if grep -q 'install_site_wrapper' "$repo_root/wp-shell.sh"; then
     printf 'Per-domain command generation must not be reintroduced.\n' >&2
     exit 1
 fi
+if grep -q 'sudo -u www-data wp' "$repo_root/wp-shell.sh"; then
+    printf 'Site WP-CLI calls must use the controlled site_wp_cli context.\n' >&2
+    exit 1
+fi
+if grep -E 'wp rewrite structure .*--hard' "$repo_root/wp-shell.sh"; then
+    printf 'Nginx sites must not request an Apache .htaccess rewrite flush.\n' >&2
+    exit 1
+fi
+grep -Fq "WP_CLI_CACHE_DIR=\"\$wp_cli_home/cache\"" "$repo_root/wp-shell.sh"
 if LC_ALL=C grep -nP '[^\x00-\x7F]' "${scripts[@]}"; then
     printf 'Non-ASCII text was found in terminal scripts.\n' >&2
     exit 1

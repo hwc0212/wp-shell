@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.3.0
+# Version 9.3.1
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.3.0"
+readonly WP_SHELL_VERSION="9.3.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -1182,6 +1182,7 @@ EOF
 
 create_site_directories() {
     local domain="$1" wp_path="$2"
+    install -d -o root -g root -m 0755 "/var/www/$domain"
     install -d -o www-data -g www-data -m 0755 "$wp_path"
     install -d -o www-data -g www-data -m 0750 "/var/www/$domain/logs"
     ensure_site_storage "$domain"
@@ -1195,6 +1196,10 @@ site_backup_dir() {
     printf '/var/www/%s/backups' "$1"
 }
 
+site_wp_cli_home() {
+    printf '/var/www/%s/.wp-cli' "$1"
+}
+
 migrate_legacy_backups() {
     local legacy_dir="$1" destination="$2" marker
     marker="$destination/.legacy-backups-imported-$(printf '%s' "$legacy_dir" | sha256sum | cut -c1-12)"
@@ -1206,23 +1211,55 @@ migrate_legacy_backups() {
 }
 
 ensure_site_storage() {
-    local domain="$1" cache_dir backup_dir
+    local domain="$1" cache_dir backup_dir wp_cli_home
     cache_dir="$(site_cache_dir "$domain")"
     backup_dir="$(site_backup_dir "$domain")"
+    wp_cli_home="$(site_wp_cli_home "$domain")"
     install -d -o www-data -g www-data -m 0750 "$cache_dir"
+    install -d -o www-data -g www-data -m 0750 "$wp_cli_home" "$wp_cli_home/cache"
     install -d -o root -g root -m 0700 "$backup_dir"
     migrate_legacy_backups "$LEGACY_BACKUP_ROOT/$domain" "$backup_dir"
     migrate_legacy_backups "$LEGACY_SINGLE_BACKUP_ROOT/$domain" "$backup_dir"
 }
 
+site_wp_cli() {
+    local domain="$1" index wp_path site_home wp_cli_home
+    shift
+    index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
+    wp_path="${SITE_PATHS[$index]}"
+    site_home="/var/www/$domain"
+    wp_cli_home="$(site_wp_cli_home "$domain")"
+    install -d -o www-data -g www-data -m 0750 "$wp_cli_home" "$wp_cli_home/cache"
+    (
+        cd "$wp_path"
+        sudo -u www-data env \
+            HOME="$site_home" \
+            WP_CLI_CACHE_DIR="$wp_cli_home/cache" \
+            wp --path="$wp_path" "$@"
+    )
+}
+
 set_site_permissions() {
-    local domain="$1" wp_path
+    local domain="$1" wp_path site_root
     wp_path="$(site_wp_path "$domain")"
-    chown -R www-data:www-data "$wp_path" "/var/www/$domain/logs"
-    find "$wp_path" -type d -exec chmod 0755 {} +
-    find "$wp_path" -type f -exec chmod 0644 {} +
+    site_root="/var/www/$domain"
+    find "$wp_path" -xdev \
+        \( -path "$site_root/backups" -o -path "$site_root/cache" -o \
+           -path "$site_root/logs" -o -path "$site_root/.wp-cli" \) -prune -o \
+        -exec chown -h www-data:www-data {} +
+    find "$wp_path" -xdev \
+        \( -path "$site_root/backups" -o -path "$site_root/cache" -o \
+           -path "$site_root/logs" -o -path "$site_root/.wp-cli" \) -prune -o \
+        -type d -exec chmod 0755 {} +
+    find "$wp_path" -xdev \
+        \( -path "$site_root/backups" -o -path "$site_root/cache" -o \
+           -path "$site_root/logs" -o -path "$site_root/.wp-cli" \) -prune -o \
+        -type f -exec chmod 0644 {} +
     [[ -f "$wp_path/wp-config.php" ]] && chmod 0640 "$wp_path/wp-config.php"
+    chown -R www-data:www-data "$site_root/logs"
     chmod 0750 "/var/www/$domain/logs"
+    ensure_site_storage "$domain"
+    chown -R root:root "$(site_backup_dir "$domain")"
 }
 
 install_wordpress_site() {
@@ -1236,31 +1273,31 @@ install_wordpress_site() {
     redis_password="$REDIS_PASSWORD"
 
     if [[ ! -f "$wp_path/wp-load.php" ]]; then
-        sudo -u www-data wp core download --path="$wp_path" --locale="$WORDPRESS_LOCALE"
+        site_wp_cli "$domain" core download --locale="$WORDPRESS_LOCALE"
     fi
     if [[ ! -f "$wp_path/wp-config.php" ]]; then
         load_database_config "$domain"
-        printf '%s\n' "$DB_PASSWORD" | sudo -u www-data wp config create \
-            --path="$wp_path" --dbname="$DB_NAME" --dbuser="$DB_USER" \
+        printf '%s\n' "$DB_PASSWORD" | site_wp_cli "$domain" config create \
+            --dbname="$DB_NAME" --dbuser="$DB_USER" \
             --dbhost=localhost --dbprefix=wp_ --dbcharset=utf8mb4 --prompt=dbpass
     fi
 
-    sudo -u www-data wp config set FORCE_SSL_ADMIN true --raw --path="$wp_path"
-    sudo -u www-data wp config set DISALLOW_FILE_EDIT true --raw --path="$wp_path"
-    sudo -u www-data wp config set WP_CACHE true --raw --path="$wp_path"
-    sudo -u www-data wp config set WP_REDIS_HOST 127.0.0.1 --path="$wp_path"
-    sudo -u www-data wp config set WP_REDIS_PORT 6379 --raw --path="$wp_path"
-    sudo -u www-data wp config set WP_REDIS_PASSWORD "$redis_password" --path="$wp_path"
-    sudo -u www-data wp config set WP_REDIS_DATABASE "${SITE_REDIS_DATABASES[$index]}" --raw --path="$wp_path"
-    sudo -u www-data wp config set WP_REDIS_PREFIX "${domain}:" --path="$wp_path"
+    site_wp_cli "$domain" config set FORCE_SSL_ADMIN true --raw
+    site_wp_cli "$domain" config set DISALLOW_FILE_EDIT true --raw
+    site_wp_cli "$domain" config set WP_CACHE true --raw
+    site_wp_cli "$domain" config set WP_REDIS_HOST 127.0.0.1
+    site_wp_cli "$domain" config set WP_REDIS_PORT 6379 --raw
+    site_wp_cli "$domain" config set WP_REDIS_PASSWORD "$redis_password"
+    site_wp_cli "$domain" config set WP_REDIS_DATABASE "${SITE_REDIS_DATABASES[$index]}" --raw
+    site_wp_cli "$domain" config set WP_REDIS_PREFIX "${domain}:"
     memory_limit="256M"
     (( $(memory_mb) >= 4096 )) && memory_limit="512M"
-    sudo -u www-data wp config set WP_MEMORY_LIMIT "$memory_limit" --path="$wp_path"
+    site_wp_cli "$domain" config set WP_MEMORY_LIMIT "$memory_limit"
 
-    if ! sudo -u www-data wp core is-installed --path="$wp_path" >/dev/null 2>&1; then
+    if ! site_wp_cli "$domain" core is-installed >/dev/null 2>&1; then
         admin_password="$(generate_password)"
-        printf '%s\n' "$admin_password" | sudo -u www-data wp core install \
-            --path="$wp_path" --url="https://$primary" \
+        printf '%s\n' "$admin_password" | site_wp_cli "$domain" core install \
+            --url="https://$primary" \
             --title="${SITE_TITLES[$index]}" \
             --admin_user="${SITE_ADMIN_USERS[$index]}" \
             --admin_email="${SITE_ADMIN_EMAILS[$index]}" --skip-email --prompt=admin_password
@@ -1277,15 +1314,15 @@ install_wordpress_site() {
     fi
 
     if [[ "$initial_mode" == "managed" ]]; then
-        sudo -u www-data wp rewrite structure '/%postname%/' --hard --path="$wp_path"
+        site_wp_cli "$domain" rewrite structure '/%postname%/'
     fi
-    sudo -u www-data wp plugin install redis-cache --activate --path="$wp_path"
-    sudo -u www-data wp redis enable --path="$wp_path"
+    site_wp_cli "$domain" plugin install redis-cache --activate
+    site_wp_cli "$domain" redis enable
     if [[ "${SITE_WOOCOMMERCE[$index]}" == "yes" ]]; then
-        sudo -u www-data wp plugin install woocommerce --activate --path="$wp_path"
+        site_wp_cli "$domain" plugin install woocommerce --activate
     fi
     if [[ "$initial_mode" == "managed" ]]; then
-        sudo -u www-data wp plugin delete hello akismet --path="$wp_path" 2>/dev/null || true
+        site_wp_cli "$domain" plugin delete hello akismet 2>/dev/null || true
     fi
     set_site_permissions "$domain"
 }
@@ -1555,11 +1592,11 @@ site_status() {
 }
 
 create_mysql_defaults_file() {
-    local wp_path="$1" defaults_file db_user db_password db_host escaped_password
+    local domain="$1" defaults_file db_user db_password db_host escaped_password
     defaults_file="$(mktemp /run/wp-vps-mysql.XXXXXX)"
-    db_user="$(sudo -u www-data wp config get DB_USER --path="$wp_path")"
-    db_password="$(sudo -u www-data wp config get DB_PASSWORD --path="$wp_path")"
-    db_host="$(sudo -u www-data wp config get DB_HOST --path="$wp_path")"
+    db_user="$(site_wp_cli "$domain" config get DB_USER)"
+    db_password="$(site_wp_cli "$domain" config get DB_PASSWORD)"
+    db_host="$(site_wp_cli "$domain" config get DB_HOST)"
     escaped_password="${db_password//\\/\\\\}"
     escaped_password="${escaped_password//\"/\\\"}"
     {
@@ -1583,8 +1620,8 @@ backup_site() {
     site_backup_root="$(site_backup_dir "$domain")"
     temp_dir="$(mktemp -d "$site_backup_root/.incomplete.XXXXXX")"
     final_dir="$site_backup_root/$timestamp"
-    defaults_file="$(create_mysql_defaults_file "$wp_path")"
-    db_name="$(sudo -u www-data wp config get DB_NAME --path="$wp_path")"
+    defaults_file="$(create_mysql_defaults_file "$domain")"
+    db_name="$(site_wp_cli "$domain" config get DB_NAME)"
 
     if ! tar --exclude='./wp-content/cache/*' --exclude='./wp-content/uploads/cache/*' -czf "$temp_dir/files.tar.gz" -C "$wp_path" .; then
         rm -rf -- "$temp_dir"
@@ -1600,7 +1637,7 @@ backup_site() {
     {
         printf 'domain=%s\n' "$domain"
         printf 'created_at=%s\n' "$(date --iso-8601=seconds)"
-        printf 'wordpress_version=%s\n' "$(sudo -u www-data wp core version --path="$wp_path")"
+        printf 'wordpress_version=%s\n' "$(site_wp_cli "$domain" core version)"
     } > "$temp_dir/manifest.txt"
     (cd "$temp_dir" && sha256sum files.tar.gz database.sql.gz manifest.txt > SHA256SUMS)
     mv "$temp_dir" "$final_dir"
@@ -1621,8 +1658,8 @@ restore_site() {
     (cd "$backup_dir" && sha256sum --check SHA256SUMS)
     log_message INFO "Creating a safety backup before restore."
     backup_site "$index" >/dev/null
-    defaults_file="$(create_mysql_defaults_file "$wp_path")"
-    db_name="$(sudo -u www-data wp config get DB_NAME --path="$wp_path")"
+    defaults_file="$(create_mysql_defaults_file "$domain")"
+    db_name="$(site_wp_cli "$domain" config get DB_NAME)"
 
     (
         set -Eeuo pipefail
@@ -1631,12 +1668,12 @@ restore_site() {
         cleanup_restore() {
             rm -rf -- "$local_stage"
             rm -f "$defaults_file"
-            sudo -u www-data wp maintenance-mode deactivate --path="$wp_path" >/dev/null 2>&1 || true
+            site_wp_cli "$domain" maintenance-mode deactivate >/dev/null 2>&1 || true
         }
         trap cleanup_restore EXIT
         tar -xzf "$backup_dir/files.tar.gz" -C "$local_stage"
         [[ -f "$local_stage/wp-config.php" ]]
-        sudo -u www-data wp maintenance-mode activate --path="$wp_path" >/dev/null 2>&1 || true
+        site_wp_cli "$domain" maintenance-mode activate >/dev/null 2>&1 || true
         rsync -a --delete "$local_stage/" "$wp_path/"
         gzip -dc "$backup_dir/database.sql.gz" | mariadb --defaults-extra-file="$defaults_file" "$db_name"
         set_site_permissions "$domain"
@@ -1654,7 +1691,7 @@ clear_site_cache() {
     [[ -d "$cache_dir" ]] && find "$cache_dir" -mindepth 1 -delete
     [[ -d "$legacy_cache_dir" ]] && find "$legacy_cache_dir" -mindepth 1 -delete
     if [[ -f "$wp_path/wp-config.php" ]]; then
-        sudo -u www-data wp cache flush --path="$wp_path" || true
+        site_wp_cli "$domain" cache flush || true
     fi
     systemctl reload "php${SITE_PHP_VERSIONS[$index]}-fpm"
 }
@@ -1664,10 +1701,10 @@ update_site() {
     domain="${SITE_DOMAINS[$index]}"
     wp_path="$(site_wp_path "$domain")"
     backup_site "$index" >/dev/null
-    sudo -u www-data wp core update --path="$wp_path"
-    sudo -u www-data wp core update-db --path="$wp_path"
-    sudo -u www-data wp plugin update --all --path="$wp_path"
-    sudo -u www-data wp theme update --all --path="$wp_path"
+    site_wp_cli "$domain" core update
+    site_wp_cli "$domain" core update-db
+    site_wp_cli "$domain" plugin update --all
+    site_wp_cli "$domain" theme update --all
     clear_site_cache "$index"
 }
 
@@ -1688,7 +1725,7 @@ site_action() {
         status) site_status "$index" ;;
         info)
             site_status "$index"
-            [[ -f "$wp_path/wp-config.php" ]] && printf '  WordPress: %s\n' "$(sudo -u www-data wp core version --path="$wp_path")"
+            [[ -f "$wp_path/wp-config.php" ]] && printf '  WordPress: %s\n' "$(site_wp_cli "$domain" core version)"
             ;;
         cache-clear) clear_site_cache "$index"; log_message SUCCESS "$domain cache was cleared." ;;
         backup) backup_site "$index" ;;

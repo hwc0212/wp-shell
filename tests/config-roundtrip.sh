@@ -73,4 +73,17 @@ load_environment_config
 [[ "$DEFAULT_PHP_VERSION" == "8.4" ]]
 [[ "$ENVIRONMENT_UFW" == "yes" ]]
 
+SITE_PATHS[1]="$test_root/site/public"
+mkdir -p "${SITE_PATHS[1]}"
+mock_bin="$test_root/mock-bin"
+mkdir -p "$mock_bin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$mock_bin/install"
+printf '#!/usr/bin/env bash\nprintf "cwd=%%s\\n" "$PWD"\nprintf "arg=%%s\\n" "$@"\n' > "$mock_bin/sudo"
+chmod 0755 "$mock_bin/install" "$mock_bin/sudo"
+wp_cli_context="$(PATH="$mock_bin:$PATH" site_wp_cli legacy.example.com core version)"
+grep -Fq "cwd=${SITE_PATHS[1]}" <<< "$wp_cli_context"
+grep -Fq 'arg=HOME=/var/www/legacy.example.com' <<< "$wp_cli_context"
+grep -Fq 'arg=WP_CLI_CACHE_DIR=/var/www/legacy.example.com/.wp-cli/cache' <<< "$wp_cli_context"
+grep -Fq "arg=--path=${SITE_PATHS[1]}" <<< "$wp_cli_context"
+
 printf 'Site/environment configuration and legacy migration tests passed.\n'

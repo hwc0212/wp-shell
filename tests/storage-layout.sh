@@ -24,6 +24,7 @@ test_migration() {
 
 [[ "$(site_cache_dir example.com)" == "/var/www/example.com/cache" ]]
 [[ "$(site_backup_dir example.com)" == "/var/www/example.com/backups" ]]
+[[ "$(site_wp_cli_home example.com)" == "/var/www/example.com/.wp-cli" ]]
 test_migration "$test_root/legacy" "$test_root/new"
 
 printf 'Site storage layout and backup migration tests passed.\n'

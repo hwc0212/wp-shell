@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.3.0
+- 当前版本：`wp-shell.sh` v9.3.1
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -848,6 +848,7 @@ sudo wp-shell optimize
 /var/www/DOMAIN/logs/         Nginx 和 PHP-FPM 日志
 /var/www/DOMAIN/cache/        Nginx FastCGI 缓存
 /var/www/DOMAIN/backups/      本地备份
+/var/www/DOMAIN/.wp-cli/      站点独立的 WP-CLI HOME 和下载缓存
 ```
 
 例如：
@@ -857,6 +858,7 @@ sudo wp-shell optimize
 /var/www/example.com/logs/
 /var/www/example.com/cache/
 /var/www/example.com/backups/
+/var/www/example.com/.wp-cli/
 ```
 
 日志每天轮转，默认保留 14 个压缩轮转文件。
@@ -1067,6 +1069,18 @@ sudo wp-shell site deploy example.com
 cd /var/www/example.com/backups/20260817-020000
 sha256sum --check SHA256SUMS
 ```
+
+### 9. WP-CLI 出现 Permission denied
+
+`v9.3.1` 起，所有站点 WP-CLI 命令都会先切换到 WordPress 文档根目录，并使用 `/var/www/DOMAIN/.wp-cli/` 作为独立的可写配置和缓存目录。脚本不会让 `www-data` 在 `/home/USER` 或共享的 `/var/www/.wp-cli` 中创建文件。
+
+如果旧版本在 WordPress 已安装后中断，并出现 `proc_open(): posix_spawn() failed: Permission denied`，更新脚本后执行：
+
+```bash
+sudo wp-shell site deploy example.com
+```
+
+修复过程会复用已有数据库、证书、WordPress 和管理员凭据，从中断的位置继续配置 permalink、Redis Object Cache 和可选插件。
 
 ## 十六、开发和测试
 
