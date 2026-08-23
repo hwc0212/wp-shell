@@ -43,6 +43,24 @@ install -d -m 0750 "$LOG_DIR"
 old_redis_secret="$(<"$REDIS_SECRET_FILE")"
 redis_log="$LOG_DIR/wp-shell-rotation-test.log"
 printf 'Accidental credential output: %s\n' "$old_redis_secret" > "$redis_log"
+install -d -o www-data -g www-data -m 0755 "${SITE_PATHS[1]}"
+wp_config="${SITE_PATHS[1]}/wp-config.php"
+printf "<?php\ndefine( 'DB_NAME', 'wp_test' );\ndefine( 'WP_REDIS_PASSWORD', '%s' );\n" \
+    "$old_redis_secret" > "$wp_config"
+chown www-data:www-data "$wp_config"
+chmod 0640 "$wp_config"
+site_wp_cli() {
+    local _domain="$1"
+    shift
+    case "$*" in
+        'config get DB_NAME') printf 'wp_test\n' ;;
+        'config set WP_REDIS_PASSWORD __WP_SHELL_REDIS_SECRET_PLACEHOLDER__ --quiet')
+            printf "<?php\ndefine( 'DB_NAME', 'wp_test' );\ndefine( 'WP_REDIS_PASSWORD', '__WP_SHELL_REDIS_SECRET_PLACEHOLDER__' );\n" > "$wp_config"
+            ;;
+        'cache flush') return 0 ;;
+        *) return 1 ;;
+    esac
+}
 redis-server /etc/redis/wp-shell.conf --supervised no --daemonize yes \
     --pidfile /tmp/wp-shell-test-redis.pid --logfile /tmp/wp-shell-test-redis.log
 [[ "$(REDISCLI_AUTH="$old_redis_secret" redis-cli --no-auth-warning ping)" == "PONG" ]]
@@ -50,6 +68,10 @@ rotate_redis_secret
 new_redis_secret="$(<"$REDIS_SECRET_FILE")"
 [[ "$new_redis_secret" != "$old_redis_secret" ]]
 [[ "$(REDISCLI_AUTH="$new_redis_secret" redis-cli --no-auth-warning ping)" == "PONG" ]]
+wp_config_content="$(<"$wp_config")"
+[[ "$wp_config_content" == *"$new_redis_secret"* ]]
+[[ "$wp_config_content" != *"$old_redis_secret"* ]]
+[[ "$wp_config_content" != *'__WP_SHELL_REDIS_SECRET_PLACEHOLDER__'* ]]
 [[ "$(<"$redis_log")" == 'Accidental credential output: [REDACTED]' ]]
 [[ "$(stat -c '%a' "$redis_log")" == "600" ]]
 REDISCLI_AUTH="$new_redis_secret" redis-cli --no-auth-warning shutdown nosave

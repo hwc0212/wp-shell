@@ -105,24 +105,32 @@ if headers_have_managed_hsts $'HTTP/2 200\nstrict-transport-security: max-age=0'
     exit 1
 fi
 
+wp_config="${SITE_PATHS[1]}/wp-config.php"
+redis_test_secret="$(printf 'a%.0s' {1..48})"
+redis_second_secret="$(printf 'b%.0s' {1..48})"
+printf "<?php\ndefine( 'WP_REDIS_PASSWORD', 'old-value' );\n" > "$wp_config"
+mock_wp_cli_failure="no"
 site_wp_cli() {
-    local _domain="$1" supplied
+    local _domain="$1"
     shift
-    supplied="$(cat)"
-    [[ " $* " == *" --quiet "* ]] || return 2
-    printf 'WP-CLI failure exposed %s\n' "$supplied" >&2
-    return 1
+    [[ "$*" == 'config set WP_REDIS_PASSWORD __WP_SHELL_REDIS_SECRET_PLACEHOLDER__ --quiet' ]] || return 2
+    [[ "$*" != *"$redis_test_secret"* && "$*" != *"$redis_second_secret"* ]] || return 3
+    printf "<?php\ndefine( 'WP_REDIS_PASSWORD', '__WP_SHELL_REDIS_SECRET_PLACEHOLDER__' );\n" > "$wp_config"
+    [[ "$mock_wp_cli_failure" != "yes" ]]
 }
-secret_status=0
-if secret_output="$(site_wp_cli_prompt_secret_quiet legacy.example.com redis-secret-value \
-    config set WP_REDIS_PASSWORD --prompt=value 2>&1)"; then
-    printf 'The failing WP-CLI secret test unexpectedly succeeded.\n' >&2
+site_wp_config_set_redis_secret legacy.example.com "$redis_test_secret"
+wp_config_content="$(<"$wp_config")"
+[[ "$wp_config_content" == *"$redis_test_secret"* ]]
+[[ "$wp_config_content" != *'__WP_SHELL_REDIS_SECRET_PLACEHOLDER__'* ]]
+[[ "$(stat -c '%a' "$wp_config")" == "640" ]]
+
+wp_config_before_failure="$wp_config_content"
+mock_wp_cli_failure="yes"
+if site_wp_config_set_redis_secret legacy.example.com "$redis_second_secret"; then
+    printf 'The failing atomic wp-config update unexpectedly succeeded.\n' >&2
     exit 1
-else
-    secret_status=$?
 fi
-[[ "$secret_status" -eq 1 ]]
-[[ "$secret_output" == *'[REDACTED: WP-CLI error output contained a secret]'* ]]
-[[ "$secret_output" != *'redis-secret-value'* ]]
+[[ "$(<"$wp_config")" == "$wp_config_before_failure" ]]
+[[ "$(stat -c '%a' "$wp_config")" == "640" ]]
 
 printf 'Site/environment configuration and legacy migration tests passed.\n'

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.4.3
+# Version 9.4.4
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.4.3"
+readonly WP_SHELL_VERSION="9.4.4"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -895,14 +895,12 @@ rotate_redis_secret() {
         domain="${SITE_DOMAINS[$i]}"
         wp_path="$(site_wp_path "$domain")"
         [[ -f "$wp_path/wp-config.php" ]] || continue
-        if ! site_wp_cli_prompt_secret_quiet "$domain" "$new_secret" \
-            config set WP_REDIS_PASSWORD --prompt=value; then
+        if ! site_wp_config_set_redis_secret "$domain" "$new_secret"; then
             for ((j = 1; j <= i; j++)); do
                 domain="${SITE_DOMAINS[$j]}"
                 wp_path="$(site_wp_path "$domain")"
                 [[ -f "$wp_path/wp-config.php" ]] || continue
-                site_wp_cli_prompt_secret_quiet "$domain" "$old_secret" \
-                    config set WP_REDIS_PASSWORD --prompt=value || true
+                site_wp_config_set_redis_secret "$domain" "$old_secret" || true
                 chmod 0640 "$wp_path/wp-config.php"
             done
             printf '%s' "$old_secret" | REDISCLI_AUTH="$new_secret" \
@@ -1266,7 +1264,19 @@ server {
         deny all;
     }
 
-    location ~* ^/(?:wp-config\.php|readme\.html|license\.txt)$ {
+    location ^~ /wp-admin/includes/ {
+        deny all;
+    }
+
+    location ~* ^/wp-includes/[^/]+\.php$ {
+        deny all;
+    }
+
+    location ~* ^/wp-includes/(?:js/tinymce/langs/.+\.php|theme-compat/) {
+        deny all;
+    }
+
+    location ~* ^/(?:wp-config(?:-sample)?\.php|wp-settings\.php|wp-load\.php|readme\.html|license\.txt)$ {
         deny all;
     }
 
@@ -1387,20 +1397,44 @@ site_wp_cli_prompt_secret() {
     return "$status"
 }
 
-site_wp_cli_prompt_secret_quiet() {
-    local domain="$1" secret="$2" output status=0
-    shift 2
-    if output="$(printf '%s\n' "$secret" | site_wp_cli "$domain" "$@" --quiet 2>&1)"; then
-        return 0
-    else
-        status=$?
+site_wp_config_set_redis_secret() {
+    local domain="$1" secret="$2" wp_path wp_config placeholder backup temp_file line original_mode
+    local replaced="no" duplicate="no"
+    [[ "$secret" =~ ^[a-f0-9]{48}$ ]] || return 1
+    wp_path="$(site_wp_path "$domain")"
+    wp_config="$wp_path/wp-config.php"
+    [[ -f "$wp_config" ]] || return 1
+    placeholder="__WP_SHELL_REDIS_SECRET_PLACEHOLDER__"
+    original_mode="$(stat -c '%a' "$wp_config")"
+    backup="$(mktemp "$wp_path/.wp-config.backup.XXXXXX")"
+    temp_file="$(mktemp "$wp_path/.wp-config.secret.XXXXXX")"
+    cp --preserve=all "$wp_config" "$backup"
+    chmod 0600 "$backup"
+
+    if ! site_wp_cli "$domain" config set WP_REDIS_PASSWORD "$placeholder" --quiet >/dev/null; then
+        cp --preserve=all "$backup" "$wp_config"
+        chmod "$original_mode" "$wp_config"
+        rm -f "$backup" "$temp_file"
+        return 1
     fi
-    if [[ -n "$secret" && "$output" == *"$secret"* ]]; then
-        printf '%s\n' '[REDACTED: WP-CLI error output contained a secret]' >&2
-    else
-        printf '%s\n' "$output" | redact_wp_cli_output >&2
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == *"$placeholder"* ]]; then
+            [[ "$replaced" == "no" ]] || duplicate="yes"
+            line="${line//"$placeholder"/"$secret"}"
+            replaced="yes"
+        fi
+        printf '%s\n' "$line"
+    done < "$wp_config" > "$temp_file"
+    if [[ "$replaced" != "yes" || "$duplicate" == "yes" ]]; then
+        cp --preserve=all "$backup" "$wp_config"
+        chmod "$original_mode" "$wp_config"
+        rm -f "$backup" "$temp_file"
+        return 1
     fi
-    return "$status"
+    chown --reference="$wp_config" "$temp_file"
+    chmod 0640 "$temp_file"
+    mv -f "$temp_file" "$wp_config"
+    rm -f "$backup"
 }
 
 site_credentials_file() {
@@ -1456,8 +1490,8 @@ install_wordpress_site() {
     site_wp_cli "$domain" config set WP_CACHE true --raw
     site_wp_cli "$domain" config set WP_REDIS_HOST 127.0.0.1
     site_wp_cli "$domain" config set WP_REDIS_PORT 6379 --raw
-    site_wp_cli_prompt_secret_quiet "$domain" "$redis_password" \
-        config set WP_REDIS_PASSWORD --prompt=value
+    site_wp_config_set_redis_secret "$domain" "$redis_password" || \
+        die "The Redis credential could not be written safely for $domain."
     site_wp_cli "$domain" config set WP_REDIS_DATABASE "${SITE_REDIS_DATABASES[$index]}" --raw
     site_wp_cli "$domain" config set WP_REDIS_PREFIX "${domain}:"
     memory_limit="256M"

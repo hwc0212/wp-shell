@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.4.3
+- 当前版本：`wp-shell.sh` v9.4.4
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -909,7 +909,7 @@ sudo wp-shell optimize
 /var/log/wp-shell/                        部署和管理日志
 ```
 
-配置和密码文件使用 root `0600` 权限。所有站点操作统一通过 `wp-shell` 执行，数据库密码和 Redis 密码通过受控标准输入或 `REDISCLI_AUTH` 传递，不作为命令行参数，也不在成功日志中回显。
+配置和密码文件使用 root `0600` 权限。所有站点操作统一通过 `wp-shell` 执行。数据库密码使用受控标准输入，Redis CLI 使用 `REDISCLI_AUTH`；写入 `wp-config.php` 时先让 WP-CLI 写入非敏感占位符，再由 root 在同一目录中完成原子替换。密码不作为外部进程命令行参数，也不在成功日志中回显。
 
 ## 十三、从旧版本升级
 
@@ -931,9 +931,11 @@ chmod +x wp-shell.sh
 sudo ./wp-shell.sh install
 ```
 
-### 2. 从 v9.4.2 升级后的必要安全操作
+### 2. 从 v9.4.2 或 v9.4.3 升级后的必要安全操作
 
-v9.4.2 在部署或修复网站时，WP-CLI 的成功信息可能把 Redis 密钥回显到 SSH 终端和对应的 `/var/log/wp-shell/` 日志。只要使用过该版本执行 `site add` 或 `site deploy`，就应把当前 Redis 密钥视为已经暴露。升级并安装 v9.4.3 后，先执行：
+v9.4.2 在部署或修复网站时，WP-CLI 的成功信息可能把 Redis 密钥回显到 SSH 终端和对应的 `/var/log/wp-shell/` 日志。只要使用过该版本执行 `site add` 或 `site deploy`，就应把当前 Redis 密钥视为已经暴露。
+
+v9.4.3 首次提供的轮换命令错误地尝试用 `--prompt=value` 填充 WP-CLI 必需的位置参数。真实 WP-CLI 会显示 `wp config set <name> <value>` 用法并拒绝执行；脚本随后会回滚 Redis 和已修改配置，因此不会留下半完成轮换，但旧密钥仍然有效、旧日志也仍需脱敏。升级并安装 v9.4.4 后，先执行：
 
 ```bash
 sudo wp-shell rotate-redis-secret
@@ -1032,6 +1034,7 @@ sudo wp-shell ...
 - 每个站点使用不同 Redis DB 和域名前缀。
 - 数据库和 Redis 密码不会出现在 `wp-shell` 命令行中。
 - Redis 密钥更新使用无成功输出的受控调用；可以用 `sudo wp-shell rotate-redis-secret` 完成在线轮换和本机日志脱敏。
+- Nginx 阻止通过 HTTP 直接访问 WordPress 上传目录 PHP、`wp-admin/includes`、include-only 核心 PHP、`wp-config.php` 和示例配置等敏感文件。
 - `wp-config.php` 使用 `0640` 权限。
 - WordPress 在线文件编辑默认关闭。
 - PHP-FPM status 使用本地 Unix socket，不通过 Nginx 暴露。
