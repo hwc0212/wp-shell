@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.4.1
+# Version 9.4.2
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.4.1"
+readonly WP_SHELL_VERSION="9.4.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -102,7 +102,8 @@ die() {
 
 on_error() {
     local exit_code=$?
-    log_message ERROR "Step '$CURRENT_STEP' failed with exit code $exit_code. Log: $LOG_FILE"
+    local function_name="${FUNCNAME[1]:-main}" line_number="${BASH_LINENO[0]:-unknown}"
+    log_message ERROR "Step '$CURRENT_STEP' failed in $function_name at line $line_number with exit code $exit_code. Log: $LOG_FILE"
     exit "$exit_code"
 }
 trap on_error ERR
@@ -1149,6 +1150,7 @@ server {
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:$pool_socket;
+        fastcgi_hide_header Strict-Transport-Security;
         fastcgi_cache $zone;
         fastcgi_cache_key "\$scheme\$request_method\$host\$request_uri";
         fastcgi_cache_methods GET HEAD;
@@ -1288,6 +1290,7 @@ set_site_permissions() {
 install_wordpress_site() {
     CURRENT_STEP="install WordPress"
     local index="$1" domain primary wp_path admin_password credentials_file redis_password memory_limit initial_mode
+    local wordpress_installed_now="no"
     domain="${SITE_DOMAINS[$index]}"
     primary="${SITE_PRIMARY_DOMAINS[$index]}"
     wp_path="${SITE_PATHS[$index]}"
@@ -1336,6 +1339,7 @@ install_wordpress_site() {
         chmod 0600 "$credentials_file"
         NEW_SITE_CREDENTIAL_DOMAIN="$domain"
         NEW_SITE_ADMIN_PASSWORD="$admin_password"
+        wordpress_installed_now="yes"
     fi
 
     if [[ "$initial_mode" == "managed" ]]; then
@@ -1346,7 +1350,7 @@ install_wordpress_site() {
     if [[ "${SITE_WOOCOMMERCE[$index]}" == "yes" ]]; then
         site_wp_cli "$domain" plugin install woocommerce --activate
     fi
-    if [[ "$initial_mode" == "managed" ]]; then
+    if [[ "$initial_mode" == "managed" && "$wordpress_installed_now" == "yes" ]]; then
         site_wp_cli "$domain" plugin delete hello akismet 2>/dev/null || true
     fi
     set_site_permissions "$domain"
@@ -1388,6 +1392,7 @@ deploy_site() {
         set_site_permissions "$domain"
     fi
     install_wordpress_site "$index"
+    clear_site_cache "$index"
     SITE_MODES[index]="managed"
     save_sites_config
     log_message SUCCESS "$domain deployment is complete."
@@ -1938,7 +1943,7 @@ collect_cpu_percent() {
 }
 
 network_bytes() {
-    awk -F'[: ]+' 'NR>2 && $2 != "lo" {rx+=$3; tx+=$11} END {printf "%d %d", rx, tx}' /proc/net/dev
+    awk -F'[: ]+' 'NR>2 && $2 != "lo" {rx+=$3; tx+=$11} END {printf "%d %d\n", rx, tx}' /proc/net/dev
 }
 
 collect_system_sample() {
@@ -2075,6 +2080,7 @@ collect_service_sample() {
 }
 
 collect_metrics() {
+    CURRENT_STEP="collect metrics"
     exec 8>"$STATE_DIR/collector.lock"
     flock -n 8 || return 0
     init_metrics_database
@@ -2087,6 +2093,36 @@ collect_metrics() {
         collect_site_sample "$ts" "$i"
     done
     sqlite3 "$METRICS_DB" "DELETE FROM system_samples WHERE ts < $((ts - 2592000)); DELETE FROM site_samples WHERE ts < $((ts - 2592000)); DELETE FROM service_samples WHERE ts < $((ts - 2592000)); PRAGMA wal_checkpoint(PASSIVE);"
+}
+
+show_metrics_status() {
+    local timer_state collector_state="idle" counts="0|0|0" system_samples=0 site_samples=0 service_samples=0
+    local last_sample="" sample_age=""
+    timer_state="$(systemctl is-active wp-shell-metrics.timer 2>/dev/null || printf 'inactive')"
+    if systemctl is-failed --quiet wp-shell-metrics.service 2>/dev/null; then
+        collector_state="failed"
+    elif systemctl is-active --quiet wp-shell-metrics.service 2>/dev/null; then
+        collector_state="running"
+    elif [[ "$timer_state" != "active" ]]; then
+        collector_state="inactive"
+    fi
+
+    if [[ -s "$METRICS_DB" ]]; then
+        counts="$(sqlite3 -separator '|' "$METRICS_DB" "SELECT (SELECT COUNT(*) FROM system_samples),(SELECT COUNT(*) FROM site_samples),(SELECT COUNT(*) FROM service_samples);" 2>/dev/null || printf '0|0|0')"
+        IFS='|' read -r system_samples site_samples service_samples <<< "$counts"
+        last_sample="$(sqlite3 "$METRICS_DB" "SELECT COALESCE(MAX(ts),'') FROM system_samples;" 2>/dev/null || true)"
+    fi
+
+    printf 'Timer: %s\n' "$timer_state"
+    printf 'Collector: %s\n' "$collector_state"
+    printf 'Samples: system=%s site=%s service=%s\n' "$system_samples" "$site_samples" "$service_samples"
+    if [[ "$last_sample" =~ ^[0-9]+$ ]]; then
+        sample_age=$(( $(date +%s) - last_sample ))
+        printf 'Last sample: %s (%ss ago)\n' "$(date --date="@$last_sample" '+%Y-%m-%d %H:%M:%S')" "$sample_age"
+    else
+        printf 'Last sample: none\n'
+    fi
+    printf 'Database: %s\n' "$METRICS_DB"
 }
 
 install_metrics_timer() {
@@ -2152,6 +2188,7 @@ dashboard() {
 import curses
 import datetime
 import sqlite3
+import subprocess
 import sys
 import time
 
@@ -2211,13 +2248,28 @@ def load_modes():
     return result
 
 
-def fetch_data():
+def collector_failed():
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-failed", "--quiet", "wp-shell-metrics.service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def fetch_data(modes):
     connection = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=2)
     connection.row_factory = sqlite3.Row
     now = int(time.time())
     system = connection.execute("SELECT * FROM system_samples ORDER BY ts DESC LIMIT 1").fetchone()
     service = connection.execute("SELECT * FROM service_samples ORDER BY ts DESC LIMIT 1").fetchone()
-    domains = [row[0] for row in connection.execute("SELECT DISTINCT domain FROM site_samples ORDER BY domain")]
+    sampled_domains = {row[0] for row in connection.execute("SELECT DISTINCT domain FROM site_samples")}
+    domains = sorted(set(modes) | sampled_domains)
     sites = []
     for domain in domains:
         latest = connection.execute(
@@ -2236,12 +2288,19 @@ def fetch_data():
                  FROM site_samples WHERE domain=? AND ts>=?""",
             (domain, now - 300),
         ).fetchone()
-        sites.append((dict(latest), dict(aggregate)))
+        if latest:
+            site = dict(latest)
+            site["_has_sample"] = True
+        else:
+            site = {"domain": domain, "_has_sample": False}
+        sites.append((site, dict(aggregate)))
     connection.close()
     return (dict(system) if system else {}, dict(service) if service else {}, sites)
 
 
 def alert_for(site, agg):
+    if not site.get("_has_sample", False):
+        return "NO DATA"
     alerts = []
     code = int(site.get("http_code", 0) or 0)
     if code < 200 or code >= 400:
@@ -2269,12 +2328,21 @@ def row_style(selected, bad=False):
     return 0
 
 
-def draw_header(stdscr, system, view, modes):
+def draw_header(stdscr, system, view, modes, failed):
     height, width = stdscr.getmaxyx()
     title = f" wp-shell {VIEWS[view]} "
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     age = int(time.time() - int(system.get("ts", 0) or 0)) if system else -1
-    right = f"sites {len(modes)} | sample {age}s | {stamp} " if age >= 0 else f"sites {len(modes)} | no sample | {stamp} "
+    if failed:
+        collector = "FAILED"
+    elif age < 0:
+        collector = "WAITING"
+    elif age > 180:
+        collector = "STALE"
+    else:
+        collector = "OK"
+    sample = f"sample {age}s" if age >= 0 else "no sample"
+    right = f"sites {len(modes)} | collector {collector} | {sample} | {stamp} "
     style = curses.color_pair(1) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE
     add(stdscr, 0, 0, (title + " " * width)[:width], style)
     add(stdscr, 0, max(len(title), width - len(right) - 1), right, style)
@@ -2320,6 +2388,16 @@ def fit_columns(columns, width):
 
 
 def values_for(view, site, agg, meta):
+    if not site.get("_has_sample", False):
+        if view == 0:
+            return [site["domain"], "-", "-", "-", "-", "-", "-", "NO DATA"]
+        if view == 1:
+            return [site["domain"], "-", "-", "-", "-", "-", "-", "-"]
+        if view == 2:
+            return [site["domain"], "-", "-", "-", "-", "-", "-", "-", "-"]
+        if view == 3:
+            return [site["domain"], "-", "-", "none", "-", meta.get("php", "-"), meta.get("mode", "-"), "NO DATA"]
+        return [site["domain"], "WARN", "NO DATA"]
     requests = int(agg.get("requests", 0) or 0)
     cache_total = int(agg.get("cache_hits", 0) or 0) + int(agg.get("cache_misses", 0) or 0)
     hit = f"{100*int(agg.get('cache_hits',0))/cache_total:.0f}%" if cache_total else "-"
@@ -2354,12 +2432,12 @@ def draw(stdscr, view, selected):
         return selected
     modes = load_modes()
     try:
-        system, service, sites = fetch_data()
+        system, service, sites = fetch_data(modes)
     except (sqlite3.Error, OSError) as error:
         add(stdscr, 0, 0, f"Metrics unavailable: {error}", curses.A_BOLD)
         stdscr.refresh()
         return selected
-    start_y = draw_header(stdscr, system, view, modes)
+    start_y = draw_header(stdscr, system, view, modes, collector_failed())
     columns = fit_columns(table_layout(width, view), width)
     header = " ".join(shorten(name, size).ljust(size) for name, size in columns)
     add(stdscr, start_y, 0, header, curses.A_BOLD | (curses.color_pair(2) if curses.has_colors() else 0))
@@ -2374,7 +2452,7 @@ def draw(stdscr, view, selected):
         bad = alert_for(site, agg) != "OK"
         add(stdscr, screen_row, 0, line, row_style(top + screen_row - start_y - 1 == selected, bad))
     if not sites:
-        add(stdscr, start_y + 2, 1, "No site samples yet. The collector runs once per minute.")
+        add(stdscr, start_y + 2, 1, "No registered sites.")
     service_text = ""
     if service:
         total = int(service.get("redis_hits", 0) or 0) + int(service.get("redis_misses", 0) or 0)
@@ -2619,7 +2697,7 @@ import_existing_sites() {
 }
 
 security_scan() {
-    local failed=0 i domain wp_config perms version
+    local failed=0 i domain primary wp_config perms version constant value credentials_file headers
     for service in nginx mariadb redis-server fail2ban; do
         if ! systemctl is-active --quiet "$service"; then
             log_message ERROR "$service is not running."
@@ -2641,9 +2719,36 @@ security_scan() {
         if [[ -f "$wp_config" ]]; then
             perms="$(stat -c '%a' "$wp_config")"
             [[ "$perms" == "640" || "$perms" == "600" ]] || { log_message WARNING "$wp_config has permissions $perms."; failed=$((failed + 1)); }
+            for constant in FORCE_SSL_ADMIN DISALLOW_FILE_EDIT WP_CACHE; do
+                value="$(site_wp_cli "$domain" config get "$constant" 2>/dev/null || true)"
+                [[ "$value" == "1" || "$value" == "true" ]] || {
+                    log_message WARNING "$domain does not have $constant enabled."
+                    failed=$((failed + 1))
+                }
+            done
+            if ! site_wp_cli "$domain" redis status 2>/dev/null | grep -Fq 'Status: Connected'; then
+                log_message WARNING "$domain is not connected to Redis Object Cache."
+                failed=$((failed + 1))
+            fi
         fi
         [[ -s "/etc/letsencrypt/live/$domain/fullchain.pem" ]] || { log_message ERROR "$domain has no certificate."; failed=$((failed + 1)); }
+        primary="${SITE_PRIMARY_DOMAINS[$i]}"
+        headers="$(curl --silent --show-error --output /dev/null --dump-header - --max-time 5 "https://$primary/wp-login.php" 2>/dev/null | tr -d '\r' || true)"
+        if ! grep -Eqi '^strict-transport-security:[[:space:]]*max-age=15552000([;[:space:]]|$)' <<< "$headers" || \
+           grep -Eqi '^strict-transport-security:[[:space:]]*max-age=0([;[:space:]]|$)' <<< "$headers"; then
+            log_message WARNING "$domain does not return the managed HSTS policy."
+            failed=$((failed + 1))
+        fi
+        credentials_file="$(site_credentials_file "$domain")"
+        if [[ -e "$credentials_file" && "$(stat -c '%a' "$credentials_file")" != "600" ]]; then
+            log_message WARNING "$credentials_file must have permissions 600."
+            failed=$((failed + 1))
+        fi
     done
+    if [[ "$ENVIRONMENT_UFW" == "yes" ]] && ! ufw status 2>/dev/null | grep -Fq 'Status: active'; then
+        log_message WARNING "UFW is configured for this environment but is not active."
+        failed=$((failed + 1))
+    fi
     if ((failed == 0)); then
         log_message SUCCESS "Security checks passed."
     else
@@ -3016,9 +3121,7 @@ execute_command() {
                 collect) collect_metrics ;;
                 install) install_self; install_metrics_timer ;;
                 status)
-                    printf 'Timer: %s\n' "$(systemctl is-active wp-shell-metrics.timer 2>/dev/null || printf 'inactive')"
-                    printf 'Database: %s\n' "$METRICS_DB"
-                    [[ -s "$METRICS_DB" ]] && sqlite3 "$METRICS_DB" "SELECT 'Last sample: '||datetime(MAX(ts),'unixepoch','localtime') FROM system_samples;"
+                    show_metrics_status
                     ;;
                 *) die "Usage: wp-shell metrics collect|install|status" ;;
             esac

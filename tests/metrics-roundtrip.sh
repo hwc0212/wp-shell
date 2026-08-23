@@ -26,6 +26,11 @@ SITE_TITLES[1]="Example"
 SITE_PATHS[1]="/var/www/example.com/public"
 save_sites_config
 init_metrics_database >/dev/null
+read -r rx_bytes tx_bytes < <(network_bytes)
+[[ "$rx_bytes" =~ ^[0-9]+$ && "$tx_bytes" =~ ^[0-9]+$ ]]
+system_ts="$(( $(date +%s) - 1 ))"
+collect_system_sample "$system_ts"
+[[ "$(sqlite3 "$METRICS_DB" 'SELECT COUNT(*) FROM system_samples;')" -eq 1 ]]
 ts="$(date +%s)"
 sqlite3 "$METRICS_DB" "INSERT INTO system_samples VALUES($ts,12.5,0.42,2048,1024,0,35,1000,2000);"
 sqlite3 "$METRICS_DB" "INSERT INTO site_samples VALUES($ts,'example.com',120,118,1,1,4096,45,120,80,20,20,2,3,0,5,0,160,200,80,12,512,8,4,1024);"
@@ -34,5 +39,12 @@ report="$(metrics_report 1h)"
 grep -q 'example.com' <<< "$report"
 grep -q '120' <<< "$report"
 grep -q '12.5%' <<< "$report"
+status_output="$(show_metrics_status)"
+grep -q 'Samples: system=2 site=1 service=1' <<< "$status_output"
+grep -q 'Last sample: ' <<< "$status_output"
+if grep -q 'Last sample: none' <<< "$status_output"; then
+    printf 'Metrics status did not report the latest sample.\n' >&2
+    exit 1
+fi
 
 printf 'Metrics database and report round-trip tests passed.\n'

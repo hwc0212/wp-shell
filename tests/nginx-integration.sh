@@ -45,4 +45,8 @@ configure_https_site 1
 configure_https_site 2
 
 nginx -t
+grep -Fq 'fastcgi_hide_header Strict-Transport-Security;' /etc/nginx/sites-available/example.com
+grep -Fq 'fastcgi_cache wp_example_com;' /etc/nginx/sites-available/example.com
+grep -Fq 'fastcgi_cache wp_single_example_com;' /etc/nginx/sites-available/single.example.com
+[[ "$(site_pool_socket example.com)" != "$(site_pool_socket single.example.com)" ]]
 printf 'Real Nginx configuration validation passed.\n'

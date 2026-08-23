@@ -38,6 +38,11 @@ load_sites_config
 [[ "${SITE_MODES[1]}" == "managed" ]]
 [[ "${SITE_TITLES[1]}" == "$dangerous_title" ]]
 [[ ! -e /tmp/wp-shell-must-not-execute ]]
+[[ "$(first_available_redis_database)" == "1" ]]
+[[ "$(site_pool_socket example.com)" != "$(site_pool_socket second.example.com)" ]]
+[[ "$(database_config_path example.com)" != "$(database_config_path second.example.com)" ]]
+[[ "$(site_cache_dir example.com)" != "$(site_cache_dir second.example.com)" ]]
+[[ "$(site_backup_dir example.com)" != "$(site_backup_dir second.example.com)" ]]
 
 rm -f "$SITES_CONFIG_FILE"
 reset_sites

@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.4.1
+- 当前版本：`wp-shell.sh` v9.4.2
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -224,10 +224,13 @@ https://example.com/
 sudo wp-shell --version
 sudo wp-shell site list
 sudo wp-shell site status
+sudo wp-shell security-scan
 sudo wp-shell metrics status
 systemctl status wp-shell-backup.timer
 systemctl status wp-shell-metrics.timer
 ```
+
+`security-scan` 不只检查服务是否启动，还会验证 Nginx 和 Fail2ban 配置、每站点 `wp-config.php` 权限、`FORCE_SSL_ADMIN`、`DISALLOW_FILE_EDIT`、`WP_CACHE`、Redis Object Cache 连接、对外 HSTS 响应、证书文件、root-only 凭据文件权限，以及环境选择启用 UFW 时的实际状态。
 
 新建 WordPress 网站成功后，脚本会在当前交互式 SSH 终端中一次性显示登录地址、管理员用户名和自动生成的管理员密码。密码直接写入终端设备，不经过普通标准输出，因此不会被写入 `/var/log/wp-shell/` 的部署日志。
 
@@ -364,6 +367,8 @@ sudo wp-shell dashboard
 ```
 
 看板会原地刷新，不会像 `tail -f` 一样不断向下滚动。列宽会根据 SSH 窗口宽度自动缩减，行数会根据终端高度自动限制。
+
+看板始终先从站点配置读取已登记域名，因此即使采集器尚未产生第一条样本，网站也会显示为 `NO DATA`，不会被误认为尚未添加。顶部同时显示 `collector OK`、`WAITING`、`STALE` 或 `FAILED`；出现 `FAILED` 时应运行 `sudo wp-shell metrics status` 查看采集器状态。
 
 建议终端至少为 `64x14`。如果窗口过小，看板会显示调整窗口的提示，而不是输出错位内容。
 
@@ -713,6 +718,8 @@ sudo wp-shell metrics status
 systemctl status wp-shell-metrics.timer
 ```
 
+状态命令会同时显示 timer、collector、系统/站点/共享服务样本数量、最后采样时间和数据库位置。timer 为 `active` 只代表定时器正在调度；collector 为 `failed` 或最后采样时间持续超过三分钟，才表示实际采集异常。
+
 ### 2. 手动采集一次
 
 ```bash
@@ -1056,6 +1063,8 @@ journalctl -u wp-shell-metrics.service -n 100 --no-pager
 ```
 
 首次安装后可能需要等待一分钟，才会出现第一批自动采集数据。
+
+如果看板顶部已经显示站点数量，但站点行显示 `NO DATA`，说明网站已登记而采集器还没有成功写入样本。重点检查 `Collector`、`Samples` 和 `Last sample`，无需重新添加网站。
 
 ### 6. 证书申请失败
 

@@ -33,10 +33,6 @@ SITE_TITLES[1]="Example"
 SITE_PATHS[1]="/var/www/example.com/public"
 save_sites_config
 init_metrics_database >/dev/null
-ts="$(date +%s)"
-sqlite3 "$METRICS_DB" "INSERT INTO system_samples VALUES($ts,12.5,0.42,2048,1024,0,35,1000,2000);"
-sqlite3 "$METRICS_DB" "INSERT INTO site_samples VALUES($ts,'example.com',120,118,1,1,4096,45,120,80,20,20,2,3,0,5,0,160,200,80,12,512,8,4,1024);"
-sqlite3 "$METRICS_DB" "INSERT INTO service_samples VALUES($ts,4,1000,1,32,900,100,0);"
 
 python3 - "$0" <<'PY'
 import fcntl
@@ -78,5 +74,8 @@ else:
 
 if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
     raise SystemExit("dashboard child failed")
+screen = captured.decode(errors="replace")
+if "example.com" not in screen or "NO DATA" not in screen:
+    raise SystemExit("dashboard did not show the registered site without samples: " + screen[-1000:])
 PY
 printf 'Dashboard interactive smoke test passed.\n'
