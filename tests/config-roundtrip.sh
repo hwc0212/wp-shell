@@ -86,4 +86,12 @@ grep -Fq 'arg=HOME=/var/www/legacy.example.com' <<< "$wp_cli_context"
 grep -Fq 'arg=WP_CLI_CACHE_DIR=/var/www/legacy.example.com/.wp-cli/cache' <<< "$wp_cli_context"
 grep -Fq "arg=--path=${SITE_PATHS[1]}" <<< "$wp_cli_context"
 
+secret_output="$(printf "wp config create --dbpass='database-secret' --admin_password='admin-secret'\n" | redact_wp_cli_output)"
+grep -Fq -- "--dbpass='[REDACTED]'" <<< "$secret_output"
+grep -Fq -- "--admin_password='[REDACTED]'" <<< "$secret_output"
+if grep -Eq 'database-secret|admin-secret' <<< "$secret_output"; then
+    printf 'A prompted WP-CLI secret was not redacted.\n' >&2
+    exit 1
+fi
+
 printf 'Site/environment configuration and legacy migration tests passed.\n'

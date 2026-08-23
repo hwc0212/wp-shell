@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.3.1
+# Version 9.4.0
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.3.1"
+readonly WP_SHELL_VERSION="9.4.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -1239,6 +1239,26 @@ site_wp_cli() {
     )
 }
 
+redact_wp_cli_output() {
+    sed -E "s/(--(dbpass|admin_password)=)'[^']*'/\1'[REDACTED]'/g"
+}
+
+site_wp_cli_prompt_secret() {
+    local domain="$1" secret="$2" output status=0
+    shift 2
+    if output="$(printf '%s\n' "$secret" | site_wp_cli "$domain" "$@" 2>&1)"; then
+        status=0
+    else
+        status=$?
+    fi
+    printf '%s\n' "$output" | redact_wp_cli_output
+    return "$status"
+}
+
+site_credentials_file() {
+    printf '/root/wordpress-credentials-%s.txt' "$1"
+}
+
 set_site_permissions() {
     local domain="$1" wp_path site_root
     wp_path="$(site_wp_path "$domain")"
@@ -1277,7 +1297,7 @@ install_wordpress_site() {
     fi
     if [[ ! -f "$wp_path/wp-config.php" ]]; then
         load_database_config "$domain"
-        printf '%s\n' "$DB_PASSWORD" | site_wp_cli "$domain" config create \
+        site_wp_cli_prompt_secret "$domain" "$DB_PASSWORD" config create \
             --dbname="$DB_NAME" --dbuser="$DB_USER" \
             --dbhost=localhost --dbprefix=wp_ --dbcharset=utf8mb4 --prompt=dbpass
     fi
@@ -1296,12 +1316,12 @@ install_wordpress_site() {
 
     if ! site_wp_cli "$domain" core is-installed >/dev/null 2>&1; then
         admin_password="$(generate_password)"
-        printf '%s\n' "$admin_password" | site_wp_cli "$domain" core install \
+        site_wp_cli_prompt_secret "$domain" "$admin_password" core install \
             --url="https://$primary" \
             --title="${SITE_TITLES[$index]}" \
             --admin_user="${SITE_ADMIN_USERS[$index]}" \
             --admin_email="${SITE_ADMIN_EMAILS[$index]}" --skip-email --prompt=admin_password
-        credentials_file="/root/wordpress-credentials-$domain.txt"
+        credentials_file="$(site_credentials_file "$domain")"
         {
             printf 'WordPress site credentials\n'
             printf 'Generated: %s\n' "$(date --iso-8601=seconds)"
@@ -1589,6 +1609,59 @@ site_status() {
     printf '  PHP-FPM: %s\n' "$(systemctl is-active "php${php_version}-fpm" 2>/dev/null || true)"
     printf '  MariaDB: %s\n' "$(systemctl is-active mariadb 2>/dev/null || true)"
     printf '  Redis: %s\n' "$(systemctl is-active redis-server 2>/dev/null || true)"
+}
+
+site_tls_expiry() {
+    local domain="$1" certificate end_date
+    certificate="/etc/letsencrypt/live/$domain/fullchain.pem"
+    [[ -s "$certificate" ]] || { printf 'missing'; return; }
+    end_date="$(openssl x509 -in "$certificate" -noout -enddate 2>/dev/null | cut -d= -f2- || true)"
+    [[ -n "$end_date" ]] || { printf 'unknown'; return; }
+    date --utc --date="$end_date" +%F 2>/dev/null || printf 'unknown'
+}
+
+show_site_deployment_summary() {
+    local index="$1" domain primary aliases wordpress_version woo_state credentials_file credentials_state
+    domain="${SITE_DOMAINS[$index]}"
+    primary="${SITE_PRIMARY_DOMAINS[$index]}"
+    aliases="none"
+    [[ "${SITE_WWW[$index]}" == "yes" ]] && aliases="www.$domain"
+    wordpress_version="$(site_wp_cli "$domain" core version 2>/dev/null || printf 'unknown')"
+    if site_wp_cli "$domain" plugin is-active woocommerce >/dev/null 2>&1; then
+        woo_state="active"
+    else
+        woo_state="not installed"
+    fi
+    credentials_file="$(site_credentials_file "$domain")"
+    if [[ -f "$credentials_file" ]]; then
+        credentials_state="$credentials_file (root-only)"
+    else
+        credentials_state="existing WordPress credentials"
+    fi
+
+    printf '\nWebsite deployment complete\n'
+    printf '%s\n' '==========================='
+    printf 'Website        https://%s/\n' "$primary"
+    printf 'Admin          https://%s/wp-admin/\n' "$primary"
+    printf 'Domain         %s\n' "$domain"
+    printf 'Aliases        %s\n' "$aliases"
+    printf 'Administrator  %s <%s>\n' "${SITE_ADMIN_USERS[$index]}" "${SITE_ADMIN_EMAILS[$index]}"
+    printf 'WordPress      %s (%s)\n' "$wordpress_version" "$WORDPRESS_LOCALE"
+    printf 'PHP            %s\n' "${SITE_PHP_VERSIONS[$index]}"
+    printf 'WooCommerce    %s\n' "$woo_state"
+    printf 'Redis cache    enabled (DB %s)\n' "${SITE_REDIS_DATABASES[$index]}"
+    printf 'TLS expires    %s\n' "$(site_tls_expiry "$domain")"
+    printf 'Document root  %s\n' "${SITE_PATHS[$index]}"
+    printf 'Credentials    %s\n' "$credentials_state"
+    printf 'Health         %s | nginx:%s | php:%s\n' \
+        "$(site_http_status "$primary")" "$(service_state nginx)" \
+        "$(service_state "php${SITE_PHP_VERSIONS[$index]}-fpm")"
+    printf '\nNext steps:\n'
+    if [[ -f "$credentials_file" ]]; then
+        printf -- '- Read credentials: sudo cat %s\n' "$credentials_file"
+        printf -- '- Save the password securely, then remove the credentials file.\n'
+    fi
+    printf -- '- Monitor the website: sudo wp-shell dashboard\n\n'
 }
 
 create_mysql_defaults_file() {
@@ -2553,6 +2626,7 @@ add_site_command() {
     install_self
     install_metrics_timer
     collect_metrics
+    show_site_deployment_summary "$index"
 }
 
 new_server_wizard() {
@@ -2845,6 +2919,7 @@ deploy_domain() {
     deploy_site "$index"
     install_self
     install_metrics_timer
+    show_site_deployment_summary "$index"
 }
 
 site_command() {

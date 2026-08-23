@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.3.1
+- 当前版本：`wp-shell.sh` v9.4.0
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -468,6 +468,16 @@ sudo wp-shell site add
 站点 PHP 版本由 `/etc/wp-shell/environment.v1` 决定，添加网站时不会单独询问。如果环境模式是 `single`，已有一个网站后脚本会拒绝添加第二个；如果是 `multi`，脚本会根据整机内存策略检查允许的网站数量。
 
 信息确认后，命令会重新计算整机资源预算，创建 PHP-FPM pool、数据库、证书、Nginx 配置和 WordPress。
+
+部署成功后会显示适合 SSH 单屏查看的网站摘要，包括：
+
+- 网站地址和 WordPress 后台地址。
+- 基础域名、`www` 别名和管理员用户名/邮箱。
+- WordPress/PHP 版本、WooCommerce 和 Redis Object Cache 状态。
+- TLS 到期日期、文档根目录、HTTP/Nginx/PHP 健康状态。
+- root-only 管理员凭据文件位置和终端看板命令。
+
+摘要不会直接打印管理员密码。数据库密码和管理员密码通过 stdin 传给 WP-CLI，终端及 `/var/log/wp-shell/` 日志中的 WP-CLI 重建命令会显示 `[REDACTED]`。首次登录后应把管理员密码保存到密码管理器，并删除对应的 `/root/wordpress-credentials-DOMAIN.txt`。
 
 添加完成后检查：
 

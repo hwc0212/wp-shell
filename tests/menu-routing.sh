@@ -30,6 +30,40 @@ grep -q 'Private IPv4   10.0.0.10 (do not use for public DNS)' <<< "$output"
 grep -q 'Root domain: A -> 203.0.113.10' <<< "$output"
 grep -q "sudo wp-shell -> 'Add a new website'" <<< "$output"
 
+SITE_COUNT=1
+SITE_DOMAINS[1]="example.com"
+SITE_PRIMARY_DOMAINS[1]="example.com"
+SITE_PHP_VERSIONS[1]="8.4"
+SITE_WOOCOMMERCE[1]="yes"
+SITE_WWW[1]="yes"
+SITE_REDIS_DATABASES[1]="0"
+SITE_ADMIN_USERS[1]="wpadmin"
+SITE_ADMIN_EMAILS[1]="admin@example.com"
+SITE_PATHS[1]="/var/www/example.com/public"
+site_wp_cli() {
+    if [[ "$*" == *"plugin is-active woocommerce"* ]]; then
+        return 0
+    fi
+    printf '7.1'
+}
+site_http_status() { printf 'healthy (HTTP 200)'; }
+site_tls_expiry() { printf '2026-11-21'; }
+site_credentials_file() { printf '%s/site-credentials.txt' "$test_root"; }
+printf 'root-only secret\n' > "$test_root/site-credentials.txt"
+output="$(show_site_deployment_summary 1)"
+grep -q 'Website deployment complete' <<< "$output"
+grep -q 'Website        https://example.com/' <<< "$output"
+grep -q 'Admin          https://example.com/wp-admin/' <<< "$output"
+grep -q 'WooCommerce    active' <<< "$output"
+grep -q 'Redis cache    enabled (DB 0)' <<< "$output"
+grep -q 'TLS expires    2026-11-21' <<< "$output"
+grep -q 'Credentials.*site-credentials.txt (root-only)' <<< "$output"
+grep -q 'Health         healthy (HTTP 200) | nginx:active | php:active' <<< "$output"
+if grep -q 'root-only secret' <<< "$output"; then
+    printf 'The website summary exposed credential contents.\n' >&2
+    exit 1
+fi
+
 bootstrap_server() { printf 'ENVIRONMENT_BOOTSTRAP_CALLED\n'; }
 output="$(new_server_wizard <<< $'1\n2\nn')"
 grep -q 'Deployment mode:' <<< "$output"
