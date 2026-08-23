@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.4.0
+- 当前版本：`wp-shell.sh` v9.4.1
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -229,7 +229,9 @@ systemctl status wp-shell-backup.timer
 systemctl status wp-shell-metrics.timer
 ```
 
-首次生成的 WordPress 管理员密码保存在：
+新建 WordPress 网站成功后，脚本会在当前交互式 SSH 终端中一次性显示登录地址、管理员用户名和自动生成的管理员密码。密码直接写入终端设备，不经过普通标准输出，因此不会被写入 `/var/log/wp-shell/` 的部署日志。
+
+脚本还会把首次生成的 WordPress 管理员密码保存在仅 root 可读的文件中，防止终端关闭后无法找回：
 
 ```text
 /root/wordpress-credentials-DOMAIN.txt
@@ -242,6 +244,8 @@ sudo cat /root/wordpress-credentials-example.com.txt
 ```
 
 首次登录后，建议把密码保存到密码管理器，然后删除服务器上的明文凭据文件。
+
+一次性密码区块只在真正创建 WordPress 管理员账号的那次交互式部署中显示。以后运行 `site DOMAIN summary`、修复已有网站或打开菜单，都不会再次把密码打印到终端。通过管道、定时任务或其他无交互终端方式部署时也不会显示密码，应使用上面的 `sudo cat` 命令读取 root-only 凭据文件。
 
 ### 6. WordPress 语言
 
@@ -477,7 +481,7 @@ sudo wp-shell site add
 - TLS 到期日期、文档根目录、HTTP/Nginx/PHP 健康状态。
 - root-only 管理员凭据文件位置和终端看板命令。
 
-摘要不会直接打印管理员密码。数据库密码和管理员密码通过 stdin 传给 WP-CLI，终端及 `/var/log/wp-shell/` 日志中的 WP-CLI 重建命令会显示 `[REDACTED]`。首次登录后应把管理员密码保存到密码管理器，并删除对应的 `/root/wordpress-credentials-DOMAIN.txt`。
+常规摘要不会打印管理员密码；紧随首次成功部署摘要之后，脚本会在交互式 SSH 终端显示一次独立的凭据区块。该区块直接写入 `/dev/tty`，绕过普通标准输出和 `/var/log/wp-shell/` 日志。数据库密码和管理员密码通过 stdin 传给 WP-CLI，WP-CLI 重建命令中的密码会显示为 `[REDACTED]`。脚本仍会保留 `/root/wordpress-credentials-DOMAIN.txt` 作为仅 root 可读的恢复副本；首次登录后应把密码保存到密码管理器并删除该文件。
 
 以后只重新显示同一份摘要，不重新部署网站：
 

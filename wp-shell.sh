@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.4.0
+# Version 9.4.1
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.4.0"
+readonly WP_SHELL_VERSION="9.4.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -31,6 +31,7 @@ readonly MANAGED_SCRIPT="/usr/local/sbin/wp-shell"
 readonly WP_CLI_VERSION="${WP_CLI_VERSION:-2.12.0}"
 readonly WORDPRESS_LOCALE="${WORDPRESS_LOCALE:-en_US}"
 readonly BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
+readonly TERMINAL_DEVICE="${WP_SHELL_TERMINAL_DEVICE:-/dev/tty}"
 
 readonly RED=$'\033[0;31m'
 readonly GREEN=$'\033[0;32m'
@@ -63,6 +64,8 @@ MARIADB_MAX_CONNECTIONS=50
 MARIADB_TMP_TABLE_MB=32
 REDIS_MAX_MEMORY_MB=64
 PHP_TOTAL_BUDGET_MB=256
+NEW_SITE_CREDENTIAL_DOMAIN=""
+NEW_SITE_ADMIN_PASSWORD=""
 
 supports_color() {
     [[ -t 1 && "${NO_COLOR:-}" == "" ]]
@@ -1331,6 +1334,8 @@ install_wordpress_site() {
             printf 'Administrator email: %s\n' "${SITE_ADMIN_EMAILS[$index]}"
         } > "$credentials_file"
         chmod 0600 "$credentials_file"
+        NEW_SITE_CREDENTIAL_DOMAIN="$domain"
+        NEW_SITE_ADMIN_PASSWORD="$admin_password"
     fi
 
     if [[ "$initial_mode" == "managed" ]]; then
@@ -1620,6 +1625,35 @@ site_tls_expiry() {
     date --utc --date="$end_date" +%F 2>/dev/null || printf 'unknown'
 }
 
+show_new_site_credentials_once() {
+    local index="$1" domain credentials_file
+    domain="${SITE_DOMAINS[$index]}"
+    [[ "$NEW_SITE_CREDENTIAL_DOMAIN" == "$domain" && -n "$NEW_SITE_ADMIN_PASSWORD" ]] || return 0
+    credentials_file="$(site_credentials_file "$domain")"
+
+    if [[ "$TERMINAL_DEVICE" != "/dev/tty" || -t 0 ]]; then
+        if {
+            printf '\nNew WordPress administrator credentials (shown once)\n'
+            printf '%s\n' '===================================================='
+            printf 'Login URL      https://%s/wp-admin/\n' "${SITE_PRIMARY_DOMAINS[$index]}"
+            printf 'Administrator  %s\n' "${SITE_ADMIN_USERS[$index]}"
+            printf 'Password       %s\n' "$NEW_SITE_ADMIN_PASSWORD"
+            printf 'Credentials    %s\n' "$credentials_file"
+            printf '\nThis password was written directly to the terminal and not to wp-shell logs.\n'
+            printf 'Save it securely, then remove the credentials file.\n\n'
+        } > "$TERMINAL_DEVICE"; then
+            :
+        else
+            log_message WARNING "Could not display the generated password on the terminal. Read it with: sudo cat $credentials_file"
+        fi
+    else
+        log_message WARNING "No interactive terminal is available. Read the generated password with: sudo cat $credentials_file"
+    fi
+
+    NEW_SITE_ADMIN_PASSWORD=""
+    NEW_SITE_CREDENTIAL_DOMAIN=""
+}
+
 show_site_deployment_summary() {
     local index="$1" domain primary aliases wordpress_version woo_state credentials_file credentials_state
     domain="${SITE_DOMAINS[$index]}"
@@ -1662,6 +1696,7 @@ show_site_deployment_summary() {
         printf -- '- Save the password securely, then remove the credentials file.\n'
     fi
     printf -- '- Monitor the website: sudo wp-shell dashboard\n\n'
+    show_new_site_credentials_once "$index"
 }
 
 create_mysql_defaults_file() {

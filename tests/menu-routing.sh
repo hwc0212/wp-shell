@@ -9,6 +9,7 @@ test_root="$(mktemp -d)"
 trap 'rm -rf -- "$test_root"' EXIT
 export WP_SHELL_CONFIG_DIR="$test_root/config"
 export WP_SHELL_STATE_DIR="$test_root/state"
+export WP_SHELL_TERMINAL_DEVICE="$test_root/terminal-output"
 source "$repo_root/wp-shell.sh"
 install -d -m 0700 "$CONFIG_DIR"
 
@@ -66,6 +67,20 @@ fi
 output="$(site_action example.com summary)"
 grep -q 'Website deployment complete' <<< "$output"
 grep -q 'TLS expires    2026-11-21' <<< "$output"
+
+: > "$WP_SHELL_TERMINAL_DEVICE"
+NEW_SITE_CREDENTIAL_DOMAIN="example.com"
+NEW_SITE_ADMIN_PASSWORD="one-time-test-password"
+normal_output="$test_root/normal-output"
+show_new_site_credentials_once 1 > "$normal_output"
+[[ ! -s "$normal_output" ]]
+grep -q 'New WordPress administrator credentials (shown once)' "$WP_SHELL_TERMINAL_DEVICE"
+grep -q 'Password       one-time-test-password' "$WP_SHELL_TERMINAL_DEVICE"
+grep -q 'not to wp-shell logs' "$WP_SHELL_TERMINAL_DEVICE"
+[[ -z "$NEW_SITE_CREDENTIAL_DOMAIN" ]]
+[[ -z "$NEW_SITE_ADMIN_PASSWORD" ]]
+show_new_site_credentials_once 1
+[[ "$(grep -c 'one-time-test-password' "$WP_SHELL_TERMINAL_DEVICE")" -eq 1 ]]
 
 bootstrap_server() { printf 'ENVIRONMENT_BOOTSTRAP_CALLED\n'; }
 output="$(new_server_wizard <<< $'1\n2\nn')"
