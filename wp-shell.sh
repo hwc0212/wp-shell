@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.2.2
+# Version 9.3.0
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.2.2"
+readonly WP_SHELL_VERSION="9.3.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -1409,6 +1409,113 @@ prepare_stack() {
     install_self
 }
 
+validate_ipv4() {
+    local address="$1" octet
+    local -a octets=()
+    [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r -a octets <<< "$address"
+    for octet in "${octets[@]}"; do
+        ((10#$octet <= 255)) || return 1
+    done
+}
+
+public_ipv4_candidate() {
+    local address="$1" first second _rest
+    validate_ipv4 "$address" || return 1
+    IFS='.' read -r first second _rest <<< "$address"
+    ((10#$first > 0 && 10#$first < 224)) || return 1
+    case "$first" in
+        10|127) return 1 ;;
+        100) ((10#$second < 64 || 10#$second > 127)) || return 1 ;;
+        169) ((10#$second != 254)) || return 1 ;;
+        172) ((10#$second < 16 || 10#$second > 31)) || return 1 ;;
+        192) ((10#$second != 168)) || return 1 ;;
+    esac
+}
+
+detect_private_ipv4() {
+    local address
+    address="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')"
+    validate_ipv4 "$address" && printf '%s' "$address"
+}
+
+detect_public_ipv4() {
+    local address token
+    if [[ -n "${WP_SHELL_PUBLIC_IPV4:-}" ]]; then
+        public_ipv4_candidate "$WP_SHELL_PUBLIC_IPV4" || return 1
+        printf '%s' "$WP_SHELL_PUBLIC_IPV4"
+        return
+    fi
+
+    token="$(curl --silent --fail --connect-timeout 1 --max-time 2 \
+        --request PUT --header 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+        http://169.254.169.254/latest/api/token 2>/dev/null || true)"
+    if [[ -n "$token" ]]; then
+        address="$(curl --silent --fail --connect-timeout 1 --max-time 2 \
+            --header "X-aws-ec2-metadata-token: $token" \
+            http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)"
+        if public_ipv4_candidate "$address"; then
+            printf '%s' "$address"
+            return
+        fi
+    fi
+
+    while IFS= read -r address; do
+        if public_ipv4_candidate "$address"; then
+            printf '%s' "$address"
+            return
+        fi
+    done < <(ip -4 -o address show scope global 2>/dev/null | awk '{split($4, value, "/"); print value[1]}')
+    return 1
+}
+
+environment_firewall_state() {
+    if [[ "$ENVIRONMENT_UFW" != "yes" ]]; then
+        printf 'skipped by user'
+        return
+    fi
+    ufw status 2>/dev/null | awk 'NR == 1 {print tolower($2)}'
+}
+
+show_environment_summary() {
+    local public_ip private_ip max_sites firewall_state
+    public_ip="$(detect_public_ipv4 || true)"
+    private_ip="$(detect_private_ipv4 || true)"
+    max_sites="$(max_sites_for_memory "$(memory_mb)")"
+    [[ "$ENVIRONMENT_MODE" == "single" ]] && max_sites=1
+    firewall_state="$(environment_firewall_state)"
+    [[ -n "$firewall_state" ]] || firewall_state="unknown"
+
+    printf '\nEnvironment installation complete\n'
+    printf '%s\n' '================================='
+    printf 'wp-shell       %s\n' "$WP_SHELL_VERSION"
+    printf 'Mode           %s\n' "$ENVIRONMENT_MODE"
+    printf 'PHP            %s\n' "$DEFAULT_PHP_VERSION"
+    printf 'Public IPv4    %s\n' "${public_ip:-not detected - check the VPS provider console}"
+    if [[ -n "$private_ip" && "$private_ip" != "$public_ip" ]]; then
+        printf 'Private IPv4   %s (do not use for public DNS)\n' "$private_ip"
+    fi
+    printf 'Firewall       %s\n' "$firewall_state"
+    printf 'Site capacity  %s/%s\n' "$SITE_COUNT" "$max_sites"
+    printf 'Services       nginx:%s php:%s mariadb:%s redis:%s fail2ban:%s\n' \
+        "$(service_state nginx)" "$(service_state "php${DEFAULT_PHP_VERSION}-fpm")" \
+        "$(service_state mariadb)" "$(service_state redis-server)" "$(service_state fail2ban)"
+    printf 'Automation     backups:%s metrics:%s\n' \
+        "$(service_state wp-shell-backup.timer)" "$(service_state wp-shell-metrics.timer)"
+
+    printf '\nDNS required before adding a WordPress website:\n'
+    if [[ -n "$public_ip" ]]; then
+        printf -- '- Root domain: A -> %s\n' "$public_ip"
+    else
+        printf -- '- Find or assign the public IPv4 in the VPS provider console.\n'
+        printf -- '- Root domain: A -> that public IPv4\n'
+    fi
+    printf -- '- www: CNAME -> root domain (or A -> the same public IPv4)\n'
+    printf -- '- Provider firewall/security group: allow TCP 80 and 443\n'
+    printf -- "- After DNS resolves: sudo wp-shell -> 'Add a new website'\n"
+    printf 'Verify the public IPv4 in the VPS provider console before changing DNS.\n\n'
+}
+
 bootstrap_server() {
     prepare_stack
     if [[ "$ENVIRONMENT_UFW" == "yes" ]]; then
@@ -1420,6 +1527,7 @@ bootstrap_server() {
     install_backup_timer
     install_metrics_timer
     collect_metrics
+    show_environment_summary
 }
 
 site_wp_path() {
@@ -2442,8 +2550,6 @@ new_server_wizard() {
     fi
     save_environment_config
     bootstrap_server
-    log_message SUCCESS "The WordPress environment is ready in $ENVIRONMENT_MODE mode with PHP $DEFAULT_PHP_VERSION."
-    log_message INFO "Run 'sudo wp-shell' and choose 'Add a new website' to create the first site."
 }
 
 nginx_installed() {

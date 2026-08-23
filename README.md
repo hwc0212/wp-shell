@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.2.2
+- 当前版本：`wp-shell.sh` v9.3.0
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -138,6 +138,25 @@ sudo ./wp-shell.sh install
 UFW 选项只处理服务器防火墙。选择启用时，脚本会保留当前 SSH 端口，开放 SSH、HTTP 和 HTTPS，不执行 `ufw reset`；如果云厂商还提供安全组或云防火墙，仍需在云平台开放相同端口。
 
 完成三项选择后，环境设置写入 `/etc/wp-shell/environment.v1`。即使当前还没有网站，再次运行 `sudo wp-shell` 也会进入完整管理菜单。
+
+安装结束时会显示一屏环境摘要，包括：
+
+- wp-shell 版本、单网站或多网站模式、PHP 版本。
+- 检测到的公网 IPv4 和私网 IPv4。
+- UFW 状态、当前网站数和安全容量上限。
+- Nginx、PHP-FPM、MariaDB、Redis、Fail2ban 状态。
+- 自动备份和指标采集 timer 状态。
+
+脚本会优先通过 AWS EC2 本地元数据和网卡地址检测公网 IPv4，不使用第三方公网 IP 查询服务。如果无法可靠检测，会显示 `not detected`，此时应到 VPS 云厂商控制台查找或分配公网 IPv4。不要把 `10.x.x.x`、`172.16-31.x.x` 或 `192.168.x.x` 私网地址用于公网 DNS。
+
+添加 WordPress 网站前，必须先在域名 DNS 服务商完成：
+
+1. 把根域名的 `A` 记录指向这台服务器的公网 IPv4。
+2. 如果需要 `www`，将 `www` 设置为指向根域名的 `CNAME`，或设置为同一公网 IPv4 的 `A` 记录。
+3. 在云厂商安全组或云防火墙中确认 TCP 80、443 已开放。
+4. 等待 DNS 生效后，再运行 `sudo wp-shell` 并选择 `Add a new website`。
+
+摘要中显示的公网地址也应与云厂商控制台核对后再修改 DNS，尤其是使用 NAT、负载均衡器或浮动 IP 的服务器。
 
 ### 3. 安装过程会执行什么
 

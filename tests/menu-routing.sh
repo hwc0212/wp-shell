@@ -12,6 +12,24 @@ export WP_SHELL_STATE_DIR="$test_root/state"
 source "$repo_root/wp-shell.sh"
 install -d -m 0700 "$CONFIG_DIR"
 
+detect_public_ipv4() { printf '203.0.113.10'; }
+detect_private_ipv4() { printf '10.0.0.10'; }
+memory_mb() { printf '4096'; }
+service_state() { printf 'active'; }
+ufw() { printf 'Status: active\n'; }
+ENVIRONMENT_MODE="multi"
+DEFAULT_PHP_VERSION="8.4"
+ENVIRONMENT_UFW="yes"
+SITE_COUNT=0
+output="$(show_environment_summary)"
+grep -q 'Environment installation complete' <<< "$output"
+grep -q 'Mode           multi' <<< "$output"
+grep -q 'PHP            8.4' <<< "$output"
+grep -q 'Public IPv4    203.0.113.10' <<< "$output"
+grep -q 'Private IPv4   10.0.0.10 (do not use for public DNS)' <<< "$output"
+grep -q 'Root domain: A -> 203.0.113.10' <<< "$output"
+grep -q "sudo wp-shell -> 'Add a new website'" <<< "$output"
+
 bootstrap_server() { printf 'ENVIRONMENT_BOOTSTRAP_CALLED\n'; }
 output="$(new_server_wizard <<< $'1\n2\nn')"
 grep -q 'Deployment mode:' <<< "$output"

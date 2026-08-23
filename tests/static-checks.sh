@@ -25,7 +25,7 @@ if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.s
 fi
 
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
-grep -Fq 'readonly WP_SHELL_VERSION="9.2.2"' "$repo_root/wp-shell.sh"
+grep -Fq 'readonly WP_SHELL_VERSION="9.3.0"' "$repo_root/wp-shell.sh"
 if grep -q '^readonly VERSION=' "$repo_root/wp-shell.sh"; then
     printf 'The generic VERSION variable conflicts with /etc/os-release.\n' >&2
     exit 1
