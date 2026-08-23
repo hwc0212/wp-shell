@@ -479,6 +479,12 @@ sudo wp-shell site add
 
 摘要不会直接打印管理员密码。数据库密码和管理员密码通过 stdin 传给 WP-CLI，终端及 `/var/log/wp-shell/` 日志中的 WP-CLI 重建命令会显示 `[REDACTED]`。首次登录后应把管理员密码保存到密码管理器，并删除对应的 `/root/wordpress-credentials-DOMAIN.txt`。
 
+以后只重新显示同一份摘要，不重新部署网站：
+
+```bash
+sudo wp-shell site example.com summary
+```
+
 添加完成后检查：
 
 ```bash

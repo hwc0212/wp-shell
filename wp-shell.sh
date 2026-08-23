@@ -1800,6 +1800,7 @@ site_action() {
             site_status "$index"
             [[ -f "$wp_path/wp-config.php" ]] && printf '  WordPress: %s\n' "$(site_wp_cli "$domain" core version)"
             ;;
+        summary) show_site_deployment_summary "$index" ;;
         cache-clear) clear_site_cache "$index"; log_message SUCCESS "$domain cache was cleared." ;;
         backup) backup_site "$index" ;;
         backups) list_backups "$index" ;;
@@ -1809,7 +1810,7 @@ site_action() {
             systemctl restart "php${SITE_PHP_VERSIONS[$index]}-fpm"
             nginx -t && systemctl reload nginx
             ;;
-        *) die "Unknown site action: $action (use status, info, cache-clear, backup, backups, restore, update, or restart)." ;;
+        *) die "Unknown site action: $action (use status, info, summary, cache-clear, backup, backups, restore, update, or restart)." ;;
     esac
 }
 
@@ -2896,6 +2897,7 @@ Usage:
   sudo wp-shell site add                         Add and deploy a site
   sudo wp-shell site list                        List managed and imported sites
   sudo wp-shell site status [DOMAIN]             Show site status
+  sudo wp-shell site DOMAIN summary              Show the website deployment summary
   sudo wp-shell site deploy DOMAIN               Idempotently deploy or repair a site
   sudo wp-shell site import                      Discover existing WordPress sites
   sudo wp-shell site DOMAIN ACTION               Run a compatibility site action
@@ -2906,7 +2908,7 @@ Usage:
   sudo wp-shell optimize                         Reapply the resource budget
   sudo wp-shell security-scan                    Validate services, TLS, and permissions
 
-Site actions: status, info, cache-clear, backup, backups, restore, update, restart
+Site actions: status, info, summary, cache-clear, backup, backups, restore, update, restart
 All dashboard text and stored operational metadata are ASCII/English. Access metrics
 exclude client IPs, cookies, and query strings. Raw samples are retained for 30 days.
 EOF

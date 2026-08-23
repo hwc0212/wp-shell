@@ -63,6 +63,9 @@ if grep -q 'root-only secret' <<< "$output"; then
     printf 'The website summary exposed credential contents.\n' >&2
     exit 1
 fi
+output="$(site_action example.com summary)"
+grep -q 'Website deployment complete' <<< "$output"
+grep -q 'TLS expires    2026-11-21' <<< "$output"
 
 bootstrap_server() { printf 'ENVIRONMENT_BOOTSTRAP_CALLED\n'; }
 output="$(new_server_wizard <<< $'1\n2\nn')"
