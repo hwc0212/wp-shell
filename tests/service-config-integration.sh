@@ -39,6 +39,21 @@ else
 fi
 [[ "$redis_exit" -eq 124 ]]
 
+install -d -m 0750 "$LOG_DIR"
+old_redis_secret="$(<"$REDIS_SECRET_FILE")"
+redis_log="$LOG_DIR/wp-shell-rotation-test.log"
+printf 'Accidental credential output: %s\n' "$old_redis_secret" > "$redis_log"
+redis-server /etc/redis/wp-shell.conf --supervised no --daemonize yes \
+    --pidfile /tmp/wp-shell-test-redis.pid --logfile /tmp/wp-shell-test-redis.log
+[[ "$(REDISCLI_AUTH="$old_redis_secret" redis-cli --no-auth-warning ping)" == "PONG" ]]
+rotate_redis_secret
+new_redis_secret="$(<"$REDIS_SECRET_FILE")"
+[[ "$new_redis_secret" != "$old_redis_secret" ]]
+[[ "$(REDISCLI_AUTH="$new_redis_secret" redis-cli --no-auth-warning ping)" == "PONG" ]]
+[[ "$(<"$redis_log")" == 'Accidental credential output: [REDACTED]' ]]
+[[ "$(stat -c '%a' "$redis_log")" == "600" ]]
+REDISCLI_AUTH="$new_redis_secret" redis-cli --no-auth-warning shutdown nosave
+
 configure_php
 php-fpm8.3 -t
 pool_file="/etc/php/8.3/fpm/pool.d/wp-shell-$(site_pool_id example.com).conf"

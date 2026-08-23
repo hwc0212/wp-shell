@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.4.2
+# Version 9.4.3
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.4.2"
+readonly WP_SHELL_VERSION="9.4.3"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -799,6 +799,133 @@ load_or_create_redis_secret() {
     [[ "$REDIS_PASSWORD" =~ ^[a-f0-9]{48}$ ]] || die "The Redis secret file has an invalid format."
 }
 
+install_redis_secret_value() {
+    local secret="$1" temp_file
+    [[ "$secret" =~ ^[a-f0-9]{48}$ ]] || die "Refusing to install an invalid Redis secret."
+    temp_file="$(mktemp "$CONFIG_DIR/.redis-secret.XXXXXX")"
+    printf '%s\n' "$secret" > "$temp_file"
+    install -o root -g root -m 0600 "$temp_file" "$REDIS_SECRET_FILE"
+    rm -f "$temp_file"
+    REDIS_PASSWORD="$secret"
+}
+
+redact_secret_from_logs() {
+    local secret="$1" log_file temp_file line changed
+    [[ "$secret" =~ ^[a-f0-9]{48}$ ]] || return 0
+    for log_file in "$LOG_DIR"/wp-shell-*.log; do
+        [[ -f "$log_file" ]] || continue
+        temp_file="$(mktemp "$LOG_DIR/.redacted.XXXXXX")"
+        changed="no"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" == *"$secret"* ]]; then
+                line="${line//"$secret"/[REDACTED]}"
+                changed="yes"
+            fi
+            printf '%s\n' "$line"
+        done < "$log_file" > "$temp_file"
+        if [[ "$changed" == "yes" ]]; then
+            mv -f "$temp_file" "$log_file"
+            chmod 0600 "$log_file"
+        else
+            rm -f "$temp_file"
+        fi
+    done
+}
+
+secret_exists_in_logs() {
+    local secret="$1" log_file line
+    [[ -n "$secret" ]] || return 1
+    for log_file in "$LOG_DIR"/wp-shell-*.log; do
+        [[ -f "$log_file" ]] || continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" == *"$secret"* ]] && return 0
+        done < "$log_file"
+    done
+    return 1
+}
+
+rotate_redis_secret() {
+    CURRENT_STEP="rotate Redis credentials"
+    local old_secret new_secret config_file config_backup config_temp output="" i j domain wp_path
+    local updated_sites=0
+    local requirepass_replaced="no"
+    load_or_create_redis_secret
+    old_secret="$REDIS_PASSWORD"
+    config_file="/etc/redis/wp-shell.conf"
+    [[ -f "$config_file" ]] || die "Redis is not managed by wp-shell."
+    [[ "$(REDISCLI_AUTH="$old_secret" redis-cli --no-auth-warning ping 2>/dev/null || true)" == "PONG" ]] || \
+        die "The current Redis credential could not authenticate."
+
+    for ((i = 1; i <= SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        wp_path="$(site_wp_path "$domain")"
+        [[ ! -f "$wp_path/wp-config.php" ]] || \
+            site_wp_cli "$domain" config get DB_NAME >/dev/null 2>&1 || \
+            die "WordPress configuration preflight failed for $domain."
+    done
+
+    new_secret="$(generate_password)"
+    config_backup="$(mktemp /tmp/wp-shell-redis-config.XXXXXX)"
+    config_temp="$(mktemp /etc/redis/.wp-shell-rotate.XXXXXX)"
+    cp -a "$config_file" "$config_backup"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == requirepass\ * ]]; then
+            printf 'requirepass %s\n' "$new_secret"
+            requirepass_replaced="yes"
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$config_file" > "$config_temp"
+    [[ "$requirepass_replaced" == "yes" ]] || printf 'requirepass %s\n' "$new_secret" >> "$config_temp"
+    chown root:redis "$config_temp"
+    chmod 0640 "$config_temp"
+    mv -f "$config_temp" "$config_file"
+
+    if output="$(printf '%s' "$new_secret" | REDISCLI_AUTH="$old_secret" \
+        redis-cli --no-auth-warning -x CONFIG SET requirepass 2>&1)" && [[ "$output" == "OK" ]]; then
+        :
+    else
+        cp -a "$config_backup" "$config_file"
+        rm -f "$config_backup"
+        die "Redis rejected the credential rotation before any WordPress configuration was changed."
+    fi
+    install_redis_secret_value "$new_secret"
+
+    for ((i = 1; i <= SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        wp_path="$(site_wp_path "$domain")"
+        [[ -f "$wp_path/wp-config.php" ]] || continue
+        if ! site_wp_cli_prompt_secret_quiet "$domain" "$new_secret" \
+            config set WP_REDIS_PASSWORD --prompt=value; then
+            for ((j = 1; j <= i; j++)); do
+                domain="${SITE_DOMAINS[$j]}"
+                wp_path="$(site_wp_path "$domain")"
+                [[ -f "$wp_path/wp-config.php" ]] || continue
+                site_wp_cli_prompt_secret_quiet "$domain" "$old_secret" \
+                    config set WP_REDIS_PASSWORD --prompt=value || true
+                chmod 0640 "$wp_path/wp-config.php"
+            done
+            printf '%s' "$old_secret" | REDISCLI_AUTH="$new_secret" \
+                redis-cli --no-auth-warning -x CONFIG SET requirepass >/dev/null 2>&1 || true
+            cp -a "$config_backup" "$config_file"
+            install_redis_secret_value "$old_secret"
+            rm -f "$config_backup"
+            die "Redis credential rotation was rolled back after $domain could not be updated."
+        fi
+        chmod 0640 "$wp_path/wp-config.php"
+        updated_sites=$((updated_sites + 1))
+    done
+
+    rm -f "$config_backup"
+    [[ "$(REDISCLI_AUTH="$new_secret" redis-cli --no-auth-warning ping 2>/dev/null || true)" == "PONG" ]] || \
+        die "Redis did not accept the rotated credential."
+    redact_secret_from_logs "$old_secret"
+    for ((i = 1; i <= SITE_COUNT; i++)); do
+        clear_site_cache "$i"
+    done
+    log_message SUCCESS "Rotated the Redis credential for Redis and $updated_sites WordPress site(s); matching wp-shell logs were redacted."
+}
+
 configure_redis() {
     CURRENT_STEP="configure Redis"
     calculate_resource_budget
@@ -1260,6 +1387,22 @@ site_wp_cli_prompt_secret() {
     return "$status"
 }
 
+site_wp_cli_prompt_secret_quiet() {
+    local domain="$1" secret="$2" output status=0
+    shift 2
+    if output="$(printf '%s\n' "$secret" | site_wp_cli "$domain" "$@" --quiet 2>&1)"; then
+        return 0
+    else
+        status=$?
+    fi
+    if [[ -n "$secret" && "$output" == *"$secret"* ]]; then
+        printf '%s\n' '[REDACTED: WP-CLI error output contained a secret]' >&2
+    else
+        printf '%s\n' "$output" | redact_wp_cli_output >&2
+    fi
+    return "$status"
+}
+
 site_credentials_file() {
     printf '/root/wordpress-credentials-%s.txt' "$1"
 }
@@ -1313,7 +1456,8 @@ install_wordpress_site() {
     site_wp_cli "$domain" config set WP_CACHE true --raw
     site_wp_cli "$domain" config set WP_REDIS_HOST 127.0.0.1
     site_wp_cli "$domain" config set WP_REDIS_PORT 6379 --raw
-    site_wp_cli "$domain" config set WP_REDIS_PASSWORD "$redis_password"
+    site_wp_cli_prompt_secret_quiet "$domain" "$redis_password" \
+        config set WP_REDIS_PASSWORD --prompt=value
     site_wp_cli "$domain" config set WP_REDIS_DATABASE "${SITE_REDIS_DATABASES[$index]}" --raw
     site_wp_cli "$domain" config set WP_REDIS_PREFIX "${domain}:"
     memory_limit="256M"
@@ -1906,7 +2050,8 @@ CREATE TABLE IF NOT EXISTS site_samples (
     files_mb REAL NOT NULL DEFAULT 0,
     cache_mb REAL NOT NULL DEFAULT 0,
     logs_mb REAL NOT NULL DEFAULT 0,
-    backups_mb REAL NOT NULL DEFAULT 0
+    backups_mb REAL NOT NULL DEFAULT 0,
+    php_pss_mb REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_site_samples_ts_domain ON site_samples(ts, domain);
 CREATE TABLE IF NOT EXISTS service_samples (
@@ -1921,6 +2066,9 @@ CREATE TABLE IF NOT EXISTS service_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_service_samples_ts ON service_samples(ts);
 SQL
+    if ! sqlite3 "$METRICS_DB" 'PRAGMA table_info(site_samples);' | awk -F'|' '$2=="php_pss_mb" {found=1} END {exit !found}'; then
+        sqlite3 "$METRICS_DB" 'ALTER TABLE site_samples ADD COLUMN php_pss_mb REAL NOT NULL DEFAULT 0;'
+    fi
     chmod 0600 "$METRICS_DB"
 }
 
@@ -2000,7 +2148,8 @@ collect_nginx_interval() {
 }
 
 collect_php_pool_status() {
-    local domain="$1" socket json pool_id rss
+    local domain="$1" socket json pool_id rss pss pid process_rss args process_pss
+    local rss_kb=0 pss_kb=0
     socket="$(site_pool_status_socket "$domain")"
     pool_id="$(site_pool_id "$domain")"
     json=""
@@ -2008,11 +2157,22 @@ collect_php_pool_status() {
         json="$(SCRIPT_NAME=/status SCRIPT_FILENAME=/status REQUEST_METHOD=GET QUERY_STRING=json \
             cgi-fcgi -bind -connect "$socket" 2>/dev/null | sed -n '/^{/,$p' | tr -d '\r' || true)"
     fi
-    rss="$(ps -eo rss=,args= 2>/dev/null | awk -v needle="php-fpm: pool $pool_id" 'index($0,needle){sum+=$1} END{printf "%.1f",sum/1024}')"
+    while read -r pid process_rss args; do
+        [[ "$args" == "php-fpm: pool $pool_id" ]] || continue
+        rss_kb=$((rss_kb + process_rss))
+        process_pss=""
+        if [[ -r "/proc/$pid/smaps_rollup" ]]; then
+            process_pss="$(awk '$1=="Pss:" {print $2; exit}' "/proc/$pid/smaps_rollup" 2>/dev/null || true)"
+        fi
+        [[ "$process_pss" =~ ^[0-9]+$ ]] || process_pss="$process_rss"
+        pss_kb=$((pss_kb + process_pss))
+    done < <(ps -eo pid=,rss=,args= 2>/dev/null)
+    rss="$(awk -v kb="$rss_kb" 'BEGIN {printf "%.1f",kb/1024}')"
+    pss="$(awk -v kb="$pss_kb" 'BEGIN {printf "%.1f",kb/1024}')"
     if jq -e . >/dev/null 2>&1 <<< "$json"; then
-        jq -r --arg rss "$rss" '[.["active processes"]//0, .["idle processes"]//0, .["listen queue"]//0, .["max active processes"]//0, .["max children reached"]//0, ($rss|tonumber)] | @tsv' <<< "$json"
+        jq -r --arg rss "$rss" --arg pss "$pss" '[.["active processes"]//0, .["idle processes"]//0, .["listen queue"]//0, .["max active processes"]//0, .["max children reached"]//0, ($rss|tonumber), ($pss|tonumber)] | @tsv' <<< "$json"
     else
-        printf '0\t0\t0\t0\t0\t%s' "${rss:-0}"
+        printf '0\t0\t0\t0\t0\t%s\t%s' "${rss:-0}" "${pss:-0}"
     fi
 }
 
@@ -2039,7 +2199,7 @@ backup_age_hours() {
 
 collect_site_sample() {
     local ts="$1" index="$2" domain primary wp_path log_stats php_stats
-    local requests s2 s4 s5 bytes avg p95 hits misses bypass stale active idle queue _max_active reached rss
+    local requests s2 s4 s5 bytes avg p95 hits misses bypass stale active idle queue _max_active reached rss pss
     local http_code tls_days backup_age files_mb cache_mb logs_mb backups_mb
     domain="${SITE_DOMAINS[$index]}"
     primary="${SITE_PRIMARY_DOMAINS[$index]}"
@@ -2047,7 +2207,7 @@ collect_site_sample() {
     log_stats="$(collect_nginx_interval "$domain")"
     read -r requests s2 s4 s5 bytes avg p95 hits misses bypass stale <<< "${log_stats//$'\t'/ }"
     php_stats="$(collect_php_pool_status "$domain")"
-    read -r active idle queue _max_active reached rss <<< "${php_stats//$'\t'/ }"
+    read -r active idle queue _max_active reached rss pss <<< "${php_stats//$'\t'/ }"
     http_code="$(curl --silent --output /dev/null --max-time 5 --write-out '%{http_code}' "https://$primary" 2>/dev/null || printf '0')"
     [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code=0
     tls_days="$(tls_days_remaining "$domain")"
@@ -2056,7 +2216,7 @@ collect_site_sample() {
     cache_mb="$(directory_size_mb "$(site_cache_dir "$domain")")"
     logs_mb="$(directory_size_mb "/var/www/$domain/logs")"
     backups_mb="$(directory_size_mb "$(site_backup_dir "$domain")")"
-    sqlite3 "$METRICS_DB" "INSERT INTO site_samples VALUES($ts,'$domain',$(numeric_or_zero "$requests"),$(numeric_or_zero "$s2"),$(numeric_or_zero "$s4"),$(numeric_or_zero "$s5"),$(numeric_or_zero "$bytes"),$(numeric_or_zero "$avg"),$(numeric_or_zero "$p95"),$(numeric_or_zero "$hits"),$(numeric_or_zero "$misses"),$(( $(numeric_or_zero "$bypass") + $(numeric_or_zero "$stale") )),$(numeric_or_zero "$active"),$(numeric_or_zero "$idle"),$(numeric_or_zero "$queue"),${SITE_PHP_MAX_CHILDREN[$index]:-0},$(numeric_or_zero "$reached"),$(numeric_or_zero "$rss"),$http_code,$tls_days,$backup_age,$files_mb,$cache_mb,$logs_mb,$backups_mb);"
+    sqlite3 "$METRICS_DB" "INSERT INTO site_samples VALUES($ts,'$domain',$(numeric_or_zero "$requests"),$(numeric_or_zero "$s2"),$(numeric_or_zero "$s4"),$(numeric_or_zero "$s5"),$(numeric_or_zero "$bytes"),$(numeric_or_zero "$avg"),$(numeric_or_zero "$p95"),$(numeric_or_zero "$hits"),$(numeric_or_zero "$misses"),$(( $(numeric_or_zero "$bypass") + $(numeric_or_zero "$stale") )),$(numeric_or_zero "$active"),$(numeric_or_zero "$idle"),$(numeric_or_zero "$queue"),${SITE_PHP_MAX_CHILDREN[$index]:-0},$(numeric_or_zero "$reached"),$(numeric_or_zero "$rss"),$http_code,$tls_days,$backup_age,$files_mb,$cache_mb,$logs_mb,$backups_mb,$(numeric_or_zero "$pss"));"
 }
 
 collect_service_sample() {
@@ -2070,7 +2230,7 @@ collect_service_sample() {
         esac
     done <<< "$mariadb_values"
     if [[ -s "$REDIS_SECRET_FILE" ]]; then
-        redis_info="$(redis-cli --no-auth-warning -a "$(<"$REDIS_SECRET_FILE")" INFO stats memory 2>/dev/null | tr -d '\r' || true)"
+        redis_info="$(REDISCLI_AUTH="$(<"$REDIS_SECRET_FILE")" redis-cli --no-auth-warning INFO stats memory 2>/dev/null | tr -d '\r' || true)"
         redis_used="$(awk -F: '$1=="used_memory"{printf "%.1f",$2/1048576}' <<< "$redis_info")"
         hits="$(awk -F: '$1=="keyspace_hits"{print $2}' <<< "$redis_info")"
         misses="$(awk -F: '$1=="keyspace_misses"{print $2}' <<< "$redis_info")"
@@ -2178,7 +2338,7 @@ metrics_report() {
     printf 'wp-shell report | range %s | generated %s\n\n' "$range" "$(date --iso-8601=seconds)"
     sqlite3 -header -column "$METRICS_DB" "SELECT printf('%.1f%%',cpu_pct) AS CPU, printf('%.2f',load1) AS Load1, (mem_total_mb-mem_available_mb)||'/'||mem_total_mb||' MB' AS Memory, swap_used_mb||' MB' AS Swap, printf('%.0f%%',disk_pct) AS Disk FROM system_samples ORDER BY ts DESC LIMIT 1;"
     printf '\nSites (interval samples aggregated over %s)\n' "$range"
-    sqlite3 -header -column "$METRICS_DB" "SELECT domain AS Domain, SUM(requests) AS Requests, SUM(status_4xx) AS '4xx', SUM(status_5xx) AS '5xx', printf('%.0f',MAX(p95_ms)) AS 'P95 ms', CASE WHEN SUM(cache_hits+cache_misses)>0 THEN printf('%.0f%%',100.0*SUM(cache_hits)/SUM(cache_hits+cache_misses)) ELSE '-' END AS 'Cache hit', printf('%.0f',MAX(php_rss_mb)) AS 'PHP MB', MAX(php_queue) AS Queue, MAX(http_code) AS HTTP, MIN(tls_days) AS 'TLS days', CASE WHEN MIN(backup_age_hours)<0 THEN '-' ELSE printf('%.1fh',MIN(backup_age_hours)) END AS Backup FROM site_samples WHERE ts >= $since GROUP BY domain ORDER BY SUM(requests) DESC;"
+    sqlite3 -header -column "$METRICS_DB" "SELECT domain AS Domain, SUM(requests) AS Requests, SUM(status_4xx) AS '4xx', SUM(status_5xx) AS '5xx', printf('%.0f',MAX(p95_ms)) AS 'P95 ms', CASE WHEN SUM(cache_hits+cache_misses)>0 THEN printf('%.0f%%',100.0*SUM(cache_hits)/SUM(cache_hits+cache_misses)) ELSE '-' END AS 'Cache hit', printf('%.0f',MAX(php_pss_mb)) AS 'PHP PSS MB', MAX(php_queue) AS Queue, MAX(http_code) AS HTTP, MIN(tls_days) AS 'TLS days', CASE WHEN MIN(backup_age_hours)<0 THEN '-' ELSE printf('%.1fh',MIN(backup_age_hours)) END AS Backup FROM site_samples WHERE ts >= $since GROUP BY domain ORDER BY SUM(requests) DESC;"
 }
 
 dashboard() {
@@ -2187,6 +2347,7 @@ dashboard() {
     python3 /dev/fd/3 "$METRICS_DB" "$SITES_CONFIG_FILE" 3<<'PY'
 import curses
 import datetime
+import os
 import sqlite3
 import subprocess
 import sys
@@ -2351,21 +2512,31 @@ def draw_header(stdscr, system, view, modes, failed):
     total = max(1, int(system.get("mem_total_mb", 0) or 0))
     used = total - int(system.get("mem_available_mb", 0) or 0)
     memory_pct = 100 * used / total
-    columns = max(12, (width - 45) // 3)
-    add(stdscr, 1, 1, f"CPU {float(system.get('cpu_pct', 0)) :5.1f}% {bar(system.get('cpu_pct', 0), columns)}")
-    add(stdscr, 1, min(width // 3, 30), f"MEM {used}/{total}MB {bar(memory_pct, columns)}")
-    add(stdscr, 1, min(2 * width // 3, 60), f"DISK {float(system.get('disk_pct', 0)):4.0f}% {bar(system.get('disk_pct', 0), columns)}")
-    add(stdscr, 2, 1, f"Load {float(system.get('load1', 0)):.2f} | Swap {int(system.get('swap_used_mb', 0))}MB | Raw data retained 30d | Window 5m")
+    boundaries = ((1, width // 3), (width // 3, 2 * width // 3), (2 * width // 3, width))
+    metrics = (
+        (f"CPU {float(system.get('cpu_pct', 0)):5.1f}%", system.get("cpu_pct", 0)),
+        (f"MEM {used}/{total}MB", memory_pct),
+        (f"DISK {float(system.get('disk_pct', 0)):4.0f}%", system.get("disk_pct", 0)),
+    )
+    for (start, end), (label, percent) in zip(boundaries, metrics):
+        available = max(1, end - start - 1)
+        bar_width = max(4, available - len(label) - 3)
+        add(stdscr, 1, start, f"{label} {bar(percent, bar_width)}", width=available)
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cores = os.cpu_count() or "?"
+    add(stdscr, 2, 1, f"Load {float(system.get('load1', 0)):.2f} / {cores} cores | Swap {int(system.get('swap_used_mb', 0))}MB | Raw data retained 30d | Window 5m")
     return 4
 
 
 def table_layout(width, view):
     if view == 0:
-        return [("Domain", 24), ("Req/5m", 8), ("P95", 8), ("Hit", 7), ("PHP", 10), ("RSS", 8), ("HTTP", 6), ("Health", 16)]
+        return [("Domain", 24), ("Req/5m", 8), ("P95", 8), ("Hit", 7), ("PHP", 10), ("PSS", 8), ("HTTP", 6), ("Health", 16)]
     if view == 1:
         return [("Domain", 24), ("Requests", 9), ("2xx", 7), ("4xx", 7), ("5xx", 7), ("Bytes", 9), ("P95", 8), ("Cache", 8)]
     if view == 2:
-        return [("Domain", 24), ("Active", 8), ("Idle", 7), ("Queue", 7), ("Max", 7), ("RSS", 9), ("Files", 9), ("Cache", 9), ("Logs", 8)]
+        return [("Domain", 24), ("Active", 8), ("Idle", 7), ("Queue", 7), ("Max", 7), ("PSS", 9), ("RSSsum", 9), ("Files", 9), ("Cache", 9), ("Logs", 8)]
     if view == 3:
         return [("Domain", 24), ("HTTP", 7), ("TLS", 9), ("Backup", 10), ("Backups", 10), ("PHP", 8), ("Mode", 10), ("Health", 16)]
     return [("Domain", 24), ("Severity", 10), ("Finding", 50)]
@@ -2394,7 +2565,7 @@ def values_for(view, site, agg, meta):
         if view == 1:
             return [site["domain"], "-", "-", "-", "-", "-", "-", "-"]
         if view == 2:
-            return [site["domain"], "-", "-", "-", "-", "-", "-", "-", "-"]
+            return [site["domain"], "-", "-", "-", "-", "-", "-", "-", "-", "-"]
         if view == 3:
             return [site["domain"], "-", "-", "none", "-", meta.get("php", "-"), meta.get("mode", "-"), "NO DATA"]
         return [site["domain"], "WARN", "NO DATA"]
@@ -2404,15 +2575,16 @@ def values_for(view, site, agg, meta):
     health = alert_for(site, agg)
     if view == 0:
         return [site["domain"], requests, f"{float(agg.get('p95_ms',0)):.0f}ms", hit,
-                f"{site.get('php_active',0)}/{site.get('php_max_children',0)}", f"{float(site.get('php_rss_mb',0)):.0f}MB",
+                f"{site.get('php_active',0)}/{site.get('php_max_children',0)}", f"{float(site.get('php_pss_mb',0)):.0f}MB",
                 site.get("http_code", 0), health]
     if view == 1:
         return [site["domain"], requests, agg.get("status_2xx", 0), agg.get("status_4xx", 0), agg.get("status_5xx", 0),
                 human_bytes(agg.get("bytes_sent", 0)), f"{float(agg.get('p95_ms',0)):.0f}ms", hit]
     if view == 2:
         return [site["domain"], site.get("php_active", 0), site.get("php_idle", 0), site.get("php_queue", 0),
-                site.get("php_max_children", 0), f"{float(site.get('php_rss_mb',0)):.0f}MB",
-                f"{float(site.get('files_mb',0)):.0f}MB", f"{float(site.get('cache_mb',0)):.0f}MB", f"{float(site.get('logs_mb',0)):.0f}MB"]
+                site.get("php_max_children", 0), f"{float(site.get('php_pss_mb',0)):.0f}MB",
+                f"{float(site.get('php_rss_mb',0)):.0f}MB", f"{float(site.get('files_mb',0)):.0f}MB",
+                f"{float(site.get('cache_mb',0)):.0f}MB", f"{float(site.get('logs_mb',0)):.0f}MB"]
     if view == 3:
         backup = float(site.get("backup_age_hours", -1) or -1)
         return [site["domain"], site.get("http_code", 0), f"{site.get('tls_days',-1)}d", "none" if backup < 0 else f"{backup:.1f}h",
@@ -2552,7 +2724,7 @@ analyze_metrics() {
     printf 'wp-shell resource analysis | range %s\n\n' "$range"
     sqlite3 -header -column "$METRICS_DB" "SELECT COUNT(*) AS Samples, printf('%.1f%%',MAX(cpu_pct)) AS 'Peak CPU', printf('%.1f%%',MIN(100.0*mem_available_mb/NULLIF(mem_total_mb,0))) AS 'Minimum free memory', printf('%.0f%%',MAX(disk_pct)) AS 'Peak disk' FROM system_samples WHERE ts >= $since;"
     printf '\nPer-site PHP evidence\n'
-    sqlite3 -header -column "$METRICS_DB" "SELECT domain AS Domain, COUNT(*) AS Samples, MAX(php_active) AS 'Peak active', MAX(php_queue) AS 'Peak queue', MAX(php_max_reached) AS 'Max reached', printf('%.0f MB',MAX(php_rss_mb)) AS 'Peak RSS', printf('%.0f ms',MAX(p95_ms)) AS 'Peak P95' FROM site_samples WHERE ts >= $since GROUP BY domain ORDER BY domain;"
+    sqlite3 -header -column "$METRICS_DB" "SELECT domain AS Domain, COUNT(*) AS Samples, MAX(php_active) AS 'Peak active', MAX(php_queue) AS 'Peak queue', MAX(php_max_reached) AS 'Max reached', printf('%.0f MB',MAX(php_pss_mb)) AS 'Peak PSS', printf('%.0f MB',MAX(php_rss_mb)) AS 'Peak RSS sum', printf('%.0f ms',MAX(p95_ms)) AS 'Peak P95' FROM site_samples WHERE ts >= $since GROUP BY domain ORDER BY domain;"
     printf '\nShared services\n'
     sqlite3 -header -column "$METRICS_DB" "SELECT MAX(mariadb_threads) AS 'Peak DB threads', MAX(mariadb_slow_queries)-MIN(mariadb_slow_queries) AS 'New slow queries', printf('%.1f MB',MAX(redis_used_mb)) AS 'Peak Redis', MAX(redis_evicted)-MIN(redis_evicted) AS 'Redis evictions' FROM service_samples WHERE ts >= $since;"
     printf '\nConfigured budget: MariaDB %sMB | Redis %sMB | PHP-FPM %sMB\n' "$MARIADB_BUFFER_MB" "$REDIS_MAX_MEMORY_MB" "$PHP_TOTAL_BUDGET_MB"
@@ -2696,8 +2868,15 @@ import_existing_sites() {
     log_message INFO "Import completed; $imported site(s) added."
 }
 
+headers_have_managed_hsts() {
+    local headers="$1"
+    grep -Eqi '^strict-transport-security:[[:space:]]*max-age=15552000([;[:space:]]|$)' <<< "$headers" &&
+        ! grep -Eqi '^strict-transport-security:[[:space:]]*max-age=0([;[:space:]]|$)' <<< "$headers"
+}
+
 security_scan() {
-    local failed=0 i domain primary wp_config perms version constant value credentials_file headers
+    local failed=0 i domain primary wp_config perms version constant value credentials_file
+    local origin_headers public_headers redis_secret
     for service in nginx mariadb redis-server fail2ban; do
         if ! systemctl is-active --quiet "$service"; then
             log_message ERROR "$service is not running."
@@ -2733,10 +2912,15 @@ security_scan() {
         fi
         [[ -s "/etc/letsencrypt/live/$domain/fullchain.pem" ]] || { log_message ERROR "$domain has no certificate."; failed=$((failed + 1)); }
         primary="${SITE_PRIMARY_DOMAINS[$i]}"
-        headers="$(curl --silent --show-error --output /dev/null --dump-header - --max-time 5 "https://$primary/wp-login.php" 2>/dev/null | tr -d '\r' || true)"
-        if ! grep -Eqi '^strict-transport-security:[[:space:]]*max-age=15552000([;[:space:]]|$)' <<< "$headers" || \
-           grep -Eqi '^strict-transport-security:[[:space:]]*max-age=0([;[:space:]]|$)' <<< "$headers"; then
-            log_message WARNING "$domain does not return the managed HSTS policy."
+        origin_headers="$(curl --silent --show-error --output /dev/null --dump-header - --max-time 5 \
+            --resolve "$primary:443:127.0.0.1" "https://$primary/wp-login.php" 2>/dev/null | tr -d '\r' || true)"
+        public_headers="$(curl --silent --show-error --output /dev/null --dump-header - --max-time 5 \
+            "https://$primary/wp-login.php" 2>/dev/null | tr -d '\r' || true)"
+        if ! headers_have_managed_hsts "$origin_headers"; then
+            log_message WARNING "$domain origin does not return the managed HSTS policy."
+            failed=$((failed + 1))
+        elif ! headers_have_managed_hsts "$public_headers"; then
+            log_message WARNING "$domain public endpoint overrides or removes the managed HSTS policy; check its CDN or reverse proxy."
             failed=$((failed + 1))
         fi
         credentials_file="$(site_credentials_file "$domain")"
@@ -2748,6 +2932,13 @@ security_scan() {
     if [[ "$ENVIRONMENT_UFW" == "yes" ]] && ! ufw status 2>/dev/null | grep -Fq 'Status: active'; then
         log_message WARNING "UFW is configured for this environment but is not active."
         failed=$((failed + 1))
+    fi
+    if [[ -s "$REDIS_SECRET_FILE" ]]; then
+        redis_secret="$(<"$REDIS_SECRET_FILE")"
+        if secret_exists_in_logs "$redis_secret"; then
+            log_message WARNING "The current Redis credential appears in wp-shell logs. Run: sudo wp-shell rotate-redis-secret"
+            failed=$((failed + 1))
+        fi
     fi
     if ((failed == 0)); then
         log_message SUCCESS "Security checks passed."
@@ -3046,6 +3237,7 @@ Usage:
   sudo wp-shell backup-all                       Back up all sites
   sudo wp-shell restore DOMAIN BACKUP_ID         Restore one backup
   sudo wp-shell optimize                         Reapply the resource budget
+  sudo wp-shell rotate-redis-secret              Rotate Redis auth and redact matching logs
   sudo wp-shell security-scan                    Validate services, TLS, and permissions
 
 Site actions: status, info, summary, cache-clear, backup, backups, restore, update, restart
@@ -3135,6 +3327,7 @@ execute_command() {
         backup) [[ -n "${2:-}" ]] || die "A domain is required."; site_action "$2" backup ;;
         restore) [[ -n "${2:-}" && -n "${3:-}" ]] || die "Usage: restore DOMAIN BACKUP_ID"; site_action "$2" restore "$3" ;;
         optimize) configure_mariadb; configure_redis; configure_php ;;
+        rotate-redis-secret) rotate_redis_secret ;;
         security-scan) security_scan ;;
         install-backup-timer) install_self; install_backup_timer ;;
         migrate) log_message SUCCESS "Configuration is using the current v3 format." ;;

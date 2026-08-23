@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# shellcheck disable=SC2016
+
 set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,11 +27,24 @@ if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.s
 fi
 
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
-grep -Fq 'readonly WP_SHELL_VERSION="9.4.2"' "$repo_root/wp-shell.sh"
+grep -Fq 'readonly WP_SHELL_VERSION="9.4.3"' "$repo_root/wp-shell.sh"
 grep -Fq "} > \"\$TERMINAL_DEVICE\"" "$repo_root/wp-shell.sh"
 grep -Fq 'END {printf "%d %d\n", rx, tx}' "$repo_root/wp-shell.sh"
+grep -Fq 'php_pss_mb REAL NOT NULL DEFAULT 0' "$repo_root/wp-shell.sh"
+grep -Fq 'Load {float(system.get('"'"'load1'"'"', 0)):.2f} / {cores} cores' "$repo_root/wp-shell.sh"
 grep -Fq "\"\$initial_mode\" == \"managed\" && \"\$wordpress_installed_now\" == \"yes\"" "$repo_root/wp-shell.sh"
 grep -Fq 'fastcgi_hide_header Strict-Transport-Security;' "$repo_root/wp-shell.sh"
+grep -Fq 'site_wp_cli_prompt_secret_quiet "$domain" "$redis_password"' "$repo_root/wp-shell.sh"
+grep -Fq 'rotate-redis-secret) rotate_redis_secret ;;' "$repo_root/wp-shell.sh"
+grep -Fq 'REDISCLI_AUTH="$(<"$REDIS_SECRET_FILE")" redis-cli --no-auth-warning' "$repo_root/wp-shell.sh"
+if grep -Fq 'config set WP_REDIS_PASSWORD "$redis_password"' "$repo_root/wp-shell.sh"; then
+    printf 'The Redis credential must not be passed as a WP-CLI argument.\n' >&2
+    exit 1
+fi
+if grep -nE 'redis-cli([^[:space:]]|[[:space:]])*[[:space:]]-a[[:space:]]' "$repo_root/wp-shell.sh"; then
+    printf 'Redis credentials must not be passed through redis-cli -a.\n' >&2
+    exit 1
+fi
 if grep -q '^readonly VERSION=' "$repo_root/wp-shell.sh"; then
     printf 'The generic VERSION variable conflicts with /etc/os-release.\n' >&2
     exit 1

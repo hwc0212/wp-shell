@@ -99,4 +99,30 @@ if grep -Eq 'database-secret|admin-secret' <<< "$secret_output"; then
     exit 1
 fi
 
+headers_have_managed_hsts $'HTTP/2 200\nstrict-transport-security: max-age=15552000; includeSubDomains'
+if headers_have_managed_hsts $'HTTP/2 200\nstrict-transport-security: max-age=0'; then
+    printf 'A disabled HSTS policy was accepted.\n' >&2
+    exit 1
+fi
+
+site_wp_cli() {
+    local _domain="$1" supplied
+    shift
+    supplied="$(cat)"
+    [[ " $* " == *" --quiet "* ]] || return 2
+    printf 'WP-CLI failure exposed %s\n' "$supplied" >&2
+    return 1
+}
+secret_status=0
+if secret_output="$(site_wp_cli_prompt_secret_quiet legacy.example.com redis-secret-value \
+    config set WP_REDIS_PASSWORD --prompt=value 2>&1)"; then
+    printf 'The failing WP-CLI secret test unexpectedly succeeded.\n' >&2
+    exit 1
+else
+    secret_status=$?
+fi
+[[ "$secret_status" -eq 1 ]]
+[[ "$secret_output" == *'[REDACTED: WP-CLI error output contained a secret]'* ]]
+[[ "$secret_output" != *'redis-secret-value'* ]]
+
 printf 'Site/environment configuration and legacy migration tests passed.\n'

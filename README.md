@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.4.2
+- 当前版本：`wp-shell.sh` v9.4.3
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -230,7 +230,7 @@ systemctl status wp-shell-backup.timer
 systemctl status wp-shell-metrics.timer
 ```
 
-`security-scan` 不只检查服务是否启动，还会验证 Nginx 和 Fail2ban 配置、每站点 `wp-config.php` 权限、`FORCE_SSL_ADMIN`、`DISALLOW_FILE_EDIT`、`WP_CACHE`、Redis Object Cache 连接、对外 HSTS 响应、证书文件、root-only 凭据文件权限，以及环境选择启用 UFW 时的实际状态。
+`security-scan` 不只检查服务是否启动，还会验证 Nginx 和 Fail2ban 配置、每站点 `wp-config.php` 权限、`FORCE_SSL_ADMIN`、`DISALLOW_FILE_EDIT`、`WP_CACHE`、Redis Object Cache 连接、证书文件、root-only 凭据文件权限，以及环境选择启用 UFW 时的实际状态。HSTS 会分别检查绕过 DNS/CDN 的本机 Nginx 源站和正常 DNS 访问的公网端点，因此可以区分服务器配置错误与 CDN/反向代理覆盖响应头。扫描还会检查当前 Redis 密钥是否意外出现在本机 wp-shell 日志中，但不会输出密钥内容。
 
 新建 WordPress 网站成功后，脚本会在当前交互式 SSH 终端中一次性显示登录地址、管理员用户名和自动生成的管理员密码。密码直接写入终端设备，不经过普通标准输出，因此不会被写入 `/var/log/wp-shell/` 的部署日志。
 
@@ -370,6 +370,8 @@ sudo wp-shell dashboard
 
 看板始终先从站点配置读取已登记域名，因此即使采集器尚未产生第一条样本，网站也会显示为 `NO DATA`，不会被误认为尚未添加。顶部同时显示 `collector OK`、`WAITING`、`STALE` 或 `FAILED`；出现 `FAILED` 时应运行 `sudo wp-shell metrics status` 查看采集器状态。
 
+顶部 CPU、内存和磁盘使用独立的等宽区域，宽屏下不会互相覆盖。CPU 是根据 `/proc/stat` 相邻采样差值计算的整机使用率；`Load` 是一分钟平均负载，并同时显示当前可用 CPU 核心数，便于判断负载是否接近 CPU 容量。
+
 建议终端至少为 `64x14`。如果窗口过小，看板会显示调整窗口的提示，而不是输出错位内容。
 
 ### 2. 看板快捷键
@@ -394,7 +396,7 @@ Overview 主要显示：
 - P95 响应时间
 - FastCGI 缓存命中率
 - PHP 活跃进程和进程上限
-- PHP RSS 内存
+- PHP PSS 内存
 - HTTP 状态
 - 综合健康提示
 
@@ -412,8 +414,10 @@ Resources 主要显示：
 - PHP 空闲进程
 - PHP 请求队列
 - PHP 最大进程数
-- PHP RSS 内存
+- PHP PSS 内存和 RSS sum
 - WordPress 文件、缓存和日志占用
+
+PSS 会把 PHP 进程共享页面按比例分摊，更接近这个 PHP-FPM pool 对物理内存的实际占用，因此 Overview 默认显示 PSS。`RSS sum` 是所有 pool 进程 RSS 的直接相加，其中共享的 PHP 库和 OPcache 页面会被重复计算，可能大于整机已用内存；它保留在 Resources 视图中用于观察趋势，不应直接当作站点独占内存。
 
 Operations 主要显示：
 
@@ -757,7 +761,7 @@ sudo wp-shell metrics install
 - FastCGI 缓存命中、未命中和绕过数量
 - PHP 活跃、空闲和排队进程
 - PHP 达到最大进程数的状态
-- PHP-FPM RSS 内存
+- PHP-FPM PSS 和 RSS sum 内存
 - HTTP 探测结果
 - TLS 剩余有效天数
 - 最近备份年龄
@@ -797,7 +801,7 @@ sudo wp-shell analyze 30d
 - 每个站点的 PHP 峰值活跃进程
 - PHP 请求队列
 - PHP 达到最大进程数的记录
-- PHP 峰值 RSS
+- PHP 峰值 PSS 和 RSS sum
 - P95 响应时间
 - MariaDB 连接和慢查询变化
 - Redis 峰值内存和淘汰数量
@@ -905,7 +909,7 @@ sudo wp-shell optimize
 /var/log/wp-shell/                        部署和管理日志
 ```
 
-配置和密码文件使用 root `0600` 权限。所有站点操作统一通过 `wp-shell` 执行，命令行中不包含数据库密码或 Redis 密码。
+配置和密码文件使用 root `0600` 权限。所有站点操作统一通过 `wp-shell` 执行，数据库密码和 Redis 密码通过受控标准输入或 `REDISCLI_AUTH` 传递，不作为命令行参数，也不在成功日志中回显。
 
 ## 十三、从旧版本升级
 
@@ -927,7 +931,27 @@ chmod +x wp-shell.sh
 sudo ./wp-shell.sh install
 ```
 
-### 2. 自动迁移的旧配置
+### 2. 从 v9.4.2 升级后的必要安全操作
+
+v9.4.2 在部署或修复网站时，WP-CLI 的成功信息可能把 Redis 密钥回显到 SSH 终端和对应的 `/var/log/wp-shell/` 日志。只要使用过该版本执行 `site add` 或 `site deploy`，就应把当前 Redis 密钥视为已经暴露。升级并安装 v9.4.3 后，先执行：
+
+```bash
+sudo wp-shell rotate-redis-secret
+sudo wp-shell security-scan
+```
+
+`rotate-redis-secret` 会完成以下操作：
+
+1. 验证旧密钥确实可以连接本机 Redis。
+2. 为 Redis 生成一个新的随机密钥并实时切换认证。
+3. 更新所有已登记 WordPress 网站的 `WP_REDIS_PASSWORD`。
+4. 如果任何站点更新失败，尽力把 Redis、配置文件和已更新站点回滚到旧密钥。
+5. 使用新密钥验证 Redis，并清理每个站点的缓存。
+6. 将本机 wp-shell 日志中与旧密钥完全匹配的内容替换为 `[REDACTED]`。
+
+脚本无法清除已经复制到聊天记录、SSH 客户端滚动缓冲区或其他外部系统中的旧密钥；轮换后旧密钥失效，因此不需要人工查看或复制新密钥。完成轮换和安全扫描后，再添加新网站。
+
+### 3. 自动迁移的旧配置
 
 当 `/etc/wp-shell/sites.v3` 不存在时，v9 会读取：
 
@@ -953,7 +977,7 @@ sudo ./wp-shell.sh install
 
 旧文件不会被自动删除。
 
-### 3. 旧备份和缓存迁移
+### 4. 旧备份和缓存迁移
 
 旧备份可能位于：
 
@@ -984,7 +1008,7 @@ sudo ./wp-shell.sh install
 
 迁移阶段执行缓存清理时会同时处理新旧缓存目录。
 
-### 4. 旧命令兼容
+### 5. 旧命令兼容
 
 以下旧文件名仍然可以运行：
 
@@ -1007,6 +1031,7 @@ sudo wp-shell ...
 - Redis 只监听 loopback，并启用 protected mode 和随机密码。
 - 每个站点使用不同 Redis DB 和域名前缀。
 - 数据库和 Redis 密码不会出现在 `wp-shell` 命令行中。
+- Redis 密钥更新使用无成功输出的受控调用；可以用 `sudo wp-shell rotate-redis-secret` 完成在线轮换和本机日志脱敏。
 - `wp-config.php` 使用 `0640` 权限。
 - WordPress 在线文件编辑默认关闭。
 - PHP-FPM status 使用本地 Unix socket，不通过 Nginx 暴露。
@@ -1110,6 +1135,19 @@ sudo wp-shell site deploy example.com
 ```
 
 修复过程会复用已有数据库、证书、WordPress 和管理员凭据，从中断的位置继续配置 permalink、Redis Object Cache 和可选插件。
+
+### 10. HSTS 检查提示公网端点覆盖策略
+
+先分别查看本机 Nginx 源站和正常公网访问的响应头：
+
+```bash
+sudo curl --resolve example.com:443:127.0.0.1 -sS -o /dev/null -D - \
+  https://example.com/wp-login.php | grep -i '^strict-transport-security:'
+curl -sS -o /dev/null -D - https://example.com/wp-login.php \
+  | grep -i '^strict-transport-security:'
+```
+
+wp-shell 管理的值是 `max-age=15552000`。如果源站返回该值，而公网端点返回 `max-age=0`、其他值或没有该响应头，说明 VPS 上的 Nginx 已正确配置，但域名前方的 CDN、负载均衡器或反向代理覆盖了响应头。此时应在对应代理服务中修正 HSTS，重复运行 `sudo wp-shell security-scan`，而不是反复重新部署 WordPress。
 
 ## 十六、开发和测试
 

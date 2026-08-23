@@ -33,11 +33,12 @@ collect_system_sample "$system_ts"
 [[ "$(sqlite3 "$METRICS_DB" 'SELECT COUNT(*) FROM system_samples;')" -eq 1 ]]
 ts="$(date +%s)"
 sqlite3 "$METRICS_DB" "INSERT INTO system_samples VALUES($ts,12.5,0.42,2048,1024,0,35,1000,2000);"
-sqlite3 "$METRICS_DB" "INSERT INTO site_samples VALUES($ts,'example.com',120,118,1,1,4096,45,120,80,20,20,2,3,0,5,0,160,200,80,12,512,8,4,1024);"
+sqlite3 "$METRICS_DB" "INSERT INTO site_samples VALUES($ts,'example.com',120,118,1,1,4096,45,120,80,20,20,2,3,0,5,0,160,200,80,12,512,8,4,1024,70);"
 sqlite3 "$METRICS_DB" "INSERT INTO service_samples VALUES($ts,4,1000,1,32,900,100,0);"
 report="$(metrics_report 1h)"
 grep -q 'example.com' <<< "$report"
 grep -q '120' <<< "$report"
+grep -q '70' <<< "$report"
 grep -q '12.5%' <<< "$report"
 status_output="$(show_metrics_status)"
 grep -q 'Samples: system=2 site=1 service=1' <<< "$status_output"
@@ -46,5 +47,9 @@ if grep -q 'Last sample: none' <<< "$status_output"; then
     printf 'Metrics status did not report the latest sample.\n' >&2
     exit 1
 fi
+
+sqlite3 "$METRICS_DB" 'DROP TABLE site_samples; CREATE TABLE site_samples (ts INTEGER NOT NULL, domain TEXT NOT NULL);'
+init_metrics_database >/dev/null
+sqlite3 "$METRICS_DB" 'PRAGMA table_info(site_samples);' | awk -F'|' '$2=="php_pss_mb" {found=1} END {exit !found}'
 
 printf 'Metrics database and report round-trip tests passed.\n'
