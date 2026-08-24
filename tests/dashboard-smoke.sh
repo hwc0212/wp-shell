@@ -33,6 +33,10 @@ SITE_TITLES[1]="Example"
 SITE_PATHS[1]="/var/www/example.com/public"
 save_sites_config
 init_metrics_database >/dev/null
+ts="$(date +%s)"
+sqlite3 "$METRICS_DB" "INSERT INTO system_samples VALUES($ts,3.5,0.14,4096,2800,0,11,1000,2000);"
+sqlite3 "$METRICS_DB" "INSERT INTO site_samples VALUES($((ts-60)),'example.com',10,10,0,0,1024,20,30,8,2,0,0,4,0,4,3,0,200,80,1,100,1,1,1,0);"
+sqlite3 "$METRICS_DB" "INSERT INTO site_samples VALUES($ts,'example.com',10,10,0,0,1024,20,30,8,2,0,0,4,0,4,3,0,200,80,1,100,1,1,1,0);"
 
 python3 - "$0" <<'PY'
 import fcntl
@@ -75,7 +79,9 @@ else:
 if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
     raise SystemExit("dashboard child failed")
 screen = captured.decode(errors="replace")
-if "example.com" not in screen or "NO DATA" not in screen:
-    raise SystemExit("dashboard did not show the registered site without samples: " + screen[-1000:])
+if "example.com" not in screen or "OK" not in screen:
+    raise SystemExit("dashboard did not show the healthy sampled site: " + screen[-1000:])
+if "PHP max" in screen:
+    raise SystemExit("dashboard treated an unchanged cumulative PHP max counter as a new alert")
 PY
 printf 'Dashboard interactive smoke test passed.\n'

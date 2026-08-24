@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.4.4
+# Version 9.4.5
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.4.4"
+readonly WP_SHELL_VERSION="9.4.5"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -249,6 +249,16 @@ site_index_by_domain() {
         fi
     done
     return 1
+}
+
+site_domain_from_selector() {
+    local selector="${1,,}" index
+    if [[ "$selector" =~ ^[1-9][0-9]*$ ]] && ((10#$selector <= SITE_COUNT)); then
+        printf '%s' "${SITE_DOMAINS[$((10#$selector))]}"
+        return 0
+    fi
+    index="$(site_index_by_domain "$selector")" || return 1
+    printf '%s' "${SITE_DOMAINS[$index]}"
 }
 
 reset_sites() {
@@ -2009,7 +2019,8 @@ list_backups() {
 }
 
 site_action() {
-    local domain="$1" action="${2:-status}" index wp_path
+    local selector="$1" domain action="${2:-status}" index wp_path
+    domain="$(site_domain_from_selector "$selector")" || die "Unknown site ID or domain: $selector"
     index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
     wp_path="$(site_wp_path "$domain")"
     case "$action" in
@@ -2486,8 +2497,22 @@ def fetch_data(modes):
         if latest:
             site = dict(latest)
             site["_has_sample"] = True
+            previous = connection.execute(
+                "SELECT php_max_reached FROM site_samples "
+                "WHERE domain=? AND ts<? ORDER BY ts DESC LIMIT 1",
+                (domain, latest["ts"]),
+            ).fetchone()
+            current_reached = int(latest["php_max_reached"] or 0)
+            previous_reached = int(previous[0] or 0) if previous is not None else None
+            site["_php_max_increased"] = bool(
+                previous_reached is not None
+                and (
+                    current_reached > previous_reached
+                    or (current_reached < previous_reached and current_reached > 0)
+                )
+            )
         else:
-            site = {"domain": domain, "_has_sample": False}
+            site = {"domain": domain, "_has_sample": False, "_php_max_increased": False}
         sites.append((site, dict(aggregate)))
     connection.close()
     return (dict(system) if system else {}, dict(service) if service else {}, sites)
@@ -2502,7 +2527,7 @@ def alert_for(site, agg):
         alerts.append(f"HTTP {code or 'DOWN'}")
     if int(site.get("php_queue", 0) or 0) > 0:
         alerts.append("PHP queue")
-    if int(site.get("php_max_reached", 0) or 0) > 0:
+    if site.get("_php_max_increased", False):
         alerts.append("PHP max")
     if int(site.get("tls_days", -1) or -1) < 14:
         alerts.append("TLS")
@@ -2720,7 +2745,7 @@ PY
 }
 
 build_tuning_recommendations() {
-    local output="$1" now since min_available_pct i domain current stats sample_count first_ts peak_active peak_queue reached recommended reason
+    local output="$1" now since min_available_pct i domain current stats sample_count first_ts peak_active peak_queue max_events recommended reason
     : > "$output"
     now="$(date +%s)"
     since=$((now - 1209600))
@@ -2728,12 +2753,12 @@ build_tuning_recommendations() {
     for ((i = 1; i <= SITE_COUNT; i++)); do
         domain="${SITE_DOMAINS[$i]}"
         current="${SITE_PHP_MAX_CHILDREN[$i]:-2}"
-        stats="$(sqlite3 -separator '|' "$METRICS_DB" "SELECT COUNT(*),COALESCE(MIN(ts),0),COALESCE(MAX(php_active),0),COALESCE(MAX(php_queue),0),COALESCE(MAX(php_max_reached),0) FROM site_samples WHERE domain='$domain' AND ts >= $since;")"
-        IFS='|' read -r sample_count first_ts peak_active peak_queue reached <<< "$stats"
+        stats="$(sqlite3 -separator '|' "$METRICS_DB" "WITH ordered AS (SELECT ts,php_active,php_queue,php_max_reached,LAG(php_max_reached) OVER (ORDER BY ts) AS previous_reached FROM site_samples WHERE domain='$domain' AND ts >= $since) SELECT COUNT(*),COALESCE(MIN(ts),0),COALESCE(MAX(php_active),0),COALESCE(MAX(php_queue),0),COALESCE(SUM(CASE WHEN previous_reached IS NULL THEN 0 WHEN php_max_reached >= previous_reached THEN php_max_reached-previous_reached ELSE php_max_reached END),0) FROM ordered;")"
+        IFS='|' read -r sample_count first_ts peak_active peak_queue max_events <<< "$stats"
         recommended="$current"
         reason="No high-confidence change"
         if ((sample_count >= 1000)) && awk -v p="$min_available_pct" 'BEGIN{exit !(p>=20)}'; then
-            if ((peak_queue > 0 || reached > 0)); then
+            if ((peak_queue > 0 || max_events > 0)); then
                 recommended=$((current + (current + 4) / 5))
                 ((recommended > 50)) && recommended=50
                 reason="Queue or pool saturation with at least 20% memory headroom"
@@ -2758,9 +2783,9 @@ analyze_metrics() {
     printf 'wp-shell resource analysis | range %s\n\n' "$range"
     sqlite3 -header -column "$METRICS_DB" "SELECT COUNT(*) AS Samples, printf('%.1f%%',MAX(cpu_pct)) AS 'Peak CPU', printf('%.1f%%',MIN(100.0*mem_available_mb/NULLIF(mem_total_mb,0))) AS 'Minimum free memory', printf('%.0f%%',MAX(disk_pct)) AS 'Peak disk' FROM system_samples WHERE ts >= $since;"
     printf '\nPer-site PHP evidence\n'
-    sqlite3 -header -column "$METRICS_DB" "SELECT domain AS Domain, COUNT(*) AS Samples, MAX(php_active) AS 'Peak active', MAX(php_queue) AS 'Peak queue', MAX(php_max_reached) AS 'Max reached', printf('%.0f MB',MAX(php_pss_mb)) AS 'Peak PSS', printf('%.0f MB',MAX(php_rss_mb)) AS 'Peak RSS sum', printf('%.0f ms',MAX(p95_ms)) AS 'Peak P95' FROM site_samples WHERE ts >= $since GROUP BY domain ORDER BY domain;"
+    sqlite3 -header -column "$METRICS_DB" "WITH ordered AS (SELECT *,LAG(php_max_reached) OVER (PARTITION BY domain ORDER BY ts) AS previous_reached FROM site_samples WHERE ts >= $since) SELECT domain AS Domain,COUNT(*) AS Samples,MAX(php_active) AS 'Peak active',MAX(php_queue) AS 'Peak queue',COALESCE(SUM(CASE WHEN previous_reached IS NULL THEN 0 WHEN php_max_reached >= previous_reached THEN php_max_reached-previous_reached ELSE php_max_reached END),0) AS 'New max events',printf('%.0f MB',MAX(php_pss_mb)) AS 'Peak PSS',printf('%.0f MB',MAX(php_rss_mb)) AS 'Peak RSS sum',printf('%.0f ms',MAX(p95_ms)) AS 'Peak P95' FROM ordered GROUP BY domain ORDER BY domain;"
     printf '\nShared services\n'
-    sqlite3 -header -column "$METRICS_DB" "SELECT MAX(mariadb_threads) AS 'Peak DB threads', MAX(mariadb_slow_queries)-MIN(mariadb_slow_queries) AS 'New slow queries', printf('%.1f MB',MAX(redis_used_mb)) AS 'Peak Redis', MAX(redis_evicted)-MIN(redis_evicted) AS 'Redis evictions' FROM service_samples WHERE ts >= $since;"
+    sqlite3 -header -column "$METRICS_DB" "WITH ordered AS (SELECT *,LAG(mariadb_slow_queries) OVER (ORDER BY ts) AS previous_slow,LAG(redis_evicted) OVER (ORDER BY ts) AS previous_evicted FROM service_samples WHERE ts >= $since) SELECT MAX(mariadb_threads) AS 'Peak DB threads',COALESCE(SUM(CASE WHEN previous_slow IS NULL THEN 0 WHEN mariadb_slow_queries >= previous_slow THEN mariadb_slow_queries-previous_slow ELSE mariadb_slow_queries END),0) AS 'New slow queries',printf('%.1f MB',MAX(redis_used_mb)) AS 'Peak Redis',COALESCE(SUM(CASE WHEN previous_evicted IS NULL THEN 0 WHEN redis_evicted >= previous_evicted THEN redis_evicted-previous_evicted ELSE redis_evicted END),0) AS 'Redis evictions' FROM ordered;"
     printf '\nConfigured budget: MariaDB %sMB | Redis %sMB | PHP-FPM %sMB\n' "$MARIADB_BUFFER_MB" "$REDIS_MAX_MEMORY_MB" "$PHP_TOTAL_BUDGET_MB"
     recommendation_file="$STATE_DIR/last-recommendations.tsv"
     build_tuning_recommendations "$recommendation_file"
@@ -3118,11 +3143,12 @@ prepare_imported_monitoring() {
 }
 
 transfer_imported_site() {
-    local domain index email php_version
+    local selector domain index email php_version
     ((SITE_COUNT > 0)) || import_existing_sites
     ((SITE_COUNT > 0)) || die "No WordPress sites could be imported."
     list_sites
-    read -r -p "Domain to transfer to wp-shell: " domain
+    read -r -p "Site ID or domain to transfer to wp-shell: " selector
+    domain="$(site_domain_from_selector "$selector")" || die "Unknown site ID or domain: $selector"
     index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
     if [[ "${SITE_MODES[$index]}" != "imported" ]]; then
         die "$domain is already managed by wp-shell."
@@ -3196,26 +3222,26 @@ management_menu() {
                 return
             fi
             list_sites
-            read -r -p "Domain (leave empty for all sites): " domain
+            read -r -p "Site ID or domain (leave empty for all sites): " domain
             if [[ -n "$domain" ]]; then site_action "$domain" status; else status_all_sites; fi
             ;;
         5)
             ((SITE_COUNT > 0)) || die "No sites are registered. Use option 2 or 9 first."
             list_sites
-            read -r -p "Domain to deploy or repair: " domain
+            read -r -p "Site ID or domain to deploy or repair: " domain
             deploy_domain "$domain"
             ;;
         6)
             ((SITE_COUNT > 0)) || die "No sites are registered."
             list_sites
-            read -r -p "Domain to back up: " domain
+            read -r -p "Site ID or domain to back up: " domain
             site_action "$domain" backup
             ;;
         7) ((SITE_COUNT > 0)) || die "No sites are registered."; backup_all_sites ;;
         8)
             ((SITE_COUNT > 0)) || die "No sites are registered."
             list_sites
-            read -r -p "Domain: " domain
+            read -r -p "Site ID or domain: " domain
             site_action "$domain" backups
             read -r -p "Backup ID: " backup_id
             site_action "$domain" restore "$backup_id"
@@ -3261,15 +3287,15 @@ Usage:
   sudo wp-shell tune --apply [--yes]             Apply safe PHP-FPM recommendations
   sudo wp-shell site add                         Add and deploy a site
   sudo wp-shell site list                        List managed and imported sites
-  sudo wp-shell site status [DOMAIN]             Show site status
-  sudo wp-shell site DOMAIN summary              Show the website deployment summary
-  sudo wp-shell site deploy DOMAIN               Idempotently deploy or repair a site
+  sudo wp-shell site status [DOMAIN|ID]          Show site status
+  sudo wp-shell site DOMAIN|ID summary           Show the website deployment summary
+  sudo wp-shell site deploy DOMAIN|ID            Idempotently deploy or repair a site
   sudo wp-shell site import                      Discover existing WordPress sites
-  sudo wp-shell site DOMAIN ACTION               Run a compatibility site action
+  sudo wp-shell site DOMAIN|ID ACTION            Run a compatibility site action
   sudo wp-shell metrics collect                  Collect one local metrics sample
   sudo wp-shell metrics install                  Install the one-minute collector
   sudo wp-shell backup-all                       Back up all sites
-  sudo wp-shell restore DOMAIN BACKUP_ID         Restore one backup
+  sudo wp-shell restore DOMAIN|ID BACKUP_ID      Restore one backup
   sudo wp-shell optimize                         Reapply the resource budget
   sudo wp-shell rotate-redis-secret              Rotate Redis auth and redact matching logs
   sudo wp-shell security-scan                    Validate services, TLS, and permissions
@@ -3281,7 +3307,8 @@ EOF
 }
 
 deploy_domain() {
-    local domain="$1" index
+    local selector="$1" domain index
+    domain="$(site_domain_from_selector "$selector")" || die "Unknown site ID or domain: $selector"
     index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
     prepare_stack
     deploy_site "$index"
@@ -3302,7 +3329,7 @@ site_command() {
                 status_all_sites
             fi
             ;;
-        deploy) [[ -n "${2:-}" ]] || die "Usage: wp-shell site deploy DOMAIN"; deploy_domain "$2" ;;
+        deploy) [[ -n "${2:-}" ]] || die "Usage: wp-shell site deploy DOMAIN|ID"; deploy_domain "$2" ;;
         import) import_existing_sites; install_self ;;
         *) site_action "$subcommand" "${2:-status}" "${3:-}" ;;
     esac
@@ -3320,7 +3347,7 @@ legacy_single_command() {
     if [[ -z "$domain" && "$SITE_COUNT" -eq 1 ]]; then
         domain="${SITE_DOMAINS[1]}"
     fi
-    [[ -n "$domain" ]] || die "The legacy single-site command is ambiguous; use 'wp-shell site DOMAIN ACTION'."
+    [[ -n "$domain" ]] || die "The legacy single-site command is ambiguous; use 'wp-shell site DOMAIN|ID ACTION'."
     case "$command" in
         deploy|--reconfigure) deploy_domain "$domain" ;;
         manage) site_action "$domain" "${2:-status}" "${3:-}" ;;
@@ -3355,11 +3382,11 @@ execute_command() {
         list) list_sites ;;
         status) status_all_sites ;;
         add-site) add_site_command ;;
-        deploy) [[ -n "${2:-}" ]] || die "A domain is required."; deploy_domain "$2" ;;
+        deploy) [[ -n "${2:-}" ]] || die "A site ID or domain is required."; deploy_domain "$2" ;;
         import) import_existing_sites; install_self ;;
         backup-all) backup_all_sites ;;
-        backup) [[ -n "${2:-}" ]] || die "A domain is required."; site_action "$2" backup ;;
-        restore) [[ -n "${2:-}" && -n "${3:-}" ]] || die "Usage: restore DOMAIN BACKUP_ID"; site_action "$2" restore "$3" ;;
+        backup) [[ -n "${2:-}" ]] || die "A site ID or domain is required."; site_action "$2" backup ;;
+        restore) [[ -n "${2:-}" && -n "${3:-}" ]] || die "Usage: restore DOMAIN|ID BACKUP_ID"; site_action "$2" restore "$3" ;;
         optimize) configure_mariadb; configure_redis; configure_php ;;
         rotate-redis-secret) rotate_redis_secret ;;
         security-scan) security_scan ;;

@@ -48,6 +48,13 @@ if grep -q 'Last sample: none' <<< "$status_output"; then
     exit 1
 fi
 
+sqlite3 "$METRICS_DB" "INSERT INTO site_samples (ts,domain,php_active,php_max_children,php_max_reached,http_code,tls_days,backup_age_hours) VALUES($((ts+1)),'example.com',2,5,0,200,80,1),($((ts+2)),'example.com',2,5,2,200,80,1),($((ts+3)),'example.com',2,5,0,200,80,1),($((ts+4)),'example.com',2,5,1,200,80,1);"
+sqlite3 "$METRICS_DB" "INSERT INTO service_samples (ts,mariadb_threads,mariadb_slow_queries,redis_used_mb,redis_evicted) VALUES($((ts+1)),5,3,32,2),($((ts+2)),5,0,32,0),($((ts+3)),5,1,32,1);"
+analysis="$(analyze_metrics 1h)"
+grep -q 'New max events' <<< "$analysis"
+grep -Eq 'example\.com[[:space:]]+5[[:space:]]+2[[:space:]]+0[[:space:]]+3' <<< "$analysis"
+grep -Eq '5[[:space:]]+3[[:space:]]+32\.0 MB[[:space:]]+3' <<< "$analysis"
+
 sqlite3 "$METRICS_DB" 'DROP TABLE site_samples; CREATE TABLE site_samples (ts INTEGER NOT NULL, domain TEXT NOT NULL);'
 init_metrics_database >/dev/null
 sqlite3 "$METRICS_DB" 'PRAGMA table_info(site_samples);' | awk -F'|' '$2=="php_pss_mb" {found=1} END {exit !found}'

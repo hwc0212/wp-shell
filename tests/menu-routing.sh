@@ -128,4 +128,27 @@ grep -q 'Back up all websites' <<< "$output"
 grep -q 'INSTALL_SELF_CALLED' <<< "$output"
 grep -q 'LIST_CALLED' <<< "$output"
 
+SITE_COUNT=2
+SITE_DOMAINS[1]="example.com"
+SITE_DOMAINS[2]="second.example.com"
+SITE_PRIMARY_DOMAINS[2]="second.example.com"
+SITE_PHP_VERSIONS[2]="8.3"
+SITE_PATHS[2]="/var/www/second.example.com/public"
+backup_site() { printf 'BACKUP_CALLED:%s\n' "$1"; }
+output="$(management_menu <<< $'6\n2')"
+grep -q 'BACKUP_CALLED:2' <<< "$output"
+site_status() { printf 'STATUS_CALLED:%s\n' "$1"; }
+output="$(site_action 2 status)"
+grep -q 'STATUS_CALLED:2' <<< "$output"
+restore_site() { printf 'RESTORE_CALLED:%s:%s\n' "$1" "$2"; }
+output="$(site_action 2 restore 20260824-020000)"
+grep -q 'RESTORE_CALLED:2:20260824-020000' <<< "$output"
+prepare_stack() { printf 'PREPARE_STACK_CALLED\n'; }
+deploy_site() { printf 'DEPLOY_CALLED:%s\n' "$1"; }
+install_metrics_timer() { printf 'METRICS_TIMER_CALLED\n'; }
+show_site_deployment_summary() { printf 'SUMMARY_CALLED:%s\n' "$1"; }
+output="$(deploy_domain 2)"
+grep -q 'DEPLOY_CALLED:2' <<< "$output"
+grep -q 'SUMMARY_CALLED:2' <<< "$output"
+
 printf 'Context-aware menu routing tests passed.\n'

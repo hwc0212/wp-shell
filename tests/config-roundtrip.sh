@@ -38,6 +38,12 @@ load_sites_config
 [[ "${SITE_MODES[1]}" == "managed" ]]
 [[ "${SITE_TITLES[1]}" == "$dangerous_title" ]]
 [[ ! -e /tmp/wp-shell-must-not-execute ]]
+[[ "$(site_domain_from_selector 1)" == "example.com" ]]
+[[ "$(site_domain_from_selector EXAMPLE.COM)" == "example.com" ]]
+if site_domain_from_selector 0 >/dev/null 2>&1 || site_domain_from_selector 2 >/dev/null 2>&1; then
+    printf 'An invalid site selector was accepted.\n' >&2
+    exit 1
+fi
 [[ "$(first_available_redis_database)" == "1" ]]
 [[ "$(site_pool_socket example.com)" != "$(site_pool_socket second.example.com)" ]]
 [[ "$(database_config_path example.com)" != "$(database_config_path second.example.com)" ]]

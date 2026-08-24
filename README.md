@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.4.4
+- 当前版本：`wp-shell.sh` v9.4.5
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -248,7 +248,7 @@ sudo cat /root/wordpress-credentials-example.com.txt
 
 首次登录后，建议把密码保存到密码管理器，然后删除服务器上的明文凭据文件。
 
-一次性密码区块只在真正创建 WordPress 管理员账号的那次交互式部署中显示。以后运行 `site DOMAIN summary`、修复已有网站或打开菜单，都不会再次把密码打印到终端。通过管道、定时任务或其他无交互终端方式部署时也不会显示密码，应使用上面的 `sudo cat` 命令读取 root-only 凭据文件。
+一次性密码区块只在真正创建 WordPress 管理员账号的那次交互式部署中显示。以后运行 `site DOMAIN|ID summary`、修复已有网站或打开菜单，都不会再次把密码打印到终端。通过管道、定时任务或其他无交互终端方式部署时也不会显示密码，应使用上面的 `sudo cat` 命令读取 root-only 凭据文件。
 
 ### 6. WordPress 语言
 
@@ -316,7 +316,7 @@ sudo ./wp-shell.sh
 - `4`：显示检测到的 Nginx、PHP-FPM、数据库状态和 `wp-config.php` 路径。
 - `5`：显示命令帮助。
 
-建议先选择 `1`，运行备份并核对网站列表。确认无误后，再重新运行 `sudo wp-shell`，通过管理菜单或 `site deploy DOMAIN` 接管单个网站。
+建议先选择 `1`，运行备份并核对网站列表。确认无误后，再重新运行 `sudo wp-shell`，通过管理菜单或 `site deploy DOMAIN|ID` 接管单个网站。
 
 选择 `3` 接管站点时，脚本还会询问目标 PHP 版本、是否包含 `www` 和证书管理员邮箱。接管会生成新的 Nginx/PHP-FPM/缓存配置，启用 wp-shell Redis 设置，并把站点文件权限统一为 `www-data`。该操作前必须准备独立的网站和数据库备份。
 
@@ -345,6 +345,8 @@ sudo ./wp-shell.sh
 
 这个菜单把日常使用频率最高的看板、建站、列表、备份、恢复和资源分析集中在一屏内。每次选择完成后脚本退出，避免在 SSH 中保留不必要的长期管理进程；需要继续操作时重新执行 `sudo wp-shell` 即可。
 
+网站列表第一列的 `ID` 可以直接用于状态、修复、备份、恢复和已有站点接管。所有显示网站列表的输入框都同时接受站点编号或基础域名。例如列表中的第二个网站既可以输入 `2`，也可以输入完整基础域名。编号只代表当前列表顺序；脚本会先把编号解析为登记域名，再执行文件、数据库或服务操作，编号本身不会进入目录路径或 Nginx 配置。
+
 ### 4. 直接执行命令
 
 菜单只是常用功能入口，所有功能仍可直接调用：
@@ -353,6 +355,8 @@ sudo ./wp-shell.sh
 ```bash
 sudo wp-shell dashboard
 sudo wp-shell site list
+sudo wp-shell site status 2
+sudo wp-shell backup 2
 sudo wp-shell backup-all
 sudo wp-shell report 24h
 sudo wp-shell --help
@@ -417,7 +421,7 @@ Resources 主要显示：
 - PHP PSS 内存和 RSS sum
 - WordPress 文件、缓存和日志占用
 
-PSS 会把 PHP 进程共享页面按比例分摊，更接近这个 PHP-FPM pool 对物理内存的实际占用，因此 Overview 默认显示 PSS。`RSS sum` 是所有 pool 进程 RSS 的直接相加，其中共享的 PHP 库和 OPcache 页面会被重复计算，可能大于整机已用内存；它保留在 Resources 视图中用于观察趋势，不应直接当作站点独占内存。
+PSS 会把 PHP 进程共享页面按比例分摊，更接近这个 PHP-FPM pool 对物理内存的实际占用，因此 Overview 默认显示 PSS。`RSS sum` 是所有 pool 进程 RSS 的直接相加，其中共享的 PHP 库和 OPcache 页面会被重复计算，可能大于整机已用内存；它保留在 Resources 视图中用于观察趋势，不应直接当作站点独占内存。站点使用 `ondemand` PHP-FPM 时，空闲一段时间后可能没有常驻子进程，此时 `PHP 0/N` 和 `PSS 0MB` 是正常的空闲状态，请求到达后会自动创建进程。
 
 Operations 主要显示：
 
@@ -436,6 +440,8 @@ Alerts 会集中显示：
 - TLS 即将过期
 - 缺少备份或备份过旧
 - 5xx 比例异常
+
+`PHP max` 只表示最新一分钟出现了新的 PHP-FPM 进程池饱和事件，不会因旧累计值长期保留。`Backup` 表示尚无本地备份或最近备份超过 48 小时；新网站完成第一次手动或定时备份并等待下一次采样后，该提示会自动消失。
 
 ### 4. 非交互式报告
 
@@ -641,7 +647,10 @@ sudo wp-shell site deploy example.com
 
 ```bash
 sudo wp-shell backup example.com
+sudo wp-shell backup 2
 ```
+
+域名和站点列表中的 `ID` 均可使用。交互菜单选择 `Back up one website` 后同样可以输入这两种形式。
 
 ### 2. 备份所有网站
 
@@ -653,6 +662,7 @@ sudo wp-shell backup-all
 
 ```bash
 sudo wp-shell site example.com backups
+sudo wp-shell site 2 backups
 ```
 
 备份编号格式类似：
@@ -665,6 +675,7 @@ sudo wp-shell site example.com backups
 
 ```bash
 sudo wp-shell restore example.com 20260817-020000
+sudo wp-shell restore 2 20260817-020000
 ```
 
 恢复流程会：
@@ -800,7 +811,7 @@ sudo wp-shell analyze 30d
 - 峰值磁盘占用
 - 每个站点的 PHP 峰值活跃进程
 - PHP 请求队列
-- PHP 达到最大进程数的记录
+- PHP 达到最大进程数的新增事件
 - PHP 峰值 PSS 和 RSS sum
 - P95 响应时间
 - MariaDB 连接和慢查询变化
@@ -846,6 +857,8 @@ sudo wp-shell tune --apply --yes
 ```
 
 MariaDB 和 Redis 的分析结果目前只作为建议展示，不会仅凭聚合计数自动改写它们的内存配置。这样可以避免在缺少 buffer pool 命中率、业务峰值和磁盘延迟背景时做出危险调整。
+
+PHP-FPM 的 `max children reached`、MariaDB 慢查询和 Redis 淘汰都是服务启动以来的累计计数器。v9.4.5 起，看板只在最近两次采样之间出现新增 PHP 饱和事件时显示 `PHP max`；历史分析和自动调优也按相邻样本的正向增量统计。计数器保持不变不会持续告警；服务重启造成计数器归零不会被误算成负数，重启后新产生的事件仍会计入。
 
 ### 4. 重新应用初始资源预算
 
@@ -935,7 +948,7 @@ sudo ./wp-shell.sh install
 
 v9.4.2 在部署或修复网站时，WP-CLI 的成功信息可能把 Redis 密钥回显到 SSH 终端和对应的 `/var/log/wp-shell/` 日志。只要使用过该版本执行 `site add` 或 `site deploy`，就应把当前 Redis 密钥视为已经暴露。
 
-v9.4.3 首次提供的轮换命令错误地尝试用 `--prompt=value` 填充 WP-CLI 必需的位置参数。真实 WP-CLI 会显示 `wp config set <name> <value>` 用法并拒绝执行；脚本随后会回滚 Redis 和已修改配置，因此不会留下半完成轮换，但旧密钥仍然有效、旧日志也仍需脱敏。升级并安装 v9.4.4 后，先执行：
+v9.4.3 首次提供的轮换命令错误地尝试用 `--prompt=value` 填充 WP-CLI 必需的位置参数。真实 WP-CLI 会显示 `wp config set <name> <value>` 用法并拒绝执行；脚本随后会回滚 Redis 和已修改配置，因此不会留下半完成轮换，但旧密钥仍然有效、旧日志也仍需脱敏。升级并安装 v9.4.4 或更新版本后，先执行：
 
 ```bash
 sudo wp-shell rotate-redis-secret

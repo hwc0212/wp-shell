@@ -27,7 +27,7 @@ if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.s
 fi
 
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
-grep -Fq 'readonly WP_SHELL_VERSION="9.4.4"' "$repo_root/wp-shell.sh"
+grep -Fq 'readonly WP_SHELL_VERSION="9.4.5"' "$repo_root/wp-shell.sh"
 grep -Fq "} > \"\$TERMINAL_DEVICE\"" "$repo_root/wp-shell.sh"
 grep -Fq 'END {printf "%d %d\n", rx, tx}' "$repo_root/wp-shell.sh"
 grep -Fq 'php_pss_mb REAL NOT NULL DEFAULT 0' "$repo_root/wp-shell.sh"
