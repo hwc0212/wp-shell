@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.4.5
+- 当前版本：`wp-shell.sh` v9.4.6
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -859,6 +859,8 @@ sudo wp-shell tune --apply --yes
 MariaDB 和 Redis 的分析结果目前只作为建议展示，不会仅凭聚合计数自动改写它们的内存配置。这样可以避免在缺少 buffer pool 命中率、业务峰值和磁盘延迟背景时做出危险调整。
 
 PHP-FPM 的 `max children reached`、MariaDB 慢查询和 Redis 淘汰都是服务启动以来的累计计数器。v9.4.5 起，看板只在最近两次采样之间出现新增 PHP 饱和事件时显示 `PHP max`；历史分析和自动调优也按相邻样本的正向增量统计。计数器保持不变不会持续告警；服务重启造成计数器归零不会被误算成负数，重启后新产生的事件仍会计入。
+
+手动运行 `sudo wp-shell metrics collect` 成功时不会输出内容。v9.4.5 曾把 SQLite WAL checkpoint 的内部结果 `0|0|0` 打印到终端；该字符串不代表采样数量为零或采集失败，v9.4.6 已隐藏这项内部输出。采样数量应通过 `sudo wp-shell metrics status` 查看。
 
 ### 4. 重新应用初始资源预算
 

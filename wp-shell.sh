@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.4.5
+# Version 9.4.6
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.4.5"
+readonly WP_SHELL_VERSION="9.4.6"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -2297,7 +2297,7 @@ collect_metrics() {
     for ((i = 1; i <= SITE_COUNT; i++)); do
         collect_site_sample "$ts" "$i"
     done
-    sqlite3 "$METRICS_DB" "DELETE FROM system_samples WHERE ts < $((ts - 2592000)); DELETE FROM site_samples WHERE ts < $((ts - 2592000)); DELETE FROM service_samples WHERE ts < $((ts - 2592000)); PRAGMA wal_checkpoint(PASSIVE);"
+    sqlite3 "$METRICS_DB" "DELETE FROM system_samples WHERE ts < $((ts - 2592000)); DELETE FROM site_samples WHERE ts < $((ts - 2592000)); DELETE FROM service_samples WHERE ts < $((ts - 2592000)); PRAGMA wal_checkpoint(PASSIVE);" >/dev/null
 }
 
 show_metrics_status() {

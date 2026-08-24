@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# shellcheck disable=SC1091,SC2034
+# shellcheck disable=SC1091,SC2034,SC2218
 
 set -Eeuo pipefail
 
@@ -54,6 +54,13 @@ analysis="$(analyze_metrics 1h)"
 grep -q 'New max events' <<< "$analysis"
 grep -Eq 'example\.com[[:space:]]+5[[:space:]]+2[[:space:]]+0[[:space:]]+3' <<< "$analysis"
 grep -Eq '5[[:space:]]+3[[:space:]]+32\.0 MB[[:space:]]+3' <<< "$analysis"
+
+calculate_resource_budget() { :; }
+collect_system_sample() { :; }
+collect_service_sample() { :; }
+collect_site_sample() { :; }
+collector_output="$(collect_metrics)"
+[[ -z "$collector_output" ]]
 
 sqlite3 "$METRICS_DB" 'DROP TABLE site_samples; CREATE TABLE site_samples (ts INTEGER NOT NULL, domain TEXT NOT NULL);'
 init_metrics_database >/dev/null
