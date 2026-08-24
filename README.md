@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.4.6
+- 当前版本：`wp-shell.sh` v9.4.7
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -230,7 +230,7 @@ systemctl status wp-shell-backup.timer
 systemctl status wp-shell-metrics.timer
 ```
 
-`security-scan` 不只检查服务是否启动，还会验证 Nginx 和 Fail2ban 配置、每站点 `wp-config.php` 权限、`FORCE_SSL_ADMIN`、`DISALLOW_FILE_EDIT`、`WP_CACHE`、Redis Object Cache 连接、证书文件、root-only 凭据文件权限，以及环境选择启用 UFW 时的实际状态。HSTS 会分别检查绕过 DNS/CDN 的本机 Nginx 源站和正常 DNS 访问的公网端点，因此可以区分服务器配置错误与 CDN/反向代理覆盖响应头。扫描还会检查当前 Redis 密钥是否意外出现在本机 wp-shell 日志中，但不会输出密钥内容。
+`security-scan` 不只检查服务是否启动，还会验证 Nginx 和 Fail2ban 配置、每站点 `wp-config.php` 权限、`FORCE_SSL_ADMIN`、`DISALLOW_FILE_EDIT`、`WP_CACHE`、Redis Object Cache 连接、WordPress 核心严格校验、证书文件、root-only 凭据文件权限，以及环境选择启用 UFW 时的实际状态。HSTS 会分别检查绕过 DNS/CDN 的本机 Nginx 源站和正常 DNS 访问的公网端点，因此可以区分服务器配置错误与 CDN/反向代理覆盖响应头。扫描还会检查当前 Redis 密钥是否意外出现在本机 wp-shell 日志中，但不会输出密钥内容。
 
 新建 WordPress 网站成功后，脚本会在当前交互式 SSH 终端中一次性显示登录地址、管理员用户名和自动生成的管理员密码。密码直接写入终端设备，不经过普通标准输出，因此不会被写入 `/var/log/wp-shell/` 的部署日志。
 
@@ -573,7 +573,23 @@ sudo wp-shell site example.com update
 
 生产网站建议先在测试环境确认插件和主题兼容性。
 
-### 6. 清理单站点缓存
+### 6. 验证和修复 WordPress 核心
+
+严格验证核心文件：
+
+```bash
+sudo wp-shell site example.com core-verify
+```
+
+如果存在缺失、校验失败或核心目录中的额外文件，执行：
+
+```bash
+sudo wp-shell site example.com core-repair
+```
+
+修复命令会先创建完整网站备份，再从 WordPress 官方 API 获取与当前版本和语言匹配的 ZIP 包，强制覆盖核心文件、保留 `wp-content`、`wp-config.php` 和数据库，并删除校验明确报告的异常核心文件。完成后会再次执行严格校验、恢复权限并清理缓存。
+
+### 7. 清理单站点缓存
 
 ```bash
 sudo wp-shell site example.com cache-clear
@@ -581,13 +597,15 @@ sudo wp-shell site example.com cache-clear
 
 它只会清理该域名的 FastCGI 缓存和 WordPress 对象缓存，不会执行 Redis `FLUSHDB`，因此不会影响其他网站。
 
-### 7. 统一站点操作语法
+### 8. 统一站点操作语法
 
 不再生成 `manage-DOMAIN` 类型的每站点脚本。所有站点操作统一使用：
 
 ```bash
 sudo wp-shell site example.com status
 sudo wp-shell site example.com info
+sudo wp-shell site example.com core-verify
+sudo wp-shell site example.com core-repair
 sudo wp-shell site example.com cache-clear
 sudo wp-shell site example.com backup
 sudo wp-shell site example.com backups
@@ -968,7 +986,21 @@ sudo wp-shell security-scan
 
 脚本无法清除已经复制到聊天记录、SSH 客户端滚动缓冲区或其他外部系统中的旧密钥；轮换后旧密钥失效，因此不需要人工查看或复制新密钥。完成轮换和安全扫描后，再添加新网站。
 
-### 3. 自动迁移的旧配置
+### 3. 从 v9.4.6 或更早版本升级后的 WordPress 7.x 核心修复
+
+WP-CLI 2.12.0 使用 PHP `PharData` 解压 WordPress 7.x 的 tar 包时，可能把超过 100 个字符的路径静默截断。v9.4.6 及更早版本调用默认 `wp core download`，因此由这些版本新建的 WordPress 7.x 网站可能存在缺失的长路径核心文件及对应的截断文件。
+
+v9.4.7 改为只使用 WordPress 官方 ZIP 包，并在下载后执行严格校验。升级后，应对每个由旧版脚本创建的 WordPress 7.x 网站运行一次：
+
+```bash
+sudo wp-shell site 1 core-repair
+sudo wp-shell site 2 core-repair
+sudo wp-shell security-scan
+```
+
+`core-repair` 会自动备份，不会修改 `wp-content`、`wp-config.php` 或数据库。普通 WP-CLI 校验即使发现额外文件仍可能以退出码 0 结束；wp-shell 的严格校验会把缺失文件和额外文件都视为失败。
+
+### 4. 自动迁移的旧配置
 
 当 `/etc/wp-shell/sites.v3` 不存在时，v9 会读取：
 
@@ -1049,7 +1081,8 @@ sudo wp-shell ...
 - 每个站点使用不同 Redis DB 和域名前缀。
 - 数据库和 Redis 密码不会出现在 `wp-shell` 命令行中。
 - Redis 密钥更新使用无成功输出的受控调用；可以用 `sudo wp-shell rotate-redis-secret` 完成在线轮换和本机日志脱敏。
-- Nginx 阻止通过 HTTP 直接访问 WordPress 上传目录 PHP、`wp-admin/includes`、include-only 核心 PHP、`wp-config.php` 和示例配置等敏感文件。
+- Nginx 阻止通过 HTTP 直接访问 WordPress 上传目录 PHP、`wp-admin/includes`、include-only 核心 PHP、`wp-config.php`、日志、SQL、INI 和备份后缀等敏感文件。
+- 新网站从 WordPress 官方 ZIP 包安装，并立即执行严格核心校验；核心修复会先自动备份。
 - `wp-config.php` 使用 `0640` 权限。
 - WordPress 在线文件编辑默认关闭。
 - PHP-FPM status 使用本地 Unix socket，不通过 Nginx 暴露。

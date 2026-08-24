@@ -27,8 +27,11 @@ if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.s
 fi
 
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
-grep -Fq 'readonly WP_SHELL_VERSION="9.4.6"' "$repo_root/wp-shell.sh"
+grep -Fq 'readonly WP_SHELL_VERSION="9.4.7"' "$repo_root/wp-shell.sh"
 grep -Fq 'PRAGMA wal_checkpoint(PASSIVE);" >/dev/null' "$repo_root/wp-shell.sh"
+grep -Fq 'core download "$download_url" --force --skip-content --locale="$locale"' "$repo_root/wp-shell.sh"
+grep -Fq 'verify_wordpress_core_strict "$domain"' "$repo_root/wp-shell.sh"
+grep -Fq 'core-repair) repair_wordpress_core "$index"' "$repo_root/wp-shell.sh"
 grep -Fq "} > \"\$TERMINAL_DEVICE\"" "$repo_root/wp-shell.sh"
 grep -Fq 'END {printf "%d %d\n", rx, tx}' "$repo_root/wp-shell.sh"
 grep -Fq 'php_pss_mb REAL NOT NULL DEFAULT 0' "$repo_root/wp-shell.sh"
@@ -57,6 +60,7 @@ if grep -q '^readonly VERSION=' "$repo_root/wp-shell.sh"; then
 fi
 grep -Fq "readonly ENVIRONMENT_CONFIG_FILE=\"\$CONFIG_DIR/environment.v1\"" "$repo_root/wp-shell.sh"
 grep -Fq "readonly WORDPRESS_LOCALE=\"\${WORDPRESS_LOCALE:-en_US}\"" "$repo_root/wp-shell.sh"
+grep -Fq 'readonly WORDPRESS_VERSION_API="https://api.wordpress.org/core/version-check/1.7/"' "$repo_root/wp-shell.sh"
 grep -Fq "fastcgi_pass unix:\$pool_socket;" "$repo_root/wp-shell.sh"
 grep -Fq 'It intentionally excludes client IPs, cookies, and query strings.' "$repo_root/wp-shell.sh"
 if grep -q 'install_site_wrapper' "$repo_root/wp-shell.sh"; then

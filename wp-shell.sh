@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.4.6
+# Version 9.4.7
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.4.6"
+readonly WP_SHELL_VERSION="9.4.7"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -30,6 +30,7 @@ readonly LOG_FILE
 readonly MANAGED_SCRIPT="/usr/local/sbin/wp-shell"
 readonly WP_CLI_VERSION="${WP_CLI_VERSION:-2.12.0}"
 readonly WORDPRESS_LOCALE="${WORDPRESS_LOCALE:-en_US}"
+readonly WORDPRESS_VERSION_API="https://api.wordpress.org/core/version-check/1.7/"
 readonly BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
 readonly TERMINAL_DEVICE="${WP_SHELL_TERMINAL_DEVICE:-/dev/tty}"
 
@@ -1294,6 +1295,10 @@ server {
         deny all;
     }
 
+    location ~* \.(?:log|sql|ini|conf|bak|old|orig|save|swp)$ {
+        deny all;
+    }
+
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:$pool_socket;
@@ -1474,9 +1479,83 @@ set_site_permissions() {
     chown -R root:root "$(site_backup_dir "$domain")"
 }
 
+wordpress_release_zip_url() {
+    local locale="${1:-en_US}" version="${2:-}" response url
+    [[ "$locale" =~ ^[A-Za-z0-9_@.-]+$ ]] || die "Invalid WordPress locale: $locale"
+    [[ -z "$version" || "$version" =~ ^[0-9]+([.][0-9]+){1,2}$ ]] || die "Invalid WordPress version: $version"
+    response="$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --get --data-urlencode "locale=$locale" "$WORDPRESS_VERSION_API")" || \
+        die "The official WordPress version API could not be reached."
+    url="$(jq -r --arg locale "$locale" --arg version "$version" \
+        '[.offers[] | select(.locale == $locale and ($version == "" or .current == $version)) | (.packages.full // .download) | select(type == "string" and endswith(".zip"))][0] // empty' \
+        <<< "$response")"
+    [[ "$url" =~ ^https://downloads[.](wordpress[.]org|w[.]org)/release/[A-Za-z0-9_./@-]+[.]zip$ ]] || \
+        die "No official WordPress ZIP release was found for locale $locale${version:+ and version $version}."
+    printf '%s' "$url"
+}
+
+site_wordpress_locale() {
+    local domain="$1" locale
+    locale="$(site_wp_cli "$domain" eval 'echo get_locale();' 2>/dev/null || true)"
+    [[ "$locale" =~ ^[A-Za-z0-9_@.-]+$ ]] || locale="en_US"
+    printf '%s' "$locale"
+}
+
+verify_wordpress_core_strict() {
+    local domain="$1" locale="${2:-}" version output status=0
+    version="$(site_wp_cli "$domain" core version 2>/dev/null || true)"
+    [[ "$version" =~ ^[0-9]+([.][0-9]+){1,2}$ ]] || return 1
+    [[ -n "$locale" ]] || locale="$(site_wordpress_locale "$domain")"
+    if output="$(site_wp_cli "$domain" core verify-checksums --version="$version" --locale="$locale" 2>&1)"; then
+        status=0
+    else
+        status=$?
+    fi
+    printf '%s\n' "$output"
+    ((status == 0)) || return 1
+    ! grep -Eq "^Warning: File (does not|doesn't|should not) exist:" <<< "$output"
+}
+
+repair_wordpress_core() {
+    local index="$1" domain wp_path version locale download_url verify_output extra_path target removed=0
+    domain="${SITE_DOMAINS[$index]}"
+    wp_path="$(site_wp_path "$domain")"
+    [[ -f "$wp_path/wp-load.php" && -f "$wp_path/wp-config.php" ]] || die "WordPress core is incomplete for $domain."
+    version="$(site_wp_cli "$domain" core version)"
+    locale="$(site_wordpress_locale "$domain")"
+    download_url="$(wordpress_release_zip_url "$locale" "$version")"
+    log_message INFO "Creating a safety backup before repairing WordPress core for $domain."
+    backup_site "$index" >/dev/null
+    site_wp_cli "$domain" maintenance-mode activate >/dev/null 2>&1 || true
+    if ! site_wp_cli "$domain" core download "$download_url" --force --skip-content --locale="$locale"; then
+        site_wp_cli "$domain" maintenance-mode deactivate >/dev/null 2>&1 || true
+        die "The official WordPress ZIP could not be installed for $domain."
+    fi
+    verify_output="$(verify_wordpress_core_strict "$domain" "$locale" 2>&1 || true)"
+    while IFS= read -r extra_path; do
+        extra_path="${extra_path%$'\r'}"
+        [[ "$extra_path" =~ ^wp-(admin|includes)/[A-Za-z0-9_./@+-]+$ && "$extra_path" != *'..'* ]] || \
+            die "Refusing to remove an unsafe core path reported by WP-CLI: $extra_path"
+        target="$wp_path/$extra_path"
+        if [[ -f "$target" || -L "$target" ]]; then
+            rm -f -- "$target"
+            removed=$((removed + 1))
+        fi
+    done < <(sed -n 's/^Warning: File should not exist: //p' <<< "$verify_output")
+    if ! verify_wordpress_core_strict "$domain" "$locale"; then
+        site_wp_cli "$domain" maintenance-mode deactivate >/dev/null 2>&1 || true
+        die "$domain still fails strict WordPress core verification after repair."
+    fi
+    set_site_permissions "$domain"
+    configure_https_site "$index"
+    site_wp_cli "$domain" maintenance-mode deactivate >/dev/null 2>&1 || true
+    clear_site_cache "$index"
+    log_message SUCCESS "Repaired and strictly verified WordPress $version core for $domain; removed $removed unexpected core file(s)."
+}
+
 install_wordpress_site() {
     CURRENT_STEP="install WordPress"
-    local index="$1" domain primary wp_path admin_password credentials_file redis_password memory_limit initial_mode
+    local index="$1" domain primary wp_path admin_password credentials_file redis_password memory_limit initial_mode download_url
     local wordpress_installed_now="no"
     domain="${SITE_DOMAINS[$index]}"
     primary="${SITE_PRIMARY_DOMAINS[$index]}"
@@ -1486,7 +1565,10 @@ install_wordpress_site() {
     redis_password="$REDIS_PASSWORD"
 
     if [[ ! -f "$wp_path/wp-load.php" ]]; then
-        site_wp_cli "$domain" core download --locale="$WORDPRESS_LOCALE"
+        download_url="$(wordpress_release_zip_url "$WORDPRESS_LOCALE")"
+        site_wp_cli "$domain" core download "$download_url" --locale="$WORDPRESS_LOCALE"
+        verify_wordpress_core_strict "$domain" "$WORDPRESS_LOCALE" || \
+            die "The downloaded WordPress core failed strict checksum verification."
     fi
     if [[ ! -f "$wp_path/wp-config.php" ]]; then
         load_database_config "$domain"
@@ -2030,6 +2112,14 @@ site_action() {
             [[ -f "$wp_path/wp-config.php" ]] && printf '  WordPress: %s\n' "$(site_wp_cli "$domain" core version)"
             ;;
         summary) show_site_deployment_summary "$index" ;;
+        core-verify)
+            if verify_wordpress_core_strict "$domain"; then
+                log_message SUCCESS "$domain WordPress core passed strict checksum verification."
+            else
+                die "$domain WordPress core failed strict checksum verification. Run: sudo wp-shell site $domain core-repair"
+            fi
+            ;;
+        core-repair) repair_wordpress_core "$index" ;;
         cache-clear) clear_site_cache "$index"; log_message SUCCESS "$domain cache was cleared." ;;
         backup) backup_site "$index" ;;
         backups) list_backups "$index" ;;
@@ -2039,7 +2129,7 @@ site_action() {
             systemctl restart "php${SITE_PHP_VERSIONS[$index]}-fpm"
             nginx -t && systemctl reload nginx
             ;;
-        *) die "Unknown site action: $action (use status, info, summary, cache-clear, backup, backups, restore, update, or restart)." ;;
+        *) die "Unknown site action: $action (use status, info, summary, core-verify, core-repair, cache-clear, backup, backups, restore, update, or restart)." ;;
     esac
 }
 
@@ -2968,6 +3058,10 @@ security_scan() {
                 log_message WARNING "$domain is not connected to Redis Object Cache."
                 failed=$((failed + 1))
             fi
+            if ! verify_wordpress_core_strict "$domain" >/dev/null 2>&1; then
+                log_message WARNING "$domain does not pass strict WordPress core checksum verification. Run: sudo wp-shell site $domain core-repair"
+                failed=$((failed + 1))
+            fi
         fi
         [[ -s "/etc/letsencrypt/live/$domain/fullchain.pem" ]] || { log_message ERROR "$domain has no certificate."; failed=$((failed + 1)); }
         primary="${SITE_PRIMARY_DOMAINS[$i]}"
@@ -3289,6 +3383,8 @@ Usage:
   sudo wp-shell site list                        List managed and imported sites
   sudo wp-shell site status [DOMAIN|ID]          Show site status
   sudo wp-shell site DOMAIN|ID summary           Show the website deployment summary
+  sudo wp-shell site DOMAIN|ID core-verify       Strictly verify WordPress core files
+  sudo wp-shell site DOMAIN|ID core-repair       Back up and repair WordPress core from ZIP
   sudo wp-shell site deploy DOMAIN|ID            Idempotently deploy or repair a site
   sudo wp-shell site import                      Discover existing WordPress sites
   sudo wp-shell site DOMAIN|ID ACTION            Run a compatibility site action
@@ -3300,7 +3396,8 @@ Usage:
   sudo wp-shell rotate-redis-secret              Rotate Redis auth and redact matching logs
   sudo wp-shell security-scan                    Validate services, TLS, and permissions
 
-Site actions: status, info, summary, cache-clear, backup, backups, restore, update, restart
+Site actions: status, info, summary, core-verify, core-repair, cache-clear,
+backup, backups, restore, update, restart
 All dashboard text and stored operational metadata are ASCII/English. Access metrics
 exclude client IPs, cookies, and query strings. Raw samples are retained for 30 days.
 EOF
