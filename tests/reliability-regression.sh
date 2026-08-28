@@ -111,4 +111,21 @@ printf 'cache\n' > "$(site_cache_dir good.example.com)/one"
 clear_site_cache 2
 [[ ! -e "$(site_cache_dir good.example.com)/one" ]]
 
-printf 'Backup fault injection, global tuning budget, atomic metrics and cache-scope tests passed.\n'
+# Tuning must share the deployment lock; a report cannot overwrite its pending plan.
+grep -Fq 'pending-tuning-recommendations.tsv' <<< "$(declare -f apply_tuning)"
+ensure_root() { :; }
+check_platform() { :; }
+init_runtime() { printf 'locked' > "$test_root/route"; }
+init_paths() { printf 'unlocked' > "$test_root/route"; }
+migrate_legacy_configs() { :; }
+load_sites_config() { :; }
+ensure_environment_config() { :; }
+load_tuning_config() { :; }
+load_opcache_config() { :; }
+execute_command() { :; }
+main tune --apply --yes
+[[ "$(<"$test_root/route")" == locked ]]
+main analyze 7d
+[[ "$(<"$test_root/route")" == unlocked ]]
+
+printf 'Backup fault injection, global tuning budget/locking, atomic metrics and cache-scope tests passed.\n'

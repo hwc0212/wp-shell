@@ -4151,7 +4151,7 @@ analyze_metrics() {
 }
 
 apply_tuning() {
-    local assume_yes="" range=14d seconds recommendation_file="$STATE_DIR/last-recommendations.tsv" domain current proposed reason
+    local assume_yes="" range=14d seconds recommendation_file="$STATE_DIR/pending-tuning-recommendations.tsv" domain current proposed reason
     while (($#)); do
         case "$1" in
             --yes) assume_yes=--yes; shift ;;
@@ -4947,7 +4947,7 @@ main() {
     check_platform
     require_command base64
     case "${1:-}" in
-        dashboard|report|analyze|tune|metrics|cron-run|ops)
+        dashboard|report|analyze|metrics|cron-run|ops)
             init_paths
             migrate_legacy_configs
             load_sites_config
