@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.4.7
+# Version 9.4.8
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.4.7"
+readonly WP_SHELL_VERSION="9.4.8"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -19,6 +19,7 @@ readonly REDIS_SECRET_FILE="$CONFIG_DIR/redis.secret"
 readonly STATE_DIR="${WP_SHELL_STATE_DIR:-/var/lib/wp-shell}"
 readonly METRICS_DB="$STATE_DIR/metrics.sqlite3"
 readonly TUNING_CONFIG_FILE="$CONFIG_DIR/tuning.v1"
+readonly OPCACHE_CONFIG_FILE="$CONFIG_DIR/opcache.v1"
 readonly LEGACY_VPS_CONFIG_DIR="${WP_SHELL_LEGACY_VPS_CONFIG_DIR:-/etc/wp-vps-manager}"
 readonly LEGACY_SINGLE_CONFIG_DIR="${WP_SHELL_LEGACY_SINGLE_CONFIG_DIR:-/etc/wp-single-deploy}"
 readonly LEGACY_BACKUP_ROOT="${WP_SHELL_LEGACY_BACKUP_ROOT:-/var/backups/wp-shell}"
@@ -54,6 +55,8 @@ declare -a SITE_PATHS=()
 declare -a SITE_MODES=()
 declare -a SITE_PHP_MAX_CHILDREN=()
 declare -A PHP_CHILD_OVERRIDES=()
+declare -A OPCACHE_MEMORY_OVERRIDES=()
+declare -A OPCACHE_STRINGS_OVERRIDES=()
 SITE_COUNT=0
 LEGACY_SINGLE_DOMAIN=""
 ENVIRONMENT_MODE=""
@@ -65,6 +68,7 @@ MARIADB_MAX_CONNECTIONS=50
 MARIADB_TMP_TABLE_MB=32
 REDIS_MAX_MEMORY_MB=64
 PHP_TOTAL_BUDGET_MB=256
+OPCACHE_TOTAL_BUDGET_MB=128
 NEW_SITE_CREDENTIAL_DOMAIN=""
 NEW_SITE_ADMIN_PASSWORD=""
 
@@ -408,6 +412,299 @@ install_private_file() {
     fi
 }
 
+validate_opcache_values() {
+    local memory="$1" strings="$2"
+    [[ "$memory" =~ ^[1-9][0-9]{1,3}$ && "$strings" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+    ((memory >= 64 && memory <= 2048 && strings >= 4 && strings <= 512 && strings <= memory / 2))
+}
+
+opcache_scan_dir() { printf '/etc/php/%s/fpm/conf.d' "$1"; }
+opcache_managed_ini() { printf '%s/zz-wp-shell-opcache.ini' "$(opcache_scan_dir "$1")"; }
+
+load_opcache_config() {
+    OPCACHE_MEMORY_OVERRIDES=()
+    OPCACHE_STRINGS_OVERRIDES=()
+    [[ -f "$OPCACHE_CONFIG_FILE" ]] || return 0
+    local record version memory strings extra header=""
+    while IFS='|' read -r record version memory strings extra || [[ -n "$record" ]]; do
+        [[ -n "$record" ]] || continue
+        if [[ -z "$header" ]]; then
+            [[ "$record|$version" == 'version|1' && -z "$memory$strings$extra" ]] || die "Invalid OPcache configuration header."
+            header=1
+            continue
+        fi
+        if [[ "$record" != php || -n "$extra" ]] || ! validate_php_version "$version" ||
+            ! validate_opcache_values "$memory" "$strings"; then
+            die "Invalid OPcache configuration record."
+        fi
+        [[ -z "${OPCACHE_MEMORY_OVERRIDES[$version]:-}" ]] || die "Duplicate OPcache version: $version"
+        OPCACHE_MEMORY_OVERRIDES[$version]="$memory"
+        OPCACHE_STRINGS_OVERRIDES[$version]="$strings"
+    done < "$OPCACHE_CONFIG_FILE"
+    [[ -n "$header" ]] || die "Empty OPcache configuration."
+}
+
+save_opcache_config() {
+    local temp_file version
+    temp_file="$(mktemp "$CONFIG_DIR/.opcache.XXXXXX")" || return 1
+    {
+        printf 'version|1\n'
+        for version in "${AVAILABLE_PHP_VERSIONS[@]}"; do
+            [[ -n "${OPCACHE_MEMORY_OVERRIDES[$version]:-}" ]] || continue
+            printf 'php|%s|%s|%s\n' "$version" "${OPCACHE_MEMORY_OVERRIDES[$version]}" "${OPCACHE_STRINGS_OVERRIDES[$version]}"
+        done
+    } > "$temp_file" || { rm -f "$temp_file"; return 1; }
+    chmod 0600 "$temp_file" && mv -fT "$temp_file" "$OPCACHE_CONFIG_FILE"
+}
+
+opcache_values() {
+    local version="$1" memory=128 strings=16 local_ini key value
+    if [[ -n "${OPCACHE_MEMORY_OVERRIDES[$version]:-}" ]]; then
+        memory="${OPCACHE_MEMORY_OVERRIDES[$version]}"
+        strings="${OPCACHE_STRINGS_OVERRIDES[$version]}"
+    else
+        local_ini="$(opcache_scan_dir "$version")/99-zz-local-opcache.ini"
+        if [[ -f "$local_ini" ]]; then
+            # Parse only the two numeric settings; never source an INI file as shell code.
+            while IFS='=' read -r key value; do
+                case "$key" in
+                    opcache.memory_consumption) memory="$value" ;;
+                    opcache.interned_strings_buffer) strings="$value" ;;
+                esac
+            done < <(awk -F= '
+                /^[[:space:]]*opcache\.(memory_consumption|interned_strings_buffer)[[:space:]]*=/ {
+                    key=$1; value=substr($0,index($0,"=")+1)
+                    sub(/[;#].*$/, "", value); gsub(/[[:space:]\042\047]/,"",value)
+                    gsub(/[[:space:]]/,"",key); print key "=" value
+                }' "$local_ini")
+        fi
+    fi
+    validate_opcache_values "$memory" "$strings" || die "Invalid OPcache settings for PHP $version. Review opcache.v1 and the local INI file."
+    printf '%s %s\n' "$memory" "$strings"
+}
+
+write_opcache_ini() {
+    local version="$1" memory="$2" strings="$3" target temp_file
+    target="$(opcache_managed_ini "$version")"
+    if [[ -e "$target" || -L "$target" ]]; then
+        if [[ ! -f "$target" || -L "$target" ]] || ! grep -Fxq '; Managed by wp-shell OPcache settings.' "$target"; then
+            log_message ERROR "Refusing to overwrite an unmanaged OPcache file: $target" >&2
+            return 1
+        fi
+    fi
+    temp_file="$(mktemp "$(opcache_scan_dir "$version")/.wp-shell-opcache.XXXXXX")" || return 1
+    printf '; Managed by wp-shell OPcache settings.\nopcache.memory_consumption = %s\nopcache.interned_strings_buffer = %s\n' \
+        "$memory" "$strings" > "$temp_file" || { rm -f "$temp_file"; return 1; }
+    chmod 0644 "$temp_file" && mv -fT "$temp_file" "$target"
+}
+
+php_fpm_service_action() {
+    local action="$1" version="$2"
+    systemctl daemon-reload && systemctl "$action" "php${version}-fpm"
+}
+
+opcache_effective_values() {
+    local info
+    info="$("php-fpm$1" -i 2>/dev/null)" || return 1
+    awk -F ' => ' '
+        $1 == "opcache.memory_consumption" {memory=$2}
+        $1 == "opcache.interned_strings_buffer" {strings=$2}
+        END {if (memory ~ /^[0-9]+$/ && strings ~ /^[0-9]+$/) print memory " " strings; else exit 1}
+    ' <<< "$info"
+}
+
+available_memory_mb() { awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo; }
+
+opcache_budget_versions() {
+    local version
+    local -A seen=()
+    while IFS= read -r version; do
+        seen[$version]=1
+        printf '%s\n' "$version"
+    done < <(unique_php_versions)
+    for version in "${AVAILABLE_PHP_VERSIONS[@]}"; do
+        if [[ -n "${OPCACHE_MEMORY_OVERRIDES[$version]:-}" && -z "${seen[$version]:-}" ]]; then
+            printf '%s\n' "$version"
+        fi
+    done
+}
+
+opcache_runtime_socket() {
+    local version="$1" i socket
+    for ((i = 1; i <= SITE_COUNT; i++)); do
+        [[ "${SITE_PHP_VERSIONS[$i]}" == "$version" ]] || continue
+        socket="$(site_pool_socket "${SITE_DOMAINS[$i]}")"
+        if [[ -S "$socket" ]]; then printf '%s' "$socket"; return 0; fi
+    done
+    socket="/run/php/php${version}-fpm.sock"
+    [[ -S "$socket" ]] || return 1
+    printf '%s' "$socket"
+}
+
+opcache_runtime_json() {
+    local socket probe_dir response result
+    command -v cgi-fcgi >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 1
+    socket="$(opcache_runtime_socket "$1")" || return 1
+    probe_dir="$(mktemp -d /run/wp-shell-opcache.XXXXXX)" || return 1
+    # A local FastCGI probe outside every document root, not a public HTTP endpoint.
+    if ! {
+        chmod 0755 "$probe_dir" &&
+        cat > "$probe_dir/status.php" <<'PHP' &&
+<?php
+header('Content-Type: application/json');
+$s = function_exists('opcache_get_status') ? opcache_get_status(false) : false;
+if (!is_array($s)) { echo '{"available":false}'; exit; }
+$m = $s['memory_usage']; $i = $s['interned_strings_usage']; $t = $s['opcache_statistics'];
+echo json_encode([
+    'available' => true, 'enabled' => $s['opcache_enabled'], 'full' => $s['cache_full'],
+    'memory_mb' => (int)ini_get('opcache.memory_consumption'),
+    'strings_mb' => (int)ini_get('opcache.interned_strings_buffer'),
+    'used_mb' => round($m['used_memory']/1048576, 1), 'free_mb' => round($m['free_memory']/1048576, 1),
+    'wasted_mb' => round($m['wasted_memory']/1048576, 1),
+    'strings_used_mb' => round($i['used_memory']/1048576, 1),
+    'strings_free_mb' => round($i['free_memory']/1048576, 1),
+    'scripts' => $t['num_cached_scripts'], 'keys' => $t['num_cached_keys'], 'max_keys' => $t['max_cached_keys'],
+    'hit_rate' => round($t['opcache_hit_rate'], 2), 'oom_restarts' => $t['oom_restarts'],
+    'hash_restarts' => $t['hash_restarts'], 'manual_restarts' => $t['manual_restarts'],
+    'restart_pending' => $s['restart_pending'], 'restart_in_progress' => $s['restart_in_progress'],
+    'start_time' => $t['start_time']
+]);
+opcache_invalidate(__FILE__, true);
+PHP
+        chmod 0644 "$probe_dir/status.php"
+    }; then
+        rm -f "$probe_dir/status.php"; rmdir "$probe_dir"
+        return 1
+    fi
+    if ! response="$(env -i PATH="$PATH" SCRIPT_FILENAME="$probe_dir/status.php" SCRIPT_NAME=/status.php \
+        REQUEST_METHOD=GET GATEWAY_INTERFACE=CGI/1.1 SERVER_PROTOCOL=HTTP/1.1 SERVER_NAME=localhost \
+        REMOTE_ADDR=127.0.0.1 QUERY_STRING='' REDIRECT_STATUS=200 \
+        timeout 10s cgi-fcgi -bind -connect "$socket" 2>/dev/null)"; then
+        rm -f "$probe_dir/status.php"; rmdir "$probe_dir"
+        return 1
+    fi
+    rm -f "$probe_dir/status.php"; rmdir "$probe_dir"
+    result="$(printf '%s\n' "$response" | sed '1,/^\r\{0,1\}$/d' | jq -ce 'select(.available == true)')" || return 1
+    printf '%s\n' "$result"
+}
+
+show_opcache_status() {
+    local version="$1" desired effective runtime
+    validate_php_version "$version" || die "Unsupported PHP version: $version"
+    desired="$(opcache_values "$version")"
+    printf 'PHP %s OPcache (shared by all pools in this FPM service)\n' "$version"
+    printf 'Managed target (memory/strings MB): %s\n' "$desired"
+    if effective="$(opcache_effective_values "$version")"; then
+        printf 'Configuration on disk (memory/strings MB): %s\n' "$effective"
+        [[ "$desired" == "$effective" ]] || log_message WARNING "Disk settings differ from the managed target; check INI precedence before applying."
+    else
+        printf 'Configuration on disk: unavailable\n'
+    fi
+    if runtime="$(opcache_runtime_json "$version")"; then
+        jq -r '
+            "Runtime (memory/strings MB): \(.memory_mb) \(.strings_mb)",
+            "Enabled: \(.enabled) | Full: \(.full) | Hit rate: \(.hit_rate)%",
+            "Memory: used \(.used_mb)MB | free \(.free_mb)MB | wasted \(.wasted_mb)MB",
+            "Strings: used \(.strings_used_mb)MB | free \(.strings_free_mb)MB",
+            "Cached scripts: \(.scripts) | Keys: \(.keys)/\(.max_keys)",
+            "Restarts: OOM \(.oom_restarts) | hash \(.hash_restarts) | manual \(.manual_restarts)",
+            "Restart pending: \(.restart_pending) | in progress: \(.restart_in_progress)",
+            "Cache started (UTC): \(.start_time | todateiso8601)"
+        ' <<< "$runtime"
+        [[ "$(jq -r '[.memory_mb,.strings_mb] | join(" ")' <<< "$runtime")" == "$desired" ]] ||
+            log_message WARNING "Running FPM settings differ from the managed target."
+        if [[ "$(jq -r '.full or (.free_mb < 1) or (.strings_free_mb < 1)' <<< "$runtime")" == true ]]; then
+            log_message WARNING "OPcache is full or nearly full; review memory headroom before increasing it."
+        fi
+    else
+        printf 'Runtime: unavailable (check local FPM socket, libfcgi-bin, jq, or pool restrictions).\n'
+    fi
+}
+
+set_opcache() {
+    local version="$1" memory="$2" strings="$3" old effective total available reserve delta shared=0 candidate values
+    local backup target had_ini=no had_config=no failed=no reload_attempted=no
+    validate_php_version "$version" || die "Unsupported PHP version: $version"
+    validate_opcache_values "$memory" "$strings" || die "Use memory 64-2048MB and strings 4-512MB, at most half of memory; use plain integers."
+    [[ -d "$(opcache_scan_dir "$version")" ]] || die "PHP $version FPM is not installed."
+    systemctl is-active --quiet "php${version}-fpm" || die "PHP $version FPM must be active before applying settings."
+    old="$(opcache_effective_values "$version")" || die "Cannot read PHP $version FPM OPcache settings."
+    for candidate in $(opcache_budget_versions); do
+        [[ "$candidate" == "$version" ]] && continue
+        values="$(opcache_values "$candidate")"
+        shared=$((shared + ${values%% *}))
+    done
+    shared=$((shared + memory))
+    total="$(memory_mb)"
+    ((shared <= total / 4)) || die "Combined OPcache target ${shared}MB exceeds the safety limit of 25% of RAM."
+    available="$(available_memory_mb)"
+    reserve=$((total / 10)); ((reserve < 256)) && reserve=256
+    delta=$((memory - ${old%% *}))
+    if ((delta > 0)) && { [[ ! "$available" =~ ^[0-9]+$ ]] || ((available < delta + reserve)); }; then
+        die "Not enough available RAM to increase OPcache while preserving ${reserve}MB headroom."
+    fi
+    target="$(opcache_managed_ini "$version")"
+    if [[ -e "$target" || -L "$target" ]]; then
+        if [[ ! -f "$target" || -L "$target" ]] || ! grep -Fxq '; Managed by wp-shell OPcache settings.' "$target"; then
+            die "Refusing to replace unmanaged file: $target"
+        fi
+        had_ini=yes
+    fi
+    [[ ! -L "$OPCACHE_CONFIG_FILE" ]] || die "Refusing a symlinked OPcache state file."
+    install -d -m 0700 "$CONFIG_DIR/opcache-backups"
+    backup="$(mktemp -d "$CONFIG_DIR/opcache-backups/$(date +%Y%m%d-%H%M%S).XXXXXX")"
+    [[ "$had_ini" == no ]] || cp -p "$target" "$backup/zz-wp-shell-opcache.ini"
+    if [[ -f "$OPCACHE_CONFIG_FILE" ]]; then had_config=yes; cp -p "$OPCACHE_CONFIG_FILE" "$backup/opcache.v1"; fi
+    printf 'PHP=%s\nPREVIOUS_MANAGED_INI=%s\nPREVIOUS_STATE=%s\n' "$version" "$had_ini" "$had_config" > "$backup/manifest"
+    OPCACHE_MEMORY_OVERRIDES[$version]="$memory"
+    OPCACHE_STRINGS_OVERRIDES[$version]="$strings"
+    if ! write_opcache_ini "$version" "$memory" "$strings" || ! save_opcache_config ||
+        ! "php-fpm$version" -t || ! effective="$(opcache_effective_values "$version")" || [[ "$effective" != "$memory $strings" ]]; then
+        failed=yes
+    else
+        reload_attempted=yes
+        php_fpm_service_action reload "$version" || failed=yes
+    fi
+    if [[ "$failed" == yes ]]; then
+        if [[ "$had_ini" == yes ]]; then cp -p "$backup/zz-wp-shell-opcache.ini" "$target"; else rm -f "$target"; fi
+        if [[ "$had_config" == yes ]]; then cp -p "$backup/opcache.v1" "$OPCACHE_CONFIG_FILE"; else rm -f "$OPCACHE_CONFIG_FILE"; fi
+        load_opcache_config
+        if [[ "$reload_attempted" == yes ]]; then
+            if ! "php-fpm$version" -t || ! php_fpm_service_action reload "$version"; then
+                log_message ERROR "Files restored, but FPM recovery needs attention. Backup: $backup"
+            fi
+        fi
+        die "OPcache apply failed; previous files restored. Check FPM and INI overrides. Backup: $backup"
+    fi
+    log_message SUCCESS "Saved OPcache for PHP $version: ${memory}MB / strings ${strings}MB. FPM reload accepted. Backup: $backup"
+    log_message INFO "All PHP $version sites share this cache. No Nginx, database, Redis, or pool limits changed."
+    log_message INFO "Run: sudo wp-shell opcache status $version (runtime values may take a moment to switch)."
+}
+
+opcache_command() {
+    local action="${1:-status}" version
+    case "$action" in
+        status)
+            (($# <= 2)) || die "Usage: wp-shell opcache status [PHP_VERSION]"
+            if [[ -n "${2:-}" ]]; then show_opcache_status "$2";
+            else while IFS= read -r version; do show_opcache_status "$version"; done < <(opcache_budget_versions); fi
+            ;;
+        set) (($# == 4)) || die "Usage: wp-shell opcache set PHP_VERSION MEMORY_MB STRINGS_MB"; set_opcache "$2" "$3" "$4" ;;
+        *) die "Usage: wp-shell opcache status [PHP_VERSION] | set PHP_VERSION MEMORY_MB STRINGS_MB" ;;
+    esac
+}
+
+opcache_menu() {
+    local version memory strings
+    read -r -p "PHP version [$DEFAULT_PHP_VERSION]: " version
+    version="${version:-$DEFAULT_PHP_VERSION}"
+    show_opcache_status "$version"
+    read -r -p "New OPcache memory in MB (leave empty to exit): " memory
+    [[ -n "$memory" ]] || return 0
+    read -r -p "Interned strings in MB: " strings
+    set_opcache "$version" "$memory" "$strings"
+}
+
 migrate_legacy_vps_config() {
     local source="$LEGACY_VPS_CONFIG_DIR/sites.v2"
     [[ -f "$source" ]] || return 1
@@ -522,7 +819,7 @@ max_sites_for_memory() {
 }
 
 calculate_resource_budget() {
-    local total_mem site_count os_reserve cache_reserve available
+    local total_mem site_count os_reserve cache_reserve available version opcache
     total_mem="$(memory_mb)"
     site_count="${SITE_COUNT:-1}"
     ((site_count < 1)) && site_count=1
@@ -541,7 +838,12 @@ calculate_resource_budget() {
     ((REDIS_MAX_MEMORY_MB < 32)) && REDIS_MAX_MEMORY_MB=32
     ((REDIS_MAX_MEMORY_MB > 512)) && REDIS_MAX_MEMORY_MB=512
     cache_reserve=$((site_count * 16))
-    available=$((total_mem - os_reserve - MARIADB_BUFFER_MB - REDIS_MAX_MEMORY_MB - cache_reserve))
+    OPCACHE_TOTAL_BUDGET_MB=0
+    while IFS= read -r version; do
+        opcache="$(opcache_values "$version")"
+        OPCACHE_TOTAL_BUDGET_MB=$((OPCACHE_TOTAL_BUDGET_MB + ${opcache%% *}))
+    done < <(opcache_budget_versions)
+    available=$((total_mem - os_reserve - MARIADB_BUFFER_MB - REDIS_MAX_MEMORY_MB - cache_reserve - OPCACHE_TOTAL_BUDGET_MB))
     PHP_TOTAL_BUDGET_MB=$available
     ((PHP_TOTAL_BUDGET_MB < 192)) && PHP_TOTAL_BUDGET_MB=192
     if ((PHP_TOTAL_BUDGET_MB > total_mem * 35 / 100)); then
@@ -564,7 +866,10 @@ calculate_resource_budget() {
 
     calculate_site_php_allocations
     if [[ "${1:-}" != "quiet" ]]; then
-        log_message INFO "Resource budget: OS reserve ${os_reserve}MB, MariaDB ${MARIADB_BUFFER_MB}MB, Redis ${REDIS_MAX_MEMORY_MB}MB, PHP-FPM ${PHP_TOTAL_BUDGET_MB}MB."
+        log_message INFO "Resource budget: OS reserve ${os_reserve}MB, MariaDB ${MARIADB_BUFFER_MB}MB, Redis ${REDIS_MAX_MEMORY_MB}MB, shared OPcache ${OPCACHE_TOTAL_BUDGET_MB}MB, PHP-FPM workers ${PHP_TOTAL_BUDGET_MB}MB."
+        if ((available < 192)); then
+            log_message WARNING "Minimum PHP worker allowance exceeds the remaining budget; reduce services/sites or add RAM."
+        fi
     fi
 }
 
@@ -679,13 +984,18 @@ site_pool_status_socket() {
 configure_php() {
     CURRENT_STEP="configure PHP-FPM"
     calculate_resource_budget
-    local version memory_limit i domain pool_id pool_file max_children
+    local version memory_limit i domain pool_id pool_file max_children opcache_memory opcache_strings values
     memory_limit="256M"
     (( $(memory_mb) >= 4096 )) && memory_limit="512M"
 
     while IFS= read -r version; do
         [[ -n "$version" ]] || continue
         install -d -m 0755 "/etc/php/$version/fpm/pool.d" "/etc/php/$version/fpm/conf.d"
+        values="$(opcache_values "$version")"
+        read -r opcache_memory opcache_strings <<< "$values"
+        OPCACHE_MEMORY_OVERRIDES[$version]="$opcache_memory"
+        OPCACHE_STRINGS_OVERRIDES[$version]="$opcache_strings"
+        write_opcache_ini "$version" "$opcache_memory" "$opcache_strings"
         cat > "/etc/php/$version/fpm/pool.d/99-wp-shell.conf" <<EOF
 ; Managed by wp-shell. Keep the distribution pool available with minimal idle use.
 [www]
@@ -706,8 +1016,8 @@ display_errors = Off
 log_errors = On
 expose_php = Off
 opcache.enable = 1
-opcache.memory_consumption = 128
-opcache.interned_strings_buffer = 16
+opcache.memory_consumption = $opcache_memory
+opcache.interned_strings_buffer = $opcache_strings
 opcache.max_accelerated_files = 20000
 opcache.validate_timestamps = 1
 opcache.revalidate_freq = 2
@@ -715,6 +1025,7 @@ opcache.jit = disable
 opcache.jit_buffer_size = 0
 EOF
     done < <(unique_php_versions)
+    save_opcache_config
 
     for ((i = 1; i <= SITE_COUNT; i++)); do
         domain="${SITE_DOMAINS[$i]}"
@@ -751,8 +1062,10 @@ EOF
     while IFS= read -r version; do
         [[ -n "$version" ]] || continue
         "php-fpm${version}" -t
+        values="$(opcache_values "$version")"
+        [[ "$(opcache_effective_values "$version")" == "$values" ]] || die "PHP $version OPcache settings are overridden by another INI file; FPM was not restarted."
         systemctl enable "php${version}-fpm"
-        systemctl restart "php${version}-fpm"
+        php_fpm_service_action restart "$version"
     done < <(unique_php_versions)
     if ((SITE_COUNT > 0)); then
         log_message SUCCESS "Configured one PHP-FPM pool per site within a shared ${PHP_TOTAL_BUDGET_MB}MB budget."
@@ -2076,7 +2389,7 @@ clear_site_cache() {
     if [[ -f "$wp_path/wp-config.php" ]]; then
         site_wp_cli "$domain" cache flush || true
     fi
-    systemctl reload "php${SITE_PHP_VERSIONS[$index]}-fpm"
+    php_fpm_service_action reload "${SITE_PHP_VERSIONS[$index]}"
 }
 
 update_site() {
@@ -2126,7 +2439,7 @@ site_action() {
         restore) [[ -n "${3:-}" ]] || die "Usage: wp-shell restore $domain BACKUP_ID"; restore_site "$index" "$3" ;;
         update) update_site "$index" ;;
         restart)
-            systemctl restart "php${SITE_PHP_VERSIONS[$index]}-fpm"
+            php_fpm_service_action restart "${SITE_PHP_VERSIONS[$index]}"
             nginx -t && systemctl reload nginx
             ;;
         *) die "Unknown site action: $action (use status, info, summary, core-verify, core-repair, cache-clear, backup, backups, restore, update, or restart)." ;;
@@ -2876,7 +3189,7 @@ analyze_metrics() {
     sqlite3 -header -column "$METRICS_DB" "WITH ordered AS (SELECT *,LAG(php_max_reached) OVER (PARTITION BY domain ORDER BY ts) AS previous_reached FROM site_samples WHERE ts >= $since) SELECT domain AS Domain,COUNT(*) AS Samples,MAX(php_active) AS 'Peak active',MAX(php_queue) AS 'Peak queue',COALESCE(SUM(CASE WHEN previous_reached IS NULL THEN 0 WHEN php_max_reached >= previous_reached THEN php_max_reached-previous_reached ELSE php_max_reached END),0) AS 'New max events',printf('%.0f MB',MAX(php_pss_mb)) AS 'Peak PSS',printf('%.0f MB',MAX(php_rss_mb)) AS 'Peak RSS sum',printf('%.0f ms',MAX(p95_ms)) AS 'Peak P95' FROM ordered GROUP BY domain ORDER BY domain;"
     printf '\nShared services\n'
     sqlite3 -header -column "$METRICS_DB" "WITH ordered AS (SELECT *,LAG(mariadb_slow_queries) OVER (ORDER BY ts) AS previous_slow,LAG(redis_evicted) OVER (ORDER BY ts) AS previous_evicted FROM service_samples WHERE ts >= $since) SELECT MAX(mariadb_threads) AS 'Peak DB threads',COALESCE(SUM(CASE WHEN previous_slow IS NULL THEN 0 WHEN mariadb_slow_queries >= previous_slow THEN mariadb_slow_queries-previous_slow ELSE mariadb_slow_queries END),0) AS 'New slow queries',printf('%.1f MB',MAX(redis_used_mb)) AS 'Peak Redis',COALESCE(SUM(CASE WHEN previous_evicted IS NULL THEN 0 WHEN redis_evicted >= previous_evicted THEN redis_evicted-previous_evicted ELSE redis_evicted END),0) AS 'Redis evictions' FROM ordered;"
-    printf '\nConfigured budget: MariaDB %sMB | Redis %sMB | PHP-FPM %sMB\n' "$MARIADB_BUFFER_MB" "$REDIS_MAX_MEMORY_MB" "$PHP_TOTAL_BUDGET_MB"
+    printf '\nConfigured budget: MariaDB %sMB | Redis %sMB | shared OPcache %sMB | PHP-FPM workers %sMB\n' "$MARIADB_BUFFER_MB" "$REDIS_MAX_MEMORY_MB" "$OPCACHE_TOTAL_BUDGET_MB" "$PHP_TOTAL_BUDGET_MB"
     recommendation_file="$STATE_DIR/last-recommendations.tsv"
     build_tuning_recommendations "$recommendation_file"
     printf '\nSafe automatic PHP recommendations\n'
@@ -3296,9 +3609,9 @@ management_menu() {
     printf '\nwp-shell v%s\n' "$WP_SHELL_VERSION"
     printf 'Environment: installed | Mode: %s | PHP: %s | Sites: %s\n\n' \
         "$ENVIRONMENT_MODE" "$DEFAULT_PHP_VERSION" "$SITE_COUNT"
-    printf '1) Dashboard\n2) Add a new website\n3) Website list\n4) Website status\n5) Deploy or repair a website\n6) Back up one website\n7) Back up all websites\n8) Restore a website\n9) Import existing websites\n10) Traffic and resource report\n11) Analyze resource usage\n12) Apply safe tuning recommendations\n13) Reapply service resource budget\n14) Security scan\n15) Repair backup and metrics timers\n0) Exit\n'
+    printf '1) Dashboard\n2) Add a new website\n3) Website list\n4) Website status\n5) Deploy or repair a website\n6) Back up one website\n7) Back up all websites\n8) Restore a website\n9) Import existing websites\n10) Traffic and resource report\n11) Analyze resource usage\n12) Apply safe tuning recommendations\n13) Reapply service resource budget\n14) Security scan\n15) Repair backup and metrics timers\n16) OPcache settings\n0) Exit\n'
     local choice domain backup_id range
-    read -r -p "Select [0-15]: " choice
+    read -r -p "Select [0-16]: " choice
     case "$choice" in
         1)
             if [[ ! -s "$METRICS_DB" ]]; then
@@ -3353,6 +3666,7 @@ management_menu() {
         13) configure_mariadb; configure_redis; configure_php ;;
         14) security_scan ;;
         15) install_self; install_backup_timer; install_metrics_timer ;;
+        16) opcache_menu ;;
         0) return ;;
         *) die "Invalid selection." ;;
     esac
@@ -3379,6 +3693,8 @@ Usage:
   sudo wp-shell report [1h|6h|24h|7d|14d|30d]   Print a non-interactive metrics report
   sudo wp-shell analyze [range]                  Analyze collected resource evidence
   sudo wp-shell tune --apply [--yes]             Apply safe PHP-FPM recommendations
+  sudo wp-shell opcache status [PHP_VERSION]     Inspect configuration and live FPM OPcache
+  sudo wp-shell opcache set PHP_VERSION MB STRINGS_MB  Save and apply OPcache settings
   sudo wp-shell site add                         Add and deploy a site
   sudo wp-shell site list                        List managed and imported sites
   sudo wp-shell site status [DOMAIN|ID]          Show site status
@@ -3465,6 +3781,7 @@ execute_command() {
         report) metrics_report "${2:-24h}" ;;
         analyze) analyze_metrics "${2:-7d}" ;;
         tune) [[ "${2:-}" == "--apply" ]] || die "Usage: wp-shell tune --apply [--yes]"; apply_tuning "${3:-}" ;;
+        opcache) shift; opcache_command "$@" ;;
         site) site_command "${2:-list}" "${3:-}" "${4:-}" ;;
         metrics)
             case "${2:-status}" in
@@ -3514,6 +3831,7 @@ main() {
             load_sites_config
             ensure_environment_config
             load_tuning_config
+            load_opcache_config
             execute_command "$@"
             ;;
         *)
@@ -3522,6 +3840,7 @@ main() {
             load_sites_config
             ensure_environment_config
             load_tuning_config
+            load_opcache_config
             execute_command "$@"
             ;;
     esac

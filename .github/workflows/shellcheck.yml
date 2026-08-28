@@ -26,6 +26,7 @@ jobs:
           bash tests/wordpress-core.sh
           bash tests/dashboard-smoke.sh
           bash tests/menu-routing.sh
+          bash tests/opcache-config.sh
 
       - name: ShellCheck
         run: >-
@@ -44,6 +45,7 @@ jobs:
           /mnt/tests/wordpress-core.sh
           /mnt/tests/dashboard-smoke.sh
           /mnt/tests/menu-routing.sh
+          /mnt/tests/opcache-config.sh
           /mnt/tests/nginx-integration.sh
           /mnt/tests/service-config-integration.sh
 
@@ -64,5 +66,5 @@ jobs:
           ubuntu:24.04
           bash -c
           'apt-get update >/dev/null &&
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mariadb-server redis-server php8.3-fpm openssl sqlite3 jq >/dev/null &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mariadb-server redis-server php8.3-fpm openssl sqlite3 jq libfcgi-bin >/dev/null &&
           bash /mnt/tests/service-config-integration.sh'

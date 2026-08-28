@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.4.7
+- 当前版本：`wp-shell.sh` v9.4.8
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -21,6 +21,7 @@
 - 提供适合 SSH 单屏显示的 `htop` 风格终端看板。
 - 可按域名查看请求量、状态码、P95 延迟、缓存命中率、PHP 内存、磁盘占用、TLS 和备份状态。
 - 可根据一段时间的历史数据生成资源分析和安全的 PHP-FPM 调整建议。
+- 按 PHP 版本持久保存 OPcache 容量，并通过本地 FPM socket 检查运行时缓存状态。
 - 自动迁移旧版多站点脚本和单站点脚本的配置。
 - 不提供 Web 控制面板，不开放远程监控端口，不上传遥测数据。
 
@@ -340,6 +341,7 @@ sudo ./wp-shell.sh
 13) Reapply service resource budget
 14) Security scan
 15) Repair backup and metrics timers
+16) OPcache settings
 0) Exit
 ```
 
@@ -888,6 +890,82 @@ sudo wp-shell optimize
 
 该命令会重新计算并应用 MariaDB、Redis 和 PHP-FPM 配置。它适合在升级 VPS 内存后使用。
 
+### 5. OPcache：检查、调整和验收（v9.4.8 起）
+
+OPcache 缓存 PHP 编译结果，与 Redis 对象缓存、Nginx FastCGI 整页缓存不同。同一个 PHP-FPM 服务下的网站共享 OPcache，**不是每个网站、每个 PHP 子进程各占一份**。例如两个网站都使用 PHP 8.4，只需设置一次 8.4。
+
+#### 先检查实际状态
+
+```bash
+sudo wp-shell opcache status
+# 也可以只看一个版本
+sudo wp-shell opcache status 8.4
+free -m
+```
+
+也可运行 `sudo wp-shell`，选择 `16) OPcache settings`，输入 PHP 版本。看完状态后，在容量输入处直接回车即可退出，不修改配置。
+
+状态输出分为三层：
+
+- `Managed target`：脚本保存的目标；没有保存值时，读取已有 `99-zz-local-opcache.ini`，否则使用初始值 128/16MB。
+- `Configuration on disk`：PHP-FPM 新进程读取的 INI 值，**不能单凭这个证明正在运行的进程已经生效**。
+- `Runtime`：通过本机 Unix socket 请求运行中的 FPM，显示实际容量、Full、已用/空闲/浪费内存、字符串缓存、脚本数、键数、命中率及 OOM/hash/manual 重启计数。
+
+运行时探针不启动 WordPress、不创建公网 `phpinfo.php`、不开放端口。它在 `/run` 临时生成一个只返回缓存统计的文件，请求结束后删除。需要 `libfcgi-bin`、`jq`、正常运行的本地 FPM socket；缺失或被 pool 限制时显示 `Runtime: unavailable`，不把缺失数据当成“正常”。自定义 `chroot`、`open_basedir`、`opcache.restrict_api` 可能限制探针，不应为读取状态而盲目移除这些安全设置。
+
+#### 容量已满且内存足够时再调整
+
+例如已经确认 128MB 缓存和 16MB 字符串空间耗尽，且服务器还有足够可用内存，可把 **256/32MB 作为第一轮测试值**：
+
+```bash
+sudo wp-shell opcache set 8.4 256 32
+sudo wp-shell opcache status 8.4
+sudo wp-shell site status
+```
+
+这不是所有网站的统一最佳值。`memory_consumption` 是总共享缓存容量，字符串空间包含在其中，预算不再额外加一次字符串容量。脚本限制单版本总容量为 64–2048MB、字符串为 4–512MB 且不超过总容量一半；各受管 PHP 版本的总 OPcache 目标不能超过服务器内存的 25%。扩容还要求当前可用内存覆盖增加量，并保留至少 256MB 或总内存 10%（取较大值）的余量。这些保护不等于承诺高峰时绝不会内存不足。
+
+此命令只做以下操作：
+
+1. 备份旧的 OPcache 状态文件和受管 INI，保存在 `/etc/wp-shell/opcache-backups/时间戳.随机值/`，目录只有 root 可读。
+2. 保存 `/etc/wp-shell/opcache.v1`，并写入 `/etc/php/8.4/fpm/conf.d/zz-wp-shell-opcache.ini`。
+3. 运行 `php-fpm8.4 -t`，验证实际 INI 值没有被更晚加载的配置覆盖。
+4. 执行 `systemctl daemon-reload`，再平滑重载对应的 `php8.4-fpm`。
+5. 校验或应用失败时恢复原文件；如果恢复后的服务重载也失败，会明确报错，并给出备份位置供人工处理。
+
+**不会重写 Nginx、WordPress 文件、数据库、Redis、PHP pool 进程额度，也不需要执行 `optimize` 或 `site deploy`。** 但重载会影响同一 PHP 版本的所有网站，并使 OPcache 重新预热，应选择低流量时段。PHP 服务的其他待生效配置也会随该服务重载生效。
+
+脚本不会修改或删除已有的 `99-zz-local-opcache.ini`。首次没有持久值时，会沿用其中的两个有效数值；保存后以 `opcache.v1` 为准，并用排序更晚的受管 INI 生效。后续添加网站或重新应用 PHP 配置会保留这些数值，不再退回硬编码的 128/16。受管文件同名但没有 wp-shell 标记、是符号链接，或有更晚 INI 覆盖目标值时，应用会拒绝而不是悄悄覆盖。
+
+如果你已经手工设置了 256/32MB，只需升级脚本后执行上面的 `opcache set 8.4 256 32`，把现值纳入持久配置。仅下载新脚本不会替你修改正在运行的 PHP。
+
+#### 如何判断生效
+
+重载后稍等片刻，访问首页、分类页、文章和后台，再次运行状态命令：
+
+- `Runtime` 应显示 `256 32`，并与目标及磁盘配置一致。
+- 预热后 `Full: false`，普通缓存和字符串缓存都有余量。
+- 命中率在有代表性的使用后观察；刚重载的低命中率不能直接判定异常。
+- OOM/hash 重启不应持续增长；同时检查网站状态和错误日志。
+
+这里是手动按需检查，不会把 OPcache 自动扩容或定时清空；资源分析的历史表尚未采集 OPcache 运行时指标。不要为了命中率归零而反复清缓存，也不要仅凭这些值增加 PHP 进程数。
+
+需退回上一组已知参数时，例如原来为 128/16MB：
+
+```bash
+sudo wp-shell opcache set 8.4 128 16
+```
+
+备份不会自动清理，`manifest` 记录变更前两个文件是否存在；备份只包含本次命令管理的文件，不是整个 PHP 或网站备份。遇到服务恢复失败，应结合备份和 `journalctl -u php8.4-fpm` 人工核查，不能把不完整的文件复制当成完整服务器回滚。
+
+若旧版曾提示 `unit file ... changed on disk`，可先执行：
+
+```bash
+sudo systemctl daemon-reload
+```
+
+该命令只让 systemd 重读服务定义，不会单独重启网站或让 PHP INI 生效。v9.4.8 起脚本的 PHP 重载/重启路径会先执行此步骤。
+
 ## 十、资源预算逻辑
 
 脚本先为操作系统预留内存，再为各服务计算安全初始值：
@@ -895,13 +973,16 @@ sudo wp-shell optimize
 - 单网站模式 MariaDB：约总内存的 35%，设置上下限。
 - 多网站模式 MariaDB：约总内存的 30%，设置上下限。
 - Redis：约总内存的 5%，限制为 32MB 至 512MB。
-- PHP-FPM：使用受限制的剩余预算。
+- OPcache：每个不同的受管 PHP 版本预留一份共享容量，沿用已保存或已有的手工值；未配置时为 128MB（其中字符串空间 16MB）。
+- PHP-FPM：扣除共享 OPcache 后使用受限制的剩余预算；分析输出分别列出共享缓存和 worker 预算。
 - PHP 进程：按约 96MB/进程估算。
 - WooCommerce：初始 pool 权重是普通网站的两倍。
 - FastCGI keys zone：每个网站 16MB。
 - 每个网站至少 2 个 PHP 子进程，默认上限 50。
 
 这些值是安全起点，不是所有网站的最终最佳值。主题、插件、流量结构、缓存命中率和 WooCommerce 请求比例都会改变实际内存需求。
+
+若剩余内存不足最低 PHP worker 额度，脚本会提示预算紧张；最低额度不是内核级内存限制。不要依赖它替代真实 PSS、可用内存和峰值观测。`opcache set` 仅核算并调整缓存，不会主动重新分配已有 worker。
 
 ## 十一、站点目录结构
 
@@ -935,6 +1016,9 @@ sudo wp-shell optimize
 /etc/wp-shell/databases/                  每站点数据库凭据
 /etc/wp-shell/redis.secret                Redis 密码
 /etc/wp-shell/tuning.v1                   可选 PHP-FPM 调优覆盖值
+/etc/wp-shell/opcache.v1                  按 PHP 版本保存的 OPcache 容量
+/etc/wp-shell/opcache-backups/            OPcache 应用前的受管文件备份
+/etc/php/VERSION/fpm/conf.d/zz-wp-shell-opcache.ini
 /etc/nginx/conf.d/wp-shell-log-format.conf
 /usr/local/sbin/wp-shell                  安装后的主程序
 /usr/local/bin/wp-shell                   全局命令链接
@@ -1212,6 +1296,7 @@ bash tests/storage-layout.sh
 bash tests/metrics-roundtrip.sh
 bash tests/dashboard-smoke.sh
 bash tests/menu-routing.sh
+bash tests/opcache-config.sh
 ```
 
 ShellCheck：
@@ -1220,7 +1305,7 @@ ShellCheck：
 shellcheck -x wp-shell.sh wp-vps-manager.sh deploy-single-wordpress.sh tests/*.sh
 ```
 
-GitHub Actions 还会在 Ubuntu 24.04 容器中使用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 验证生成的配置。
+GitHub Actions 还会在 Ubuntu 24.04 容器中使用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 验证生成的配置。OPcache 测试覆盖手工参数接管、持久值重用、共享预算去重、无效参数/低内存拒绝、配置及重载失败回滚、INI 加载冲突，以及通过真实 FPM socket 读取运行时状态。
 
 ## 十七、当前边界
 
