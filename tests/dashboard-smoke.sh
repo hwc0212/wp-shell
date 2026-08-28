@@ -37,6 +37,7 @@ ts="$(date +%s)"
 sqlite3 "$METRICS_DB" "INSERT INTO system_samples VALUES($ts,3.5,0.14,4096,2800,0,11,1000,2000);"
 sqlite3 "$METRICS_DB" "INSERT INTO site_samples VALUES($((ts-60)),'example.com',10,10,0,0,1024,20,30,8,2,0,0,4,0,4,3,0,200,80,1,100,1,1,1,0);"
 sqlite3 "$METRICS_DB" "INSERT INTO site_samples VALUES($ts,'example.com',10,10,0,0,1024,20,30,8,2,0,0,4,0,4,3,0,200,80,1,100,1,1,1,0);"
+sqlite3 "$METRICS_DB" "INSERT INTO sample_health VALUES($ts,'example.com','php',1),($((ts-60)),'example.com','php',1);"
 
 python3 - "$0" <<'PY'
 import fcntl

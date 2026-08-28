@@ -128,7 +128,7 @@ site_wp_config_set_redis_secret legacy.example.com "$redis_test_secret"
 wp_config_content="$(<"$wp_config")"
 [[ "$wp_config_content" == *"$redis_test_secret"* ]]
 [[ "$wp_config_content" != *'__WP_SHELL_REDIS_SECRET_PLACEHOLDER__'* ]]
-[[ "$(stat -c '%a' "$wp_config")" == "640" ]]
+[[ "$(stat -c '%a' "$wp_config")" == "600" ]]
 
 wp_config_before_failure="$wp_config_content"
 mock_wp_cli_failure="yes"
@@ -137,6 +137,6 @@ if site_wp_config_set_redis_secret legacy.example.com "$redis_second_secret"; th
     exit 1
 fi
 [[ "$(<"$wp_config")" == "$wp_config_before_failure" ]]
-[[ "$(stat -c '%a' "$wp_config")" == "640" ]]
+[[ "$(stat -c '%a' "$wp_config")" == "600" ]]
 
 printf 'Site/environment configuration and legacy migration tests passed.\n'

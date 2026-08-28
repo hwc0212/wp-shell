@@ -27,7 +27,7 @@ if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.s
 fi
 
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
-grep -Fq 'readonly WP_SHELL_VERSION="9.4.8"' "$repo_root/wp-shell.sh"
+grep -Fq 'readonly WP_SHELL_VERSION="9.5.0"' "$repo_root/wp-shell.sh"
 grep -Fq 'PRAGMA wal_checkpoint(PASSIVE);" >/dev/null' "$repo_root/wp-shell.sh"
 grep -Fq 'core download "$download_url" --force --skip-content --locale="$locale"' "$repo_root/wp-shell.sh"
 grep -Fq 'verify_wordpress_core_strict "$domain"' "$repo_root/wp-shell.sh"
@@ -40,7 +40,7 @@ grep -Fq "\"\$initial_mode\" == \"managed\" && \"\$wordpress_installed_now\" == 
 grep -Fq 'fastcgi_hide_header Strict-Transport-Security;' "$repo_root/wp-shell.sh"
 grep -Fq 'site_wp_config_set_redis_secret "$domain" "$redis_password"' "$repo_root/wp-shell.sh"
 grep -Fq 'rotate-redis-secret) rotate_redis_secret ;;' "$repo_root/wp-shell.sh"
-grep -Fq 'REDISCLI_AUTH="$(<"$REDIS_SECRET_FILE")" redis-cli --no-auth-warning' "$repo_root/wp-shell.sh"
+grep -Fq 'REDISCLI_AUTH="$(<"$REDIS_SECRET_FILE")" timeout 4s redis-cli --no-auth-warning' "$repo_root/wp-shell.sh"
 grep -Fq 'config set WP_REDIS_PASSWORD "$placeholder" --quiet' "$repo_root/wp-shell.sh"
 if grep -Fq 'config set WP_REDIS_PASSWORD "$redis_password"' "$repo_root/wp-shell.sh"; then
     printf 'The Redis credential must not be passed as a WP-CLI argument.\n' >&2

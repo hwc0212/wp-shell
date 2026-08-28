@@ -27,6 +27,7 @@ jobs:
           bash tests/dashboard-smoke.sh
           bash tests/menu-routing.sh
           bash tests/opcache-config.sh
+          bash tests/reliability-regression.sh
 
       - name: ShellCheck
         run: >-
@@ -46,8 +47,10 @@ jobs:
           /mnt/tests/dashboard-smoke.sh
           /mnt/tests/menu-routing.sh
           /mnt/tests/opcache-config.sh
+          /mnt/tests/reliability-regression.sh
           /mnt/tests/nginx-integration.sh
           /mnt/tests/service-config-integration.sh
+          /mnt/tests/operations-integration.sh
 
       - name: Nginx configuration integration test
         run: >-
@@ -56,7 +59,7 @@ jobs:
           ubuntu:24.04
           bash -c
           'apt-get update >/dev/null &&
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nginx openssl >/dev/null &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nginx openssl php8.3-fpm curl >/dev/null &&
           bash /mnt/tests/nginx-integration.sh'
 
       - name: Service configuration integration test
@@ -66,5 +69,6 @@ jobs:
           ubuntu:24.04
           bash -c
           'apt-get update >/dev/null &&
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mariadb-server redis-server php8.3-fpm openssl sqlite3 jq libfcgi-bin >/dev/null &&
-          bash /mnt/tests/service-config-integration.sh'
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mariadb-server redis-server php8.3-fpm php8.3-cli openssl sqlite3 jq libfcgi-bin sudo acl curl gnupg ca-certificates rsync python3 >/dev/null &&
+          bash /mnt/tests/service-config-integration.sh &&
+          bash /mnt/tests/operations-integration.sh'

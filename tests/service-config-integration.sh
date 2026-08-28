@@ -91,7 +91,7 @@ grep -q '^pm = ondemand$' "$pool_file"
 [[ "$(opcache_effective_values 8.3)" == '256 32' ]]
 load_opcache_config
 [[ "${OPCACHE_MEMORY_OVERRIDES[8.3]} ${OPCACHE_STRINGS_OVERRIDES[8.3]}" == '256 32' ]]
-[[ "$(tail -n 2 "$CONFIG_DIR/systemctl-calls")" == $'daemon-reload\nrestart php8.3-fpm' ]]
+[[ "$(tail -n 2 "$CONFIG_DIR/systemctl-calls")" == $'daemon-reload\nreload php8.3-fpm' ]]
 
 memory_mb() { printf '3832'; }
 available_memory_mb() { printf '2080'; }

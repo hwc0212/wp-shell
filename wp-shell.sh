@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.4.8
+# Version 9.5.0
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.4.8"
+readonly WP_SHELL_VERSION="9.5.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -20,6 +20,7 @@ readonly STATE_DIR="${WP_SHELL_STATE_DIR:-/var/lib/wp-shell}"
 readonly METRICS_DB="$STATE_DIR/metrics.sqlite3"
 readonly TUNING_CONFIG_FILE="$CONFIG_DIR/tuning.v1"
 readonly OPCACHE_CONFIG_FILE="$CONFIG_DIR/opcache.v1"
+readonly SITE_POLICY_DIR="$CONFIG_DIR/site-policy"
 readonly LEGACY_VPS_CONFIG_DIR="${WP_SHELL_LEGACY_VPS_CONFIG_DIR:-/etc/wp-vps-manager}"
 readonly LEGACY_SINGLE_CONFIG_DIR="${WP_SHELL_LEGACY_SINGLE_CONFIG_DIR:-/etc/wp-single-deploy}"
 readonly LEGACY_BACKUP_ROOT="${WP_SHELL_LEGACY_BACKUP_ROOT:-/var/backups/wp-shell}"
@@ -80,7 +81,8 @@ color_for_level() {
     local level="$1"
     if ! supports_color; then
         printf ''
-        return
+        # A bare return inside an EXIT/ERR trap can inherit the original failure.
+        return 0
     fi
     case "$level" in
         ERROR) printf '%s' "$RED" ;;
@@ -937,24 +939,34 @@ unique_php_versions() {
 }
 
 install_wp_cli() {
-    local current_version="" temp_file download_url
+    local current_version="" temp_dir download_url fingerprint
     if command -v wp >/dev/null 2>&1; then
         current_version="$(wp --allow-root cli version 2>/dev/null | awk '{print $2}' || true)"
     fi
-    [[ "$current_version" == "$WP_CLI_VERSION" ]] && return 0
+    [[ "$current_version" == "$WP_CLI_VERSION" && "${1:-}" != --verify ]] && return 0
 
-    temp_file="$(mktemp /tmp/wp-cli.XXXXXX.phar)"
+    require_command gpg
+    temp_dir="$(mktemp -d /tmp/wp-cli.XXXXXX)"
     download_url="https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION}/wp-cli-${WP_CLI_VERSION}.phar"
-    curl --fail --location --retry 3 --proto '=https' --tlsv1.2 --output "$temp_file" "$download_url"
-    php "$temp_file" --info >/dev/null
-    install -o root -g root -m 0755 "$temp_file" /usr/local/bin/wp
-    rm -f "$temp_file"
+    (
+        trap 'rm -rf -- "$temp_dir"' EXIT
+        install -d -m 0700 "$temp_dir/gnupg"
+        curl --fail --location --retry 3 --proto '=https' --tlsv1.2 --output "$temp_dir/wp.phar" "$download_url"
+        curl --fail --location --retry 3 --proto '=https' --tlsv1.2 --output "$temp_dir/wp.asc" "$download_url.asc"
+        curl --fail --location --retry 3 --proto '=https' --tlsv1.2 --output "$temp_dir/wp.pgp" https://raw.githubusercontent.com/wp-cli/builds/gh-pages/wp-cli.pgp
+        fingerprint="$(gpg --homedir "$temp_dir/gnupg" --batch --with-colons --show-keys "$temp_dir/wp.pgp" | awk -F: '$1=="fpr" {print $10; exit}')"
+        [[ "$fingerprint" == 63AF7AA15067C05616FDDD88A3A2E8F226F0BC06 ]] || die "WP-CLI signing key fingerprint mismatch; download was not executed."
+        gpg --homedir "$temp_dir/gnupg" --batch --import "$temp_dir/wp.pgp"
+        gpg --homedir "$temp_dir/gnupg" --batch --verify "$temp_dir/wp.asc" "$temp_dir/wp.phar" || die "WP-CLI signature verification failed; download was not executed."
+        php "$temp_dir/wp.phar" --info >/dev/null
+        install -o root -g root -m 0755 "$temp_dir/wp.phar" /usr/local/bin/wp
+    )
 }
 
 install_system_packages() {
     CURRENT_STEP="install system packages"
     apt-get update
-    apt_install ca-certificates curl openssl unzip rsync dnsutils sudo python3 sqlite3 jq libfcgi-bin nginx mariadb-server mariadb-client redis-server certbot fail2ban ufw
+    apt_install ca-certificates curl gnupg openssl unzip rsync dnsutils sudo python3 sqlite3 jq libfcgi-bin nginx mariadb-server mariadb-client redis-server certbot fail2ban ufw
 
     local version
     while IFS= read -r version; do
@@ -981,15 +993,94 @@ site_pool_status_socket() {
     printf '/run/php/%s-status.sock' "$(site_pool_id "$1")"
 }
 
+site_run_user() {
+    local value uid
+    value="$(site_policy_value "$1" user www-data)"
+    [[ "$value" =~ ^[a-z_][a-z0-9_-]*$ && "$value" != root ]] || die "Invalid non-root site identity for $1."
+    uid="$(id -u "$value" 2>/dev/null)" || die "Missing site account: $value"
+    [[ "$uid" =~ ^[1-9][0-9]*$ ]] || die "A site must not run with UID 0."
+    printf '%s' "$value"
+}
+
+create_site_identity() {
+    local domain="$1" user_id
+    user_id="$(site_pool_id "$domain")"
+    if id "$user_id" >/dev/null 2>&1; then
+        [[ "$(getent passwd "$user_id" | cut -d: -f6)" == "/var/www/$domain" ]] || die "Site account name collision: $user_id"
+    else
+        useradd --system --user-group --home-dir "/var/www/$domain" --shell /usr/sbin/nologin "$user_id"
+    fi
+    set_site_policy "$domain" user "$user_id"
+}
+
+isolate_site() (
+    local index="$1" assume_yes="${2:-}" domain wp_path old_user new_user version pool_file stage success=no
+    local -a permission_paths=()
+    domain="${SITE_DOMAINS[$index]}"
+    wp_path="$(site_wp_path "$domain")"
+    [[ "${SITE_MODES[$index]}" == managed && "$wp_path" == "/var/www/$domain/public" && ! -L "$wp_path" ]] || die "UID migration only supports the managed public-directory layout."
+    old_user="$(site_run_user "$domain")"
+    new_user="$(site_pool_id "$domain")"
+    [[ "$old_user" != "$new_user" ]] || { log_message INFO "$domain already uses its own PHP user."; return 0; }
+    grep -Fq '.wp-shell-maintenance' "/etc/nginx/sites-available/$domain" || die "Apply the new Nginx template before migrating: wp-shell site $domain nginx-apply"
+    [[ ! -e "/var/www/$domain/.wp-shell-maintenance" ]] || die "Site is already in maintenance mode; finish that operation first."
+    if [[ "$assume_yes" != --yes ]]; then
+        collect_yes_no "Back up $domain, briefly enable maintenance and migrate its PHP/filesystem user (Redis remains separate)" no || return 0
+    fi
+    require_command getfacl
+    require_command setfacl
+    backup_site "$index" >/dev/null || exit 1
+    version="${SITE_PHP_VERSIONS[$index]}"
+    pool_file="/etc/php/$version/fpm/pool.d/wp-shell-$(site_pool_id "$domain").conf"
+    [[ -f "$pool_file" ]] || die "Managed PHP pool configuration is missing."
+    stage="$(mktemp -d "$STATE_DIR/.isolation.XXXXXX")" || exit 1
+    cp -a "$pool_file" "$stage/pool.conf" || { rm -rf -- "$stage"; exit 1; }
+    permission_paths=("$wp_path" "/var/www/$domain/logs" "$(site_wp_cli_home "$domain")")
+    if [[ -d "/var/www/$domain/.wp-shell" ]]; then permission_paths+=("/var/www/$domain/.wp-shell"); fi
+    getfacl -R --absolute-names "${permission_paths[@]}" > "$stage/permissions.acl" || { rm -rf -- "$stage"; exit 1; }
+    # shellcheck disable=SC2317,SC2329
+    cleanup_isolation() {
+        local rollback_ok=yes
+        if [[ "$success" != yes ]]; then
+            set_site_policy "$domain" user "$old_user" || rollback_ok=no
+            cp -a "$stage/pool.conf" "$pool_file" || rollback_ok=no
+            setfacl --restore="$stage/permissions.acl" || rollback_ok=no
+            php_fpm_service_action reload "$version" || rollback_ok=no
+            if [[ "$rollback_ok" != yes ]]; then
+                log_message ERROR "UID migration rollback is incomplete. Maintenance remains enabled; inspect $stage and the safety backup."
+                return 1
+            fi
+            log_message WARNING "UID migration failed; previous pool/permissions restored. Safety backup retained."
+        fi
+        rm -f -- "/var/www/$domain/.wp-shell-maintenance"
+        rm -rf -- "$stage"
+    }
+    trap cleanup_isolation EXIT
+    install -m 0600 /dev/null "/var/www/$domain/.wp-shell-maintenance" || exit 1
+    create_site_identity "$domain" || exit 1
+    set_site_permissions "$domain" || exit 1
+    chown -R "$new_user":"$(id -gn "$new_user")" "$(site_wp_cli_home "$domain")" || exit 1
+    if [[ -d "/var/www/$domain/.wp-shell" ]]; then chown -R "$new_user":"$(id -gn "$new_user")" "/var/www/$domain/.wp-shell" || exit 1; fi
+    sed -E "s/^user[[:space:]]*=.*/user = $new_user/; s/^group[[:space:]]*=.*/group = $new_user/" "$stage/pool.conf" > "$stage/new-pool.conf" || exit 1
+    install -m 0644 "$stage/new-pool.conf" "$pool_file" || exit 1
+    "php-fpm$version" -t || exit 1
+    php_fpm_service_action reload "$version" || exit 1
+    site_wp_cli "$domain" core is-installed || exit 1
+    success=yes
+    log_message SUCCESS "$domain now uses $new_user and wp-config.php mode 600. Redis isolation is a separate opt-in."
+)
+
 configure_php() {
     CURRENT_STEP="configure PHP-FPM"
     calculate_resource_budget
-    local version memory_limit i domain pool_id pool_file max_children opcache_memory opcache_strings values
+    local version memory_limit i domain pool_id pool_file max_children opcache_memory opcache_strings values run_user run_group
+    local -A before=()
     memory_limit="256M"
     (( $(memory_mb) >= 4096 )) && memory_limit="512M"
 
     while IFS= read -r version; do
         [[ -n "$version" ]] || continue
+        before[$version]="$(php_config_fingerprint "$version")"
         install -d -m 0755 "/etc/php/$version/fpm/pool.d" "/etc/php/$version/fpm/conf.d"
         values="$(opcache_values "$version")"
         read -r opcache_memory opcache_strings <<< "$values"
@@ -1033,12 +1124,14 @@ EOF
         pool_id="$(site_pool_id "$domain")"
         pool_file="/etc/php/$version/fpm/pool.d/wp-shell-${pool_id}.conf"
         max_children="${SITE_PHP_MAX_CHILDREN[$i]}"
-        install -d -o www-data -g www-data -m 0750 "/var/www/$domain/logs"
+        run_user="$(site_run_user "$domain")"
+        run_group="$(id -gn "$run_user")"
+        install -d -o "$run_user" -g www-data -m 0750 "/var/www/$domain/logs"
         cat > "$pool_file" <<EOF
 ; Managed by wp-shell for $domain.
 [$pool_id]
-user = www-data
-group = www-data
+user = $run_user
+group = $run_group
 listen = $(site_pool_socket "$domain")
 listen.owner = www-data
 listen.group = www-data
@@ -1061,17 +1154,29 @@ EOF
 
     while IFS= read -r version; do
         [[ -n "$version" ]] || continue
-        "php-fpm${version}" -t
+        "php-fpm${version}" -t || return 1
         values="$(opcache_values "$version")"
         [[ "$(opcache_effective_values "$version")" == "$values" ]] || die "PHP $version OPcache settings are overridden by another INI file; FPM was not restarted."
         systemctl enable "php${version}-fpm"
-        php_fpm_service_action restart "$version"
+        if systemctl is-active --quiet "php${version}-fpm"; then
+            if [[ "${before[$version]}" != "$(php_config_fingerprint "$version")" ]]; then
+                php_fpm_service_action reload "$version" || return 1
+            fi
+        else
+            php_fpm_service_action start "$version" || return 1
+        fi
     done < <(unique_php_versions)
     if ((SITE_COUNT > 0)); then
         log_message SUCCESS "Configured one PHP-FPM pool per site within a shared ${PHP_TOTAL_BUDGET_MB}MB budget."
     else
         log_message SUCCESS "Configured PHP ${DEFAULT_PHP_VERSION}-FPM. Site pools will be created when websites are added."
     fi
+}
+
+php_config_fingerprint() {
+    local version="$1"
+    find "/etc/php/$version/fpm" -maxdepth 2 -type f \( -name '*wp-shell*' -o -name 'php-fpm.conf' \) -print0 2>/dev/null |
+        sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1
 }
 
 configure_mariadb() {
@@ -1098,6 +1203,11 @@ slow_query_log = 1
 slow_query_log_file = /var/log/mysql/wp-shell-slow.log
 long_query_time = 2
 EOF
+    if [[ -f "$config_file" ]] && cmp -s "$temp_file" "$config_file" && systemctl is-active --quiet mariadb; then
+        rm -f "$temp_file"
+        log_message INFO "MariaDB configuration is unchanged; no restart needed."
+        return 0
+    fi
     [[ -f "$config_file" ]] && cp -a "$config_file" "$backup_file"
     install -o root -g root -m 0644 "$temp_file" "$config_file"
     rm -f "$temp_file"
@@ -1219,13 +1329,15 @@ rotate_redis_secret() {
         domain="${SITE_DOMAINS[$i]}"
         wp_path="$(site_wp_path "$domain")"
         [[ -f "$wp_path/wp-config.php" ]] || continue
+        [[ "$(site_policy_value "$domain" redis-mode)" != isolated ]] || continue
         if ! site_wp_config_set_redis_secret "$domain" "$new_secret"; then
             for ((j = 1; j <= i; j++)); do
                 domain="${SITE_DOMAINS[$j]}"
                 wp_path="$(site_wp_path "$domain")"
                 [[ -f "$wp_path/wp-config.php" ]] || continue
+                [[ "$(site_policy_value "$domain" redis-mode)" != isolated ]] || continue
                 site_wp_config_set_redis_secret "$domain" "$old_secret" || true
-                chmod 0640 "$wp_path/wp-config.php"
+                chmod "$(site_config_mode "$domain")" "$wp_path/wp-config.php"
             done
             printf '%s' "$old_secret" | REDISCLI_AUTH="$new_secret" \
                 redis-cli --no-auth-warning -x CONFIG SET requirepass >/dev/null 2>&1 || true
@@ -1234,7 +1346,7 @@ rotate_redis_secret() {
             rm -f "$config_backup"
             die "Redis credential rotation was rolled back after $domain could not be updated."
         fi
-        chmod 0640 "$wp_path/wp-config.php"
+        chmod "$(site_config_mode "$domain")" "$wp_path/wp-config.php"
         updated_sites=$((updated_sites + 1))
     done
 
@@ -1252,7 +1364,8 @@ configure_redis() {
     CURRENT_STEP="configure Redis"
     calculate_resource_budget
     load_or_create_redis_secret
-    local config_file override_dir override_file previous_config="" previous_override=""
+    local config_file override_dir override_file previous_config="" previous_override="" shared_memory
+    shared_memory="$(shared_redis_memory_budget)" || die "Dedicated Redis allocations exceed the global Redis budget."
     config_file="/etc/redis/wp-shell.conf"
     override_dir="/etc/systemd/system/redis-server.service.d"
     override_file="$override_dir/wp-shell.conf"
@@ -1274,7 +1387,7 @@ databases 16
 dir /var/lib/redis
 dbfilename dump.rdb
 requirepass $REDIS_PASSWORD
-maxmemory ${REDIS_MAX_MEMORY_MB}mb
+maxmemory ${shared_memory}mb
 maxmemory-policy allkeys-lru
 save ""
 appendonly no
@@ -1288,6 +1401,13 @@ ExecStart=
 ExecStart=/usr/bin/redis-server $config_file --supervised systemd --daemonize no
 EOF
     systemctl daemon-reload
+    if [[ -n "$previous_config" && -n "$previous_override" ]] &&
+        cmp -s "$previous_config" "$config_file" && cmp -s "$previous_override" "$override_file" &&
+        systemctl is-active --quiet redis-server; then
+        rm -f "$previous_config" "$previous_override"
+        log_message INFO "Redis configuration is unchanged; no restart needed."
+        return 0
+    fi
     if ! systemctl restart redis-server; then
         if [[ -n "$previous_config" ]]; then
             cp -a "$previous_config" "$config_file"
@@ -1304,12 +1424,157 @@ EOF
     systemctl enable redis-server
 }
 
+shared_redis_memory_budget() {
+    local i value remaining="$REDIS_MAX_MEMORY_MB"
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        [[ "$(site_policy_value "${SITE_DOMAINS[$i]}" redis-mode)" == isolated ]] || continue
+        value="$(site_policy_value "${SITE_DOMAINS[$i]}" redis-memory)"
+        [[ "$value" =~ ^[1-9][0-9]{1,3}$ ]] && ((value >= 32)) || return 1
+        remaining=$((remaining-value))
+    done
+    ((remaining >= 32)) || return 1
+    printf '%s' "$remaining"
+}
+
+site_redis_socket() { printf '/run/wp-shell-redis-%s/redis.sock' "$(site_pool_id "$1")"; }
+
+apply_site_redis_connection() {
+    local domain="$1" index secret
+    index="$(site_index_by_domain "$domain")" || return 1
+    if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
+        secret="$(site_policy_value "$domain" redis-secret)"
+        site_wp_cli "$domain" config set WP_REDIS_SCHEME unix
+        site_wp_cli "$domain" config set WP_REDIS_PATH "$(site_redis_socket "$domain")"
+        site_wp_cli "$domain" config set WP_REDIS_DATABASE 0 --raw
+    else
+        load_or_create_redis_secret
+        secret="$REDIS_PASSWORD"
+        site_wp_cli "$domain" config set WP_REDIS_SCHEME tcp
+        site_wp_cli "$domain" config set WP_REDIS_HOST 127.0.0.1
+        site_wp_cli "$domain" config set WP_REDIS_PORT 6379 --raw
+        site_wp_cli "$domain" config set WP_REDIS_DATABASE "${SITE_REDIS_DATABASES[$index]}" --raw
+    fi
+    site_wp_config_set_redis_secret "$domain" "$secret"
+    chmod "$(site_config_mode "$domain")" "$(site_wp_path "$domain")/wp-config.php"
+}
+
+isolate_site_redis() (
+    local index="$1" memory="${2:-64}" domain run_user redis_user pool unit config stage secret
+    local old_memory remaining success=no wp_config redis_status
+    domain="${SITE_DOMAINS[$index]}"
+    pool="$(site_pool_id "$domain")"
+    run_user="$(site_run_user "$domain")"
+    [[ "$run_user" == "$pool" ]] || die "First migrate this site to its own PHP user: wp-shell site $domain isolate"
+    [[ "$(site_policy_value "$domain" redis-mode)" != isolated ]] || die "This site already has a dedicated Redis instance. Review its configuration before changing its capacity."
+    if [[ ! "$memory" =~ ^[1-9][0-9]{1,3}$ ]] || ((memory < 32)); then die "Specify at least 32MB of the existing global Redis budget."; fi
+    calculate_resource_budget
+    remaining="$(shared_redis_memory_budget)"
+    ((remaining-memory >= 32)) || die "Not enough global Redis budget; at least 32MB must remain for the shared instance."
+    [[ -f /etc/redis/wp-shell.conf ]] || die "The shared Redis instance must already be managed by wp-shell."
+    site_wp_cli "$domain" plugin is-active redis-cache || die "This operation supports the Redis Object Cache plugin."
+    load_or_create_redis_secret
+    old_memory="$(REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli --raw CONFIG GET maxmemory | tail -n 1)"
+    [[ "$old_memory" =~ ^[0-9]+$ ]] || die "Could not read the shared Redis limit."
+    backup_site "$index" >/dev/null
+    wp_config="$(site_wp_path "$domain")/wp-config.php"
+    stage="$(mktemp -d "$STATE_DIR/.redis-isolation.XXXXXX")"
+    cp -a "$wp_config" "$stage/wp-config.php"
+    cp -a /etc/redis/wp-shell.conf "$stage/shared.conf"
+    redis_user="wr_${pool#wp_}"
+    unit="wp-shell-redis-$pool"
+    config="/etc/wp-shell-redis/$pool.conf"
+    [[ ! -e "$config" && ! -e "/etc/systemd/system/$unit.service" ]] || die "A dedicated Redis configuration already exists; inspect it before retrying."
+    # shellcheck disable=SC2317,SC2329
+    cleanup_redis_isolation() {
+        if [[ "$success" != yes ]]; then
+            cp -a "$stage/wp-config.php" "$wp_config"
+            cp -a "$stage/shared.conf" /etc/redis/wp-shell.conf
+            REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli CONFIG SET maxmemory "$old_memory" >/dev/null 2>&1 || true
+            systemctl disable --now "$unit.service" >/dev/null 2>&1 || true
+            rm -f -- "$config" "/etc/systemd/system/$unit.service"
+            systemctl daemon-reload
+            set_site_policy "$domain" redis-mode shared
+            set_site_policy "$domain" redis-secret ''
+            log_message WARNING "Dedicated Redis migration failed; WordPress and the shared Redis limit restored. Safety backup retained."
+        fi
+        rm -rf -- "$stage"
+    }
+    trap cleanup_redis_isolation EXIT
+    if ! id "$redis_user" >/dev/null 2>&1; then
+        useradd --system --user-group --no-create-home --home-dir "/var/lib/$unit" --shell /usr/sbin/nologin "$redis_user"
+    fi
+    [[ "$(getent passwd "$redis_user" | cut -d: -f6)" == "/var/lib/$unit" ]] || die "Redis account name collision."
+    secret="$(generate_password)"
+    install -d -m 0755 /etc/wp-shell-redis
+    cat > "$config" <<EOF
+port 0
+protected-mode yes
+unixsocket $(site_redis_socket "$domain")
+unixsocketperm 660
+daemonize no
+supervised no
+logfile ""
+databases 1
+dir /var/lib/$unit
+requirepass $secret
+maxmemory ${memory}mb
+maxmemory-policy allkeys-lru
+save ""
+appendonly no
+EOF
+    chown root:"$run_user" "$config"
+    chmod 0640 "$config"
+    cat > "/etc/systemd/system/$unit.service" <<EOF
+[Unit]
+Description=Private Redis object cache for $domain
+After=local-fs.target
+[Service]
+User=$redis_user
+Group=$run_user
+ExecStart=/usr/bin/redis-server $config
+Restart=on-failure
+RuntimeDirectory=$unit
+RuntimeDirectoryMode=0750
+StateDirectory=$unit
+StateDirectoryMode=0700
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX
+[Install]
+WantedBy=multi-user.target
+EOF
+    remaining=$((remaining-memory))
+    sed -E "s/^maxmemory[[:space:]].*/maxmemory ${remaining}mb/" "$stage/shared.conf" > /etc/redis/wp-shell.conf
+    [[ "$(REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli CONFIG SET maxmemory "$((remaining*1048576))")" == OK ]] || die "Could not reserve dedicated Redis memory."
+    systemctl daemon-reload
+    systemctl enable --now "$unit.service"
+    [[ "$(REDISCLI_AUTH="$secret" timeout 4s redis-cli -s "$(site_redis_socket "$domain")" ping)" == PONG ]] || die "Dedicated Redis did not start."
+    set_site_policy "$domain" redis-mode isolated
+    set_site_policy "$domain" redis-memory "$memory"
+    set_site_policy "$domain" redis-secret "$secret"
+    site_wp_cli "$domain" config set WP_REDIS_SCHEME unix
+    site_wp_cli "$domain" config set WP_REDIS_PATH "$(site_redis_socket "$domain")"
+    site_wp_cli "$domain" config set WP_REDIS_DATABASE 0 --raw
+    site_wp_config_set_redis_secret "$domain" "$secret"
+    chmod 0600 "$wp_config"
+    redis_status="$(site_wp_cli "$domain" redis status)" || die "WordPress could not inspect its private Redis instance."
+    grep -Fq 'Status: Connected' <<< "$redis_status" || die "WordPress could not connect to its private Redis instance."
+    success=yes
+    log_message SUCCESS "$domain: dedicated Unix-socket Redis (${memory}MB), separate Redis UID, no TCP listener. Shared Redis now has ${remaining}MB; its cache may evict old entries."
+)
+
 configure_fail2ban() {
     CURRENT_STEP="configure Fail2ban"
+    local ssh_port
+    ssh_port="$(detect_ssh_port)"
     install -d -m 0755 /etc/fail2ban/jail.d
-    cat > /etc/fail2ban/jail.d/wp-shell.local <<'EOF'
+    cat > /etc/fail2ban/jail.d/wp-shell.local <<EOF
 [sshd]
 enabled = true
+port = $ssh_port
 backend = systemd
 maxretry = 5
 findtime = 10m
@@ -1323,7 +1588,7 @@ bantime = 1h
 EOF
     fail2ban-client -t
     systemctl enable fail2ban
-    systemctl restart fail2ban
+    systemctl reload-or-restart fail2ban
 }
 
 configure_log_rotation() {
@@ -1337,6 +1602,19 @@ configure_log_rotation() {
     delaycompress
     copytruncate
     create 0640 www-data adm
+}
+EOF
+    cat > /etc/logrotate.d/wp-shell-operations <<'EOF'
+/var/log/wp-shell/*.log {
+    daily
+    maxage 30
+    rotate 4
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
 }
 EOF
 }
@@ -1445,11 +1723,19 @@ EOF
 
 install_nginx_files() {
     local domain="$1" site_temp="$2" cache_temp="${3:-}"
-    local site_target cache_target site_backup="" cache_backup=""
+    local site_target cache_target site_backup="" cache_backup="" snapshot
     site_target="/etc/nginx/sites-available/$domain"
     cache_target="/etc/nginx/conf.d/wp-cache-$domain.conf"
     [[ -f "$site_target" ]] && site_backup="$(mktemp /tmp/nginx-site.XXXXXX)" && cp -a "$site_target" "$site_backup"
     [[ -f "$cache_target" ]] && cache_backup="$(mktemp /tmp/nginx-cache.XXXXXX)" && cp -a "$cache_target" "$cache_backup"
+    if [[ -f "$site_target" ]]; then
+        install -d -m 0700 "$CONFIG_DIR/nginx-backups"
+        snapshot="$(mktemp -d "$CONFIG_DIR/nginx-backups/$domain-$(date +%Y%m%d-%H%M%S).XXXXXX")"
+        cp -a "$site_target" "$snapshot/site.conf"
+        [[ ! -f "$cache_target" ]] || cp -a "$cache_target" "$snapshot/cache.conf"
+        [[ ! -d "/etc/nginx/wp-shell-custom/$domain" ]] || cp -a "/etc/nginx/wp-shell-custom/$domain" "$snapshot/custom"
+        log_message INFO "Previous Nginx configuration saved in $snapshot"
+    fi
     install -o root -g root -m 0644 "$site_temp" "$site_target"
     if [[ -n "$cache_temp" ]]; then
         install -o root -g root -m 0644 "$cache_temp" "$cache_target"
@@ -1457,16 +1743,16 @@ install_nginx_files() {
         rm -f "$cache_target"
     fi
     ln -sfn "$site_target" "/etc/nginx/sites-enabled/$domain"
-    if ! nginx -t; then
+    if ! nginx -t || ! systemctl reload nginx; then
         if [[ -n "$site_backup" ]]; then cp -a "$site_backup" "$site_target"; else rm -f "$site_target" "/etc/nginx/sites-enabled/$domain"; fi
         if [[ -n "$cache_backup" ]]; then cp -a "$cache_backup" "$cache_target"; else rm -f "$cache_target"; fi
         nginx -t || true
+        systemctl reload nginx || true
         rm -f "$site_backup" "$cache_backup"
         die "Nginx configuration validation failed; $domain was rolled back."
     fi
     rm -f "$site_backup" "$cache_backup"
     systemctl enable nginx
-    systemctl reload nginx
 }
 
 configure_acme_site() {
@@ -1529,6 +1815,7 @@ configure_https_site() {
     zone="$(nginx_zone_name "$domain")"
     site_temp="$(mktemp /tmp/nginx-site.XXXXXX)"
     cache_temp="$(mktemp /tmp/nginx-cache.XXXXXX)"
+    install -d -m 0755 "/etc/nginx/wp-shell-custom/$domain"
     cat > "$cache_temp" <<EOF
 fastcgi_cache_path $(site_cache_dir "$domain") levels=1:2 keys_zone=${zone}:16m inactive=60m max_size=512m use_temp_path=off;
 EOF
@@ -1571,14 +1858,25 @@ server {
     if (\$host != $primary) { return 301 https://$primary\$request_uri; }
 
     client_max_body_size 128M;
+    gzip on;
+    gzip_vary on;
+    gzip_comp_level 5;
+    gzip_min_length 1024;
+    gzip_types text/css text/plain text/xml application/javascript application/json application/xml image/svg+xml;
     access_log /var/www/$domain/logs/nginx-access.log wp_shell;
     error_log /var/www/$domain/logs/nginx-error.log warn;
 
     set \$skip_cache 0;
-    if (\$request_method = POST) { set \$skip_cache 1; }
+    if (\$request_method !~ ^(GET|HEAD)$) { set \$skip_cache 1; }
+    if (\$http_authorization != "") { set \$skip_cache 1; }
     if (\$query_string != "") { set \$skip_cache 1; }
-    if (\$request_uri ~* "^/(wp-admin|wp-login.php|wp-cron.php|xmlrpc.php|cart|checkout|my-account|wc-api|feed|sitemap)") { set \$skip_cache 1; }
+    if (\$request_uri ~* "(^|/)(wp-admin|wp-login\\.php|wp-cron\\.php|wp-json|xmlrpc\\.php|cart|checkout|my-account|wc-api|feed|sitemap)(/|\\?|$)") { set \$skip_cache 1; }
     if (\$http_cookie ~* "wordpress_logged_in|comment_author|wp-postpass|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session_") { set \$skip_cache 1; }
+    if (-f /var/www/$domain/.wp-shell-maintenance) { return 503; }
+
+    # Root-owned per-site overrides survive template refreshes. Put staging
+    # exclusions/custom WooCommerce paths here; never edit the generated file.
+    include /etc/nginx/wp-shell-custom/$domain/*.conf;
 
     location / {
         try_files \$uri \$uri/ /index.php?\$args;
@@ -1600,7 +1898,15 @@ server {
         deny all;
     }
 
-    location ~* ^/(?:wp-config(?:-sample)?\.php|wp-settings\.php|wp-load\.php|readme\.html|license\.txt)$ {
+    location ~* /(?:wp-config(?:-sample)?\.php|wp-settings\.php|wp-load\.php|readme\.html|license\.txt)$ {
+        deny all;
+    }
+
+    location ~* /wp-content/(?:wpvividbackups|updraft|ai1wm-backups|backup-db)(?:/|$) {
+        deny all;
+    }
+
+    location ~* ^/(?:backups|cache|logs)(?:/|$) {
         deny all;
     }
 
@@ -1609,6 +1915,10 @@ server {
     }
 
     location ~* \.(?:log|sql|ini|conf|bak|old|orig|save|swp)$ {
+        deny all;
+    }
+
+    location ~* \.(?:log|sql)(?:\.[0-9]+)?\.(?:gz|zip|bz2|xz)$ {
         deny all;
     }
 
@@ -1638,7 +1948,7 @@ server {
         add_header X-Frame-Options "SAMEORIGIN" always;
         add_header X-Content-Type-Options "nosniff" always;
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-        add_header Cache-Control "public, max-age=2592000, immutable";
+        # Same-URL media may be replaced. Do not promise immutability.
         access_log off;
         try_files \$uri =404;
     }
@@ -1651,10 +1961,11 @@ EOF
 }
 
 create_site_directories() {
-    local domain="$1" wp_path="$2"
+    local domain="$1" wp_path="$2" run_user
+    run_user="$(site_run_user "$domain")"
     install -d -o root -g root -m 0755 "/var/www/$domain"
-    install -d -o www-data -g www-data -m 0755 "$wp_path"
-    install -d -o www-data -g www-data -m 0750 "/var/www/$domain/logs"
+    install -d -o "$run_user" -g www-data -m 0755 "$wp_path"
+    install -d -o "$run_user" -g www-data -m 0750 "/var/www/$domain/logs"
     ensure_site_storage "$domain"
 }
 
@@ -1681,31 +1992,35 @@ migrate_legacy_backups() {
 }
 
 ensure_site_storage() {
-    local domain="$1" cache_dir backup_dir wp_cli_home
+    local domain="$1" cache_dir backup_dir wp_cli_home run_user
+    run_user="$(site_run_user "$domain")"
     cache_dir="$(site_cache_dir "$domain")"
     backup_dir="$(site_backup_dir "$domain")"
     wp_cli_home="$(site_wp_cli_home "$domain")"
     install -d -o www-data -g www-data -m 0750 "$cache_dir"
-    install -d -o www-data -g www-data -m 0750 "$wp_cli_home" "$wp_cli_home/cache"
+    install -d -o "$run_user" -g "$(id -gn "$run_user")" -m 0700 "$wp_cli_home" "$wp_cli_home/cache"
     install -d -o root -g root -m 0700 "$backup_dir"
     migrate_legacy_backups "$LEGACY_BACKUP_ROOT/$domain" "$backup_dir"
     migrate_legacy_backups "$LEGACY_SINGLE_BACKUP_ROOT/$domain" "$backup_dir"
 }
 
 site_wp_cli() {
-    local domain="$1" index wp_path site_home wp_cli_home
+    local domain="$1" index wp_path site_home wp_cli_home run_user php_binary
     shift
     index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
     wp_path="${SITE_PATHS[$index]}"
     site_home="/var/www/$domain"
     wp_cli_home="$(site_wp_cli_home "$domain")"
-    install -d -o www-data -g www-data -m 0750 "$wp_cli_home" "$wp_cli_home/cache"
+    run_user="$(site_run_user "$domain")"
+    php_binary="/usr/bin/php${SITE_PHP_VERSIONS[$index]}"
+    [[ -x "$php_binary" ]] || die "Missing PHP CLI for ${SITE_PHP_VERSIONS[$index]}."
+    install -d -o "$run_user" -g "$(id -gn "$run_user")" -m 0700 "$wp_cli_home" "$wp_cli_home/cache"
     (
         cd "$wp_path"
-        sudo -u www-data env \
+        timeout "${WP_SHELL_WP_TIMEOUT:-600}s" sudo -u "$run_user" env \
             HOME="$site_home" \
             WP_CLI_CACHE_DIR="$wp_cli_home/cache" \
-            wp --path="$wp_path" "$@"
+            "$php_binary" /usr/local/bin/wp --path="$wp_path" "$@"
     )
 }
 
@@ -1731,7 +2046,7 @@ site_wp_config_set_redis_secret() {
     [[ "$secret" =~ ^[a-f0-9]{48}$ ]] || return 1
     wp_path="$(site_wp_path "$domain")"
     wp_config="$wp_path/wp-config.php"
-    [[ -f "$wp_config" ]] || return 1
+    [[ -f "$wp_config" && ! -L "$wp_config" ]] || return 1
     placeholder="__WP_SHELL_REDIS_SECRET_PLACEHOLDER__"
     original_mode="$(stat -c '%a' "$wp_config")"
     backup="$(mktemp "$wp_path/.wp-config.backup.XXXXXX")"
@@ -1760,7 +2075,7 @@ site_wp_config_set_redis_secret() {
         return 1
     fi
     chown --reference="$wp_config" "$temp_file"
-    chmod 0640 "$temp_file"
+    if [[ "$original_mode" == 600 ]]; then chmod 0600 "$temp_file"; else chmod "$(site_config_mode "$domain")" "$temp_file"; fi
     mv -f "$temp_file" "$wp_config"
     rm -f "$backup"
 }
@@ -1770,23 +2085,26 @@ site_credentials_file() {
 }
 
 set_site_permissions() {
-    local domain="$1" wp_path site_root
+    local domain="$1" wp_path site_root run_user dir_mode=0755 file_mode=0644 config_mode=0640
     wp_path="$(site_wp_path "$domain")"
+    [[ ! -L "$wp_path/wp-config.php" ]] || die "Refusing to change permissions through a wp-config.php symlink."
     site_root="/var/www/$domain"
+    run_user="$(site_run_user "$domain")"
+    if [[ "$run_user" != www-data ]]; then dir_mode=0750; file_mode=0640; config_mode=0600; fi
     find "$wp_path" -xdev \
         \( -path "$site_root/backups" -o -path "$site_root/cache" -o \
            -path "$site_root/logs" -o -path "$site_root/.wp-cli" \) -prune -o \
-        -exec chown -h www-data:www-data {} +
+        -exec chown -h "$run_user":www-data {} +
     find "$wp_path" -xdev \
         \( -path "$site_root/backups" -o -path "$site_root/cache" -o \
            -path "$site_root/logs" -o -path "$site_root/.wp-cli" \) -prune -o \
-        -type d -exec chmod 0755 {} +
+        -type d -exec chmod "$dir_mode" {} +
     find "$wp_path" -xdev \
         \( -path "$site_root/backups" -o -path "$site_root/cache" -o \
            -path "$site_root/logs" -o -path "$site_root/.wp-cli" \) -prune -o \
-        -type f -exec chmod 0644 {} +
-    [[ -f "$wp_path/wp-config.php" ]] && chmod 0640 "$wp_path/wp-config.php"
-    chown -R www-data:www-data "$site_root/logs"
+        -type f -exec chmod "$file_mode" {} +
+    [[ -f "$wp_path/wp-config.php" ]] && chmod "$config_mode" "$wp_path/wp-config.php"
+    chown -R "$run_user":www-data "$site_root/logs"
     chmod 0750 "/var/www/$domain/logs"
     ensure_site_storage "$domain"
     chown -R root:root "$(site_backup_dir "$domain")"
@@ -1860,7 +2178,6 @@ repair_wordpress_core() {
         die "$domain still fails strict WordPress core verification after repair."
     fi
     set_site_permissions "$domain"
-    configure_https_site "$index"
     site_wp_cli "$domain" maintenance-mode deactivate >/dev/null 2>&1 || true
     clear_site_cache "$index"
     log_message SUCCESS "Repaired and strictly verified WordPress $version core for $domain; removed $removed unexpected core file(s)."
@@ -1876,6 +2193,10 @@ install_wordpress_site() {
     initial_mode="${SITE_MODES[$index]}"
     load_or_create_redis_secret
     redis_password="$REDIS_PASSWORD"
+    if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
+        redis_password="$(site_policy_value "$domain" redis-secret)"
+        [[ "$redis_password" =~ ^[a-f0-9]{48}$ ]] || die "Invalid private Redis credential."
+    fi
 
     if [[ ! -f "$wp_path/wp-load.php" ]]; then
         download_url="$(wordpress_release_zip_url "$WORDPRESS_LOCALE")"
@@ -1897,7 +2218,13 @@ install_wordpress_site() {
     site_wp_cli "$domain" config set WP_REDIS_PORT 6379 --raw
     site_wp_config_set_redis_secret "$domain" "$redis_password" || \
         die "The Redis credential could not be written safely for $domain."
-    site_wp_cli "$domain" config set WP_REDIS_DATABASE "${SITE_REDIS_DATABASES[$index]}" --raw
+    if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
+        site_wp_cli "$domain" config set WP_REDIS_SCHEME unix
+        site_wp_cli "$domain" config set WP_REDIS_PATH "$(site_redis_socket "$domain")"
+        site_wp_cli "$domain" config set WP_REDIS_DATABASE 0 --raw
+    else
+        site_wp_cli "$domain" config set WP_REDIS_DATABASE "${SITE_REDIS_DATABASES[$index]}" --raw
+    fi
     site_wp_cli "$domain" config set WP_REDIS_PREFIX "${domain}:"
     memory_limit="256M"
     (( $(memory_mb) >= 4096 )) && memory_limit="512M"
@@ -2201,7 +2528,11 @@ site_status() {
     printf '  Nginx: %s\n' "$(systemctl is-active nginx 2>/dev/null || true)"
     printf '  PHP-FPM: %s\n' "$(systemctl is-active "php${php_version}-fpm" 2>/dev/null || true)"
     printf '  MariaDB: %s\n' "$(systemctl is-active mariadb 2>/dev/null || true)"
-    printf '  Redis: %s\n' "$(systemctl is-active redis-server 2>/dev/null || true)"
+    if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
+        printf '  Redis: %s (private socket)\n' "$(systemctl is-active "wp-shell-redis-$(site_pool_id "$domain")" 2>/dev/null || true)"
+    else
+        printf '  Redis: %s (shared)\n' "$(systemctl is-active redis-server 2>/dev/null || true)"
+    fi
 }
 
 site_tls_expiry() {
@@ -2271,7 +2602,11 @@ show_site_deployment_summary() {
     printf 'WordPress      %s (%s)\n' "$wordpress_version" "$WORDPRESS_LOCALE"
     printf 'PHP            %s\n' "${SITE_PHP_VERSIONS[$index]}"
     printf 'WooCommerce    %s\n' "$woo_state"
-    printf 'Redis cache    enabled (DB %s)\n' "${SITE_REDIS_DATABASES[$index]}"
+    if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
+        printf 'Redis cache    enabled (private Unix socket, DB 0)\n'
+    else
+        printf 'Redis cache    enabled (shared instance, DB %s)\n' "${SITE_REDIS_DATABASES[$index]}"
+    fi
     printf 'TLS expires    %s\n' "$(site_tls_expiry "$domain")"
     printf 'Document root  %s\n' "${SITE_PATHS[$index]}"
     printf 'Credentials    %s\n' "$credentials_state"
@@ -2289,10 +2624,20 @@ show_site_deployment_summary() {
 
 create_mysql_defaults_file() {
     local domain="$1" defaults_file db_user db_password db_host escaped_password
-    defaults_file="$(mktemp /run/wp-vps-mysql.XXXXXX)"
-    db_user="$(site_wp_cli "$domain" config get DB_USER)"
-    db_password="$(site_wp_cli "$domain" config get DB_PASSWORD)"
-    db_host="$(site_wp_cli "$domain" config get DB_HOST)"
+    defaults_file="$(mktemp /run/wp-vps-mysql.XXXXXX)" || return 1
+    if ! db_user="$(site_wp_cli "$domain" config get DB_USER)" ||
+       ! db_password="$(site_wp_cli "$domain" config get DB_PASSWORD)" ||
+       ! db_host="$(site_wp_cli "$domain" config get DB_HOST)"; then
+        rm -f "$defaults_file"
+        log_message ERROR "Could not read database connection settings for $domain." >&2
+        return 1
+    fi
+    if [[ ! "$db_user" =~ ^[a-zA-Z0-9_\$-]{1,64}$ || "$db_user" == root ||
+          ! "$db_host" =~ ^[a-zA-Z0-9_.:-]+$ || "$db_password" == *$'\n'* || "$db_password" == *$'\r'* ]]; then
+        rm -f "$defaults_file"
+        log_message ERROR "Unsafe database connection settings for $domain; use a dedicated database user." >&2
+        return 1
+    fi
     escaped_password="${db_password//\\/\\\\}"
     escaped_password="${escaped_password//\"/\\\"}"
     {
@@ -2300,47 +2645,222 @@ create_mysql_defaults_file() {
         printf 'user=%s\n' "$db_user"
         printf 'password="%s"\n' "$escaped_password"
         printf 'host=%s\n' "$db_host"
-    } > "$defaults_file"
-    chmod 0600 "$defaults_file"
+    } > "$defaults_file" || { rm -f "$defaults_file"; return 1; }
+    chmod 0600 "$defaults_file" || { rm -f "$defaults_file"; return 1; }
     printf '%s' "$defaults_file"
 }
 
-backup_site() {
+verify_backup_directory() {
+    local directory="$1" domain="$2"
+    [[ -d "$directory" && ! -L "$directory" && -s "$directory/SHA256SUMS" ]] || return 1
+    awk '
+        BEGIN {expected["files.tar.gz"]=1; expected["database.sql.gz"]=1; expected["manifest.txt"]=1}
+        NF != 2 || length($1) != 64 || $1 !~ /^[[:xdigit:]]+$/ || !($2 in expected) || seen[$2]++ {bad=1}
+        END {exit (bad || NR != 3)}' "$directory/SHA256SUMS" || return 1
+    (cd "$directory" && sha256sum --strict --check SHA256SUMS >/dev/null) || return 1
+    grep -Fxq "domain=$domain" "$directory/manifest.txt" || return 1
+    gzip -t "$directory/database.sql.gz" || return 1
+    tar -tzf "$directory/files.tar.gz" >/dev/null || return 1
+}
+
+site_policy_value() {
+    local domain="$1" key="$2" fallback="${3:-}" path
+    validate_domain "$domain" && [[ "$key" =~ ^[a-z-]+$ ]] || return 1
+    path="$SITE_POLICY_DIR/$domain/$key"
+    if [[ -f "$path" && ! -L "$path" ]]; then
+        head -n 1 "$path"
+    else
+        printf '%s' "$fallback"
+    fi
+}
+
+set_site_policy() {
+    local domain="$1" key="$2" value="$3" temp
+    validate_domain "$domain" && [[ "$key" =~ ^[a-z-]+$ && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+    install -d -m 0700 "$SITE_POLICY_DIR" "$SITE_POLICY_DIR/$domain"
+    temp="$(mktemp "$SITE_POLICY_DIR/$domain/.policy.XXXXXX")"
+    printf '%s\n' "$value" > "$temp"
+    chmod 0600 "$temp"
+    mv -T "$temp" "$SITE_POLICY_DIR/$domain/$key"
+}
+
+validate_encrypted_remote() {
+    local remote="$1" name
+    [[ "$remote" =~ ^[a-zA-Z0-9_-]+:[a-zA-Z0-9_./-]*$ && "$remote" != *..* ]] || return 1
+    name="${remote%%:*}"
+    # Only the selected remote type is inspected. Never print credentials/config dump.
+    rclone config dump 2>/dev/null | jq -e --arg name "$name" '.[$name].type == "crypt"' >/dev/null
+}
+
+upload_remote_backup() {
+    local domain="$1" directory="$2" remote target
+    remote="$(site_policy_value "$domain" backup-remote)"
+    [[ -n "$remote" ]] || return 0
+    require_command rclone
+    validate_encrypted_remote "$remote" || { log_message ERROR "The configured remote must be an existing rclone crypt remote." >&2; return 1; }
+    target="${remote%/}/$domain/$(basename "$directory")"
+    if ! timeout 2h rclone copy -- "$directory" "$target" ||
+        ! timeout 2h rclone check --download -- "$directory" "$target"; then
+            log_message ERROR "Remote upload/verification failed. The verified local backup was retained; local retention was skipped." >&2
+            return 1
+    fi
+    log_message SUCCESS "Encrypted remote backup verified for $domain. Remote backups are never deleted automatically." >&2
+}
+
+backup_command() {
+    local action="${1:-}" domain index remote directory backup_id
+    case "$action" in
+        remote)
+            domain="$(site_domain_from_selector "${2:-}")" || die "Unknown site ID or domain."
+            remote="${3:-status}"
+            case "$remote" in
+                status) printf 'Remote: %s\n' "$(site_policy_value "$domain" backup-remote disabled)" ;;
+                off) set_site_policy "$domain" backup-remote ''; log_message INFO "Remote upload disabled; existing remote files were not removed." ;;
+                *) require_command rclone; validate_encrypted_remote "$remote" || die "Configure an encrypted rclone crypt remote as root first."
+                   set_site_policy "$domain" backup-remote "$remote"
+                   log_message SUCCESS "Future backups of $domain will also be uploaded and verified on the encrypted remote."
+                   ;;
+            esac
+            ;;
+        verify|drill)
+            domain="$(site_domain_from_selector "${2:-}")" || die "Unknown site ID or domain."
+            backup_id="${3:-latest}"
+            if [[ "$backup_id" == latest ]]; then
+                backup_id="$(find "$(site_backup_dir "$domain")" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' -printf '%f\n' | sort -r | head -n 1)"
+            fi
+            [[ "$backup_id" =~ ^20[0-9]{6}-[0-9]{6}$ ]] || die "No valid backup ID was selected."
+            directory="$(site_backup_dir "$domain")/$backup_id"
+            verify_backup_directory "$directory" "$domain" || die "Backup verification failed."
+            if [[ "$action" == drill ]]; then backup_restore_drill "$domain" "$directory"; fi
+            log_message SUCCESS "$domain $backup_id: $action completed."
+            ;;
+        '') die "Usage: wp-shell backup DOMAIN|ID, or backup verify|drill|remote DOMAIN|ID [VALUE]" ;;
+        *) index="$(site_domain_from_selector "$action")" || die "Unknown site ID or domain."; site_action "$index" backup ;;
+    esac
+}
+
+validate_restore_archive() {
+    python3 - "$1" <<'PY'
+import sys, tarfile, posixpath
+with tarfile.open(sys.argv[1], "r:gz") as archive:
+    for member in archive:
+        path = posixpath.normpath(member.name)
+        if path.startswith("/") or path == ".." or path.startswith("../") or member.isdev():
+            raise SystemExit("Unsafe archive member; restore refused.")
+        if member.issym() or member.islnk():
+            raise SystemExit("Archive contains links; review them before a privileged restore.")
+PY
+}
+
+cleanup_restore_drill() {
+    local database="$1" directory="$2"
+    [[ "$database" =~ ^drill_[a-f0-9]{12}$ && "$directory" == /tmp/wp-shell-drill.* ]] || return 1
+    mariadb --protocol=socket -e "DROP DATABASE IF EXISTS \`$database\`; DROP USER IF EXISTS '$database'@'localhost';" >/dev/null 2>&1 || true
+    rm -rf -- "$directory"
+}
+
+backup_restore_drill() (
+    local domain="$1" directory="$2" stage drill_db password defaults tables
+    require_command python3
+    stage="$(mktemp -d /tmp/wp-shell-drill.XXXXXX)"
+    drill_db="drill_$(openssl rand -hex 6)"
+    password="$(generate_password)"
+    defaults="$stage/mysql.cnf"
+    # The dump is untrusted SQL: execute only as a temporary user confined to an empty DB.
+    # Capture immutable cleanup arguments before function-local scopes unwind.
+    # shellcheck disable=SC2064
+    trap "$(printf 'cleanup_restore_drill %q %q' "$drill_db" "$stage")" EXIT
+    validate_restore_archive "$directory/files.tar.gz" || exit 1
+    mkdir "$stage/files"
+    tar --no-same-owner --no-same-permissions -xzf "$directory/files.tar.gz" -C "$stage/files"
+    [[ -f "$stage/files/wp-config.php" ]] || die "Backup is missing wp-config.php."
+    mariadb --protocol=socket <<SQL
+CREATE DATABASE \`$drill_db\`;
+CREATE USER '$drill_db'@'localhost' IDENTIFIED BY '$password';
+GRANT ALL PRIVILEGES ON \`$drill_db\`.* TO '$drill_db'@'localhost';
+SQL
+    printf '[client]\nuser=%s\npassword=%s\nhost=localhost\n' "$drill_db" "$password" > "$defaults"
+    # shellcheck disable=SC2016
+    timeout 30m bash -o pipefail -c 'gzip -dc -- "$1" | mariadb --defaults-extra-file="$2" --binary-mode --local-infile=0 "$3"' _ "$directory/database.sql.gz" "$defaults" "$drill_db" || exit 1
+    tables="$(mariadb --defaults-extra-file="$defaults" --batch --skip-column-names -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$drill_db';")"
+    ((tables > 0)) || die "The restored database contains no tables."
+    log_message SUCCESS "$domain: files extracted and $tables tables restored to a disposable database. No website/PHP code was executed; this is not a full application acceptance test."
+    exit 0
+)
+
+backup_site() (
     CURRENT_STEP="back up the site"
     local index="$1" domain wp_path timestamp site_backup_root temp_dir final_dir defaults_file db_name
+    local required_kb free_kb database_kb
+    temp_dir=""; defaults_file=""
+    trap '[[ -z "$defaults_file" ]] || rm -f -- "$defaults_file"; [[ -z "$temp_dir" ]] || rm -rf -- "$temp_dir"' EXIT
     domain="${SITE_DOMAINS[$index]}"
     wp_path="$(site_wp_path "$domain")"
-    [[ -f "$wp_path/wp-config.php" ]] || die "WordPress is not installed for $domain."
+    [[ -f "$wp_path/wp-config.php" ]] || { log_message ERROR "WordPress is not installed for $domain." >&2; exit 1; }
+    [[ "$BACKUP_RETENTION_DAYS" =~ ^[1-9][0-9]{0,3}$ ]] || exit 1
     timestamp="$(date +%Y%m%d-%H%M%S)"
-    ensure_site_storage "$domain"
+    ensure_site_storage "$domain" || exit 1
     site_backup_root="$(site_backup_dir "$domain")"
-    temp_dir="$(mktemp -d "$site_backup_root/.incomplete.XXXXXX")"
+    # Imported layouts can place private storage below the document root.
+    # Exclude those exact directories, never recursively back up old backups.
+    local storage_path relative_path
+    local -a archive_excludes=(--exclude='./wp-content/cache/*' --exclude='./wp-content/uploads/cache/*')
+    local -a size_excludes=()
+    for storage_path in "$site_backup_root" "$(site_cache_dir "$domain")" "$(site_wp_cli_home "$domain")" "/var/www/$domain/logs"; do
+        [[ -e "$storage_path" ]] || continue
+        storage_path="$(readlink -f "$storage_path")" || exit 1
+        if [[ "$storage_path/" == "$(readlink -f "$wp_path")/"* ]]; then
+            relative_path="${storage_path#"$(readlink -f "$wp_path")/"}"
+            [[ "$relative_path" != "$storage_path" && -n "$relative_path" ]] || exit 1
+            archive_excludes+=("--exclude=./$relative_path")
+            size_excludes+=("--exclude=$relative_path")
+        fi
+    done
+    required_kb="$(du -sk "${size_excludes[@]}" -- "$wp_path" | awk '{print $1}')" || exit 1
+    free_kb="$(df -Pk "$site_backup_root" | awk 'NR==2 {print $4}')" || exit 1
+    if [[ ! "$required_kb" =~ ^[0-9]+$ || ! "$free_kb" =~ ^[0-9]+$ ]] || ((free_kb <= required_kb + 262144)); then
+        log_message ERROR "Insufficient free disk for a conservative file backup estimate plus 256MB reserve." >&2; exit 1;
+    fi
+    temp_dir="$(mktemp -d "$site_backup_root/.incomplete.XXXXXX")" || exit 1
     final_dir="$site_backup_root/$timestamp"
-    defaults_file="$(create_mysql_defaults_file "$domain")"
-    db_name="$(site_wp_cli "$domain" config get DB_NAME)"
+    [[ ! -e "$final_dir" ]] || { log_message ERROR "A backup already exists for this second; retry shortly." >&2; exit 1; }
+    defaults_file="$(create_mysql_defaults_file "$domain")" || exit 1
+    db_name="$(site_wp_cli "$domain" config get DB_NAME)" || exit 1
+    [[ "$db_name" =~ ^[a-zA-Z0-9_\$-]{1,64}$ ]] || exit 1
+    database_kb="$(mariadb --defaults-extra-file="$defaults_file" --connect-timeout=5 --batch --skip-column-names -e "SELECT COALESCE(CEIL(SUM(data_length+index_length)/1024),0) FROM information_schema.tables WHERE table_schema='$db_name';")" || exit 1
+    [[ "$database_kb" =~ ^[0-9]+$ ]] || exit 1
+    if ((free_kb <= required_kb + database_kb*2 + 262144)); then
+        log_message ERROR "Insufficient disk for files, a conservative database dump estimate and 256MB reserve." >&2; exit 1
+    fi
 
-    if ! tar --exclude='./wp-content/cache/*' --exclude='./wp-content/uploads/cache/*' -czf "$temp_dir/files.tar.gz" -C "$wp_path" .; then
-        rm -rf -- "$temp_dir"
-        rm -f "$defaults_file"
-        die "File backup failed for $domain."
+    if ! tar "${archive_excludes[@]}" -czf "$temp_dir/files.tar.gz" -C "$wp_path" .; then
+        log_message ERROR "File backup failed for $domain." >&2; exit 1
     fi
     if ! mariadb-dump --defaults-extra-file="$defaults_file" --single-transaction --quick --routines --triggers --add-drop-table "$db_name" | gzip -9 > "$temp_dir/database.sql.gz"; then
-        rm -rf -- "$temp_dir"
-        rm -f "$defaults_file"
-        die "Database backup failed for $domain."
+        log_message ERROR "Database backup failed for $domain." >&2; exit 1
     fi
-    rm -f "$defaults_file"
+    rm -f "$defaults_file" || exit 1
+    defaults_file=""
+    local core_version
+    core_version="$(site_wp_cli "$domain" core version)" || exit 1
     {
         printf 'domain=%s\n' "$domain"
+        printf 'database_name=%s\n' "$db_name"
         printf 'created_at=%s\n' "$(date --iso-8601=seconds)"
-        printf 'wordpress_version=%s\n' "$(site_wp_cli "$domain" core version)"
-    } > "$temp_dir/manifest.txt"
-    (cd "$temp_dir" && sha256sum files.tar.gz database.sql.gz manifest.txt > SHA256SUMS)
-    mv "$temp_dir" "$final_dir"
-    find "$site_backup_root" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' -mtime "+$BACKUP_RETENTION_DAYS" -exec rm -rf -- {} +
+        printf 'wordpress_version=%s\n' "$core_version"
+    } > "$temp_dir/manifest.txt" || exit 1
+    (cd "$temp_dir" && sha256sum files.tar.gz database.sql.gz manifest.txt > SHA256SUMS) || {
+        log_message ERROR "Backup checksum generation failed for $domain." >&2; exit 1;
+    }
+    verify_backup_directory "$temp_dir" "$domain" || { log_message ERROR "Backup verification failed for $domain." >&2; exit 1; }
+    mv -T "$temp_dir" "$final_dir" || exit 1
+    temp_dir=""
+    upload_remote_backup "$domain" "$final_dir" || exit 1
+    find "$site_backup_root" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' -mtime "+$BACKUP_RETENTION_DAYS" -exec rm -rf -- {} + || exit 1
     log_message SUCCESS "Backup completed: $final_dir"
     printf '%s\n' "$final_dir"
-}
+    exit 0
+)
 
 restore_site() {
     CURRENT_STEP="restore the site"
@@ -2351,7 +2871,10 @@ restore_site() {
     ensure_site_storage "$domain"
     backup_dir="$(site_backup_dir "$domain")/$backup_id"
     [[ -d "$backup_dir" ]] || die "Backup not found: $backup_dir"
-    (cd "$backup_dir" && sha256sum --check SHA256SUMS)
+    verify_backup_directory "$backup_dir" "$domain" || die "Backup verification failed; nothing was restored."
+    validate_restore_archive "$backup_dir/files.tar.gz" || die "Unsafe archive; nothing was restored."
+    grep -Fq '.wp-shell-maintenance' "/etc/nginx/sites-available/$domain" || die "Apply the maintenance-capable Nginx template before restoring."
+    [[ ! -e "/var/www/$domain/.wp-shell-maintenance" ]] || die "Site is already in maintenance mode; resolve that operation first."
     log_message INFO "Creating a safety backup before restore."
     backup_site "$index" >/dev/null
     defaults_file="$(create_mysql_defaults_file "$domain")"
@@ -2364,32 +2887,50 @@ restore_site() {
         cleanup_restore() {
             rm -rf -- "$local_stage"
             rm -f "$defaults_file"
-            site_wp_cli "$domain" maintenance-mode deactivate >/dev/null 2>&1 || true
         }
         trap cleanup_restore EXIT
         tar -xzf "$backup_dir/files.tar.gz" -C "$local_stage"
         [[ -f "$local_stage/wp-config.php" ]]
+        install -m 0600 /dev/null "/var/www/$domain/.wp-shell-maintenance"
         site_wp_cli "$domain" maintenance-mode activate >/dev/null 2>&1 || true
-        rsync -a --delete "$local_stage/" "$wp_path/"
-        gzip -dc "$backup_dir/database.sql.gz" | mariadb --defaults-extra-file="$defaults_file" "$db_name"
+        local storage_path relative_path
+        local -a restore_excludes=()
+        for storage_path in "$(site_backup_dir "$domain")" "$(site_cache_dir "$domain")" "$(site_wp_cli_home "$domain")" "/var/www/$domain/logs"; do
+            if [[ "$storage_path/" == "$wp_path/"* ]]; then
+                relative_path="${storage_path#"$wp_path/"}"
+                restore_excludes+=("--exclude=/$relative_path/")
+            fi
+        done
+        rsync -a --delete "${restore_excludes[@]}" "$local_stage/" "$wp_path/"
+        gzip -dc "$backup_dir/database.sql.gz" | mariadb --defaults-extra-file="$defaults_file" --binary-mode --local-infile=0 "$db_name"
         set_site_permissions "$domain"
+        [[ "${SITE_MODES[$index]}" != managed ]] || apply_site_redis_connection "$domain"
+        site_wp_cli "$domain" core is-installed
+        site_wp_cli "$domain" maintenance-mode deactivate >/dev/null
     )
-    clear_site_cache "$index"
+    clear_site_cache "$index" all
+    rm -f -- "/var/www/$domain/.wp-shell-maintenance"
     log_message SUCCESS "$domain was restored to $backup_id."
 }
 
 clear_site_cache() {
-    local index="$1" domain wp_path cache_dir legacy_cache_dir
+    local index="$1" scope="${2:-page}" domain wp_path cache_dir legacy_cache_dir
     domain="${SITE_DOMAINS[$index]}"
     wp_path="$(site_wp_path "$domain")"
     cache_dir="$(site_cache_dir "$domain")"
     legacy_cache_dir="$LEGACY_CACHE_ROOT/$domain"
-    [[ -d "$cache_dir" ]] && find "$cache_dir" -mindepth 1 -delete
-    [[ -d "$legacy_cache_dir" ]] && find "$legacy_cache_dir" -mindepth 1 -delete
-    if [[ -f "$wp_path/wp-config.php" ]]; then
-        site_wp_cli "$domain" cache flush || true
+    case "$scope" in page|object|opcache|all) ;; *) die "Cache scope must be page, object, opcache, or all." ;; esac
+    if [[ "$scope" == page || "$scope" == all ]]; then
+        if [[ -d "$cache_dir" ]]; then find "$cache_dir" -mindepth 1 -delete || return 1; fi
+        if [[ -d "$legacy_cache_dir" ]]; then find "$legacy_cache_dir" -mindepth 1 -delete || return 1; fi
     fi
-    php_fpm_service_action reload "${SITE_PHP_VERSIONS[$index]}"
+    if [[ "$scope" == object || "$scope" == all ]] && [[ -f "$wp_path/wp-config.php" ]]; then
+        site_wp_cli "$domain" cache flush || return 1
+    fi
+    if [[ "$scope" == opcache || "$scope" == all ]]; then
+        php_fpm_service_action reload "${SITE_PHP_VERSIONS[$index]}"
+    fi
+    return 0
 }
 
 update_site() {
@@ -2413,6 +2954,228 @@ list_backups() {
     find "$backup_dir" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' -printf '  %f\n' 2>/dev/null | sort -r || true
 }
 
+run_site_cron() (
+    local domain="$1" index
+    index="$(site_index_by_domain "$domain")" || die "Unmanaged site."
+    [[ -f "${SITE_PATHS[$index]}/wp-config.php" ]] || die "WordPress is not installed."
+    exec 7>"$STATE_DIR/cron-$(site_pool_id "$domain").lock"
+    flock -n 7 || exit 0
+    WP_SHELL_WP_TIMEOUT=240 site_wp_cli "$domain" cron event run --due-now
+    date +%s > "$STATE_DIR/cron-$(site_pool_id "$domain").success"
+)
+
+site_cron_action() {
+    local domain="$1" action="${2:-status}" unit prior
+    unit="wp-shell-cron-$(site_pool_id "$domain")"
+    case "$action" in
+        enable)
+            install_self
+            prior="$(site_wp_cli "$domain" config get DISABLE_WP_CRON 2>/dev/null || printf 'false')"
+            [[ "$(site_policy_value "$domain" cron-mode)" == system ]] || set_site_policy "$domain" cron-prior "$prior"
+            cat > "/etc/systemd/system/$unit.service" <<EOF
+[Unit]
+Description=Run due WordPress events for $domain
+After=network.target mariadb.service
+[Service]
+Type=oneshot
+ExecStart=$MANAGED_SCRIPT cron-run $domain
+TimeoutStartSec=270s
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=true
+EOF
+            cat > "/etc/systemd/system/$unit.timer" <<EOF
+[Unit]
+Description=WordPress schedule for $domain
+[Timer]
+OnBootSec=2m
+OnUnitInactiveSec=60s
+RandomizedDelaySec=15s
+[Install]
+WantedBy=timers.target
+EOF
+            systemctl daemon-reload
+            # A real successful run and active timer are required before disabling HTTP cron.
+            systemctl start "$unit.service" || die "Cron trial failed; request-driven WP-Cron was not changed."
+            systemctl enable --now "$unit.timer"
+            systemctl is-active --quiet "$unit.timer" || die "Cron timer is not active."
+            site_wp_cli "$domain" config set DISABLE_WP_CRON true --raw
+            chmod "$(site_config_mode "$domain")" "$(site_wp_path "$domain")/wp-config.php"
+            set_site_policy "$domain" cron-mode system
+            log_message SUCCESS "$domain: verified system WP-Cron enabled. Do not also schedule it in crontab."
+            ;;
+        disable)
+            prior="$(site_policy_value "$domain" cron-prior false)"
+            [[ "$prior" == 1 || "$prior" == true ]] && prior=true || prior=false
+            site_wp_cli "$domain" config set DISABLE_WP_CRON "$prior" --raw
+            chmod "$(site_config_mode "$domain")" "$(site_wp_path "$domain")/wp-config.php"
+            systemctl disable --now "$unit.timer" 2>/dev/null || true
+            set_site_policy "$domain" cron-mode request
+            log_message INFO "Restored the previous DISABLE_WP_CRON value ($prior); timer disabled."
+            ;;
+        status)
+            printf '%s: mode=%s timer=%s\n' "$domain" "$(site_policy_value "$domain" cron-mode request)" "$(systemctl is-active "$unit.timer" 2>/dev/null || true)"
+            [[ ! -f "$STATE_DIR/cron-$(site_pool_id "$domain").success" ]] || printf 'Last successful run (epoch): %s\n' "$(<"$STATE_DIR/cron-$(site_pool_id "$domain").success")"
+            ;;
+        *) die "Use: wp-shell site DOMAIN cron enable|disable|status" ;;
+    esac
+}
+
+site_config_mode() {
+    if [[ "$(site_run_user "$1")" == www-data ]]; then printf '0640'; else printf '0600'; fi
+}
+
+install_operations_timer() {
+    install_self
+    cat > /etc/systemd/system/wp-shell-operations.service <<EOF
+[Unit]
+Description=Process WordPress page-cache invalidations
+[Service]
+Type=oneshot
+ExecStart=$MANAGED_SCRIPT ops run
+TimeoutStartSec=50s
+Nice=10
+IOSchedulingClass=idle
+EOF
+    cat > /etc/systemd/system/wp-shell-operations.timer <<'EOF'
+[Unit]
+Description=Process page-cache changes every minute
+[Timer]
+OnBootSec=1m
+OnUnitActiveSec=60s
+AccuracySec=5s
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now wp-shell-operations.timer
+}
+
+run_operations() (
+    local i domain marker
+    exec 7>"$STATE_DIR/operations.lock"
+    flock -n 7 || exit 0
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        [[ "$(site_policy_value "$domain" cache-auto)" == enabled ]] || continue
+        marker="/var/www/$domain/.wp-shell/cache-dirty"
+        if [[ -f "$marker" && ! -L "$marker" ]]; then
+            # Remove first: another edit during the purge leaves a marker for the next run.
+            rm -f -- "$marker"
+            if ! clear_site_cache "$i" page; then
+                touch "$marker"
+                return 1
+            fi
+        fi
+    done
+)
+
+site_cache_auto() {
+    local domain="$1" action="${2:-status}" wp_path plugin run_user
+    wp_path="$(site_wp_path "$domain")"
+    plugin="$wp_path/wp-content/mu-plugins/wp-shell-cache.php"
+    run_user="$(site_run_user "$domain")"
+    case "$action" in
+        enable)
+            [[ "$wp_path" == "/var/www/$domain/public" ]] || die "Automatic invalidation requires the managed public-directory layout."
+            if [[ -e "$plugin" ]] && ! grep -Fq 'Plugin Name: wp-shell Cache Signals' "$plugin"; then die "An unrelated MU plugin already uses $plugin."; fi
+            install -d -o "$run_user" -g "$(id -gn "$run_user")" -m 0700 "/var/www/$domain/.wp-shell"
+            install -d -o "$run_user" -g www-data -m 0750 "$wp_path/wp-content/mu-plugins"
+            cat > "$plugin" <<'PHP'
+<?php
+/* Plugin Name: wp-shell Cache Signals */
+if (!defined('ABSPATH')) { exit; }
+function wp_shell_signal_page_change() {
+    $directory = dirname(rtrim(ABSPATH, '/')) . '/.wp-shell';
+    if (is_dir($directory) && is_writable($directory)) {
+        touch($directory . '/cache-dirty');
+    }
+}
+foreach (array('save_post', 'deleted_post', 'trashed_post', 'untrashed_post',
+               'wp_update_nav_menu', 'switch_theme', 'customize_save_after',
+               'edited_term', 'delete_term', 'comment_post', 'edit_comment',
+               'transition_comment_status', 'upgrader_process_complete') as $event) {
+    add_action($event, 'wp_shell_signal_page_change', 100, 0);
+}
+PHP
+            chown "$run_user":www-data "$plugin"
+            chmod 0640 "$plugin"
+            install_operations_timer
+            systemctl is-active --quiet wp-shell-operations.timer || die "Cache invalidation timer failed to start."
+            set_site_policy "$domain" cache-auto enabled
+            touch "/var/www/$domain/.wp-shell/cache-dirty"
+            chown "$run_user":"$(id -gn "$run_user")" "/var/www/$domain/.wp-shell/cache-dirty"
+            log_message SUCCESS "$domain: page cache purged within about one minute after supported content changes. Custom plugin changes may still need manual clearing."
+            ;;
+        disable)
+            if [[ -f "$plugin" ]] && grep -Fq 'Plugin Name: wp-shell Cache Signals' "$plugin"; then rm -f -- "$plugin"; fi
+            set_site_policy "$domain" cache-auto disabled
+            ;;
+        status) printf '%s: automatic page invalidation %s\n' "$domain" "$(site_policy_value "$domain" cache-auto disabled)" ;;
+        *) die "Use cache-auto enable|disable|status." ;;
+    esac
+}
+
+site_cache_exclude() {
+    local domain="$1" path="${2:-}" file temp
+    file="/etc/nginx/wp-shell-custom/$domain/20-cache-exclusions.conf"
+    [[ "$path" =~ ^/[a-zA-Z0-9_/-]+/$ && "$path" != *..* ]] || die "Use an absolute URL path ending with /, for example /staging/ or /basket/."
+    install -d -m 0755 "$(dirname "$file")"
+    temp="$(mktemp /tmp/wp-cache-exclude.XXXXXX)"
+    [[ ! -f "$file" ]] || cp -a "$file" "$temp"
+    if ! grep -Fq "~* \"^$path\"" "$temp"; then
+        # shellcheck disable=SC2016
+        printf 'if ($request_uri ~* "^%s") { set $skip_cache 1; }\n' "$path" >> "$temp"
+    fi
+    install -m 0644 "$temp" "$file.new"
+    [[ ! -f "$file" ]] || cp -a "$file" "$file.previous"
+    mv -T "$file.new" "$file"
+    rm -f "$temp"
+    if ! nginx -t; then
+        if [[ -f "$file.previous" ]]; then mv -f "$file.previous" "$file"; else rm -f "$file"; fi
+        die "Invalid Nginx exclusion; previous file restored."
+    fi
+    systemctl reload nginx
+    log_message SUCCESS "Cache exclusion saved for $domain $path. The managed template must include wp-shell-custom; use nginx-apply when upgrading an old template."
+}
+
+site_login_limit() {
+    local domain="$1" action="${2:-status}" file
+    file="/etc/nginx/wp-shell-custom/$domain/30-login-limit.conf"
+    case "$action" in
+        direct)
+            log_message WARNING "This mode assumes direct client connections. Do not use it behind a CDN/proxy until trusted real-IP handling is configured and verified."
+            install -d -m 0755 "$(dirname "$file")"
+            if [[ ! -f /etc/nginx/conf.d/wp-shell-login-limit.conf ]]; then
+                cat > /etc/nginx/conf.d/wp-shell-login-limit.conf <<'EOF'
+# Managed by wp-shell. Empty keys exclude all requests except login POSTs.
+map "$request_method:$uri" $wp_shell_login_key {
+    default "";
+    ~*^POST:/(?:[^/]+/)*wp-login\.php$ $binary_remote_addr;
+}
+limit_req_zone $wp_shell_login_key zone=wp_shell_login:10m rate=10r/m;
+EOF
+            fi
+            [[ ! -f "$file" ]] || cp -a "$file" "$file.previous"
+            printf 'limit_req zone=wp_shell_login burst=10 nodelay;\nlimit_req_status 429;\n' > "$file"
+            if ! nginx -t; then
+                if [[ -f "$file.previous" ]]; then mv -f "$file.previous" "$file"; else rm -f "$file"; fi
+                die "Login rate-limit validation failed; previous site setting restored."
+            fi
+            systemctl reload nginx
+            set_site_policy "$domain" login-limit direct
+            log_message SUCCESS "Login POST rate limit: 10/minute per client IP plus burst 10. Requires the current managed Nginx include."
+            ;;
+        off)
+            rm -f -- "$file"
+            nginx -t && systemctl reload nginx
+            set_site_policy "$domain" login-limit disabled
+            ;;
+        status) printf '%s: login limiting %s\n' "$domain" "$(site_policy_value "$domain" login-limit disabled)" ;;
+        *) die "Use login-limit direct|off|status. CDN/proxy sites need verified real-IP configuration first." ;;
+    esac
+}
+
 site_action() {
     local selector="$1" domain action="${2:-status}" index wp_path
     domain="$(site_domain_from_selector "$selector")" || die "Unknown site ID or domain: $selector"
@@ -2433,7 +3196,26 @@ site_action() {
             fi
             ;;
         core-repair) repair_wordpress_core "$index" ;;
-        cache-clear) clear_site_cache "$index"; log_message SUCCESS "$domain cache was cleared." ;;
+        isolate) isolate_site "$index" "${3:-}" ;;
+        redis-isolate) isolate_site_redis "$index" "${3:-64}" ;;
+        cron) site_cron_action "$domain" "${3:-status}" ;;
+        cache-auto) site_cache_auto "$domain" "${3:-status}" ;;
+        cache-exclude) site_cache_exclude "$domain" "${3:-}" ;;
+        login-limit) site_login_limit "$domain" "${3:-status}" ;;
+        nginx-apply)
+            [[ "${SITE_MODES[$index]}" == managed ]] || die "Imported Nginx sites must be reviewed before adopting a managed template."
+            configure_https_site "$index"
+            clear_site_cache "$index" page
+            ;;
+        maintenance)
+            case "${3:-status}" in
+                on) install -m 0600 /dev/null "/var/www/$domain/.wp-shell-maintenance" ;;
+                off) rm -f -- "/var/www/$domain/.wp-shell-maintenance" ;;
+                status) [[ ! -f "/var/www/$domain/.wp-shell-maintenance" ]] || printf 'Maintenance: ON\n' ;;
+                *) die "Use maintenance on|off|status." ;;
+            esac
+            ;;
+        cache-clear) clear_site_cache "$index" "${3:-page}"; log_message SUCCESS "$domain ${3:-page} cache was cleared." ;;
         backup) backup_site "$index" ;;
         backups) list_backups "$index" ;;
         restore) [[ -n "${3:-}" ]] || die "Usage: wp-shell restore $domain BACKUP_ID"; restore_site "$index" "$3" ;;
@@ -2513,6 +3295,18 @@ CREATE TABLE IF NOT EXISTS service_samples (
     redis_evicted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_service_samples_ts ON service_samples(ts);
+CREATE TABLE IF NOT EXISTS sample_health (
+    ts INTEGER NOT NULL, domain TEXT NOT NULL, component TEXT NOT NULL,
+    valid INTEGER NOT NULL, PRIMARY KEY(ts,domain,component)
+);
+CREATE TABLE IF NOT EXISTS system_pressure (
+    ts INTEGER PRIMARY KEY, cpu_steal REAL, io_wait REAL, memory_psi REAL,
+    io_psi REAL, inode_pct REAL, oom_kills INTEGER
+);
+CREATE TABLE IF NOT EXISTS redis_site_samples (
+    ts INTEGER NOT NULL, domain TEXT NOT NULL, used_mb REAL, hits INTEGER,
+    misses INTEGER, evicted INTEGER, valid INTEGER, PRIMARY KEY(ts,domain)
+);
 SQL
     if ! sqlite3 "$METRICS_DB" 'PRAGMA table_info(site_samples);' | awk -F'|' '$2=="php_pss_mb" {found=1} END {exit !found}'; then
         sqlite3 "$METRICS_DB" 'ALTER TABLE site_samples ADD COLUMN php_pss_mb REAL NOT NULL DEFAULT 0;'
@@ -2524,12 +3318,38 @@ numeric_or_zero() {
     [[ "${1:-}" =~ ^-?[0-9]+([.][0-9]+)?$ ]] && printf '%s' "$1" || printf '0'
 }
 
+record_metric_sql() {
+    if [[ -n "${COLLECTOR_SQL_FILE:-}" ]]; then
+        printf '%s\n' "$1" >> "$COLLECTOR_SQL_FILE"
+    else
+        sqlite3 -cmd '.timeout 5000' "$METRICS_DB" "$1"
+    fi
+}
+
+record_sample_health() {
+    record_metric_sql "INSERT OR REPLACE INTO sample_health VALUES($1,'$2','$3',$4);"
+}
+
+read_pool_limit() {
+    local domain="$1" version="$2" fallback="$3" value file
+    file="/etc/php/$version/fpm/pool.d/wp-shell-$(site_pool_id "$domain").conf"
+    value="$(awk -F= '/^[[:space:]]*pm.max_children[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); v=$2} END {print v}' "$file" 2>/dev/null || true)"
+    if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then printf '%s' "$value"; else printf '%s' "$fallback"; fi
+}
+
+refresh_actual_pool_limits() {
+    local i
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        SITE_PHP_MAX_CHILDREN[i]="$(read_pool_limit "${SITE_DOMAINS[$i]}" "${SITE_PHP_VERSIONS[$i]}" "${SITE_PHP_MAX_CHILDREN[$i]:-2}")"
+    done
+}
+
 collect_cpu_percent() {
     local _cpu user nice system idle iowait irq softirq steal _guest _guest_nice total idle_total
     read -r _cpu user nice system idle iowait irq softirq steal _guest _guest_nice < /proc/stat
     total=$((user + nice + system + idle + iowait + irq + softirq + steal))
     idle_total=$((idle + iowait))
-    local state_file="$STATE_DIR/cpu.state" previous_total="$total" previous_idle="$idle_total"
+    local state_file="${METRICS_CURSOR_DIR:-$STATE_DIR}/cpu.state" previous_total="$total" previous_idle="$idle_total"
     if [[ -r "$state_file" ]]; then
         read -r previous_total previous_idle < "$state_file" || true
     fi
@@ -2553,28 +3373,48 @@ collect_system_sample() {
     swap_used=$((swap_total - swap_free))
     disk_pct="$(df -P / | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
     read -r rx tx < <(network_bytes)
-    sqlite3 "$METRICS_DB" "INSERT INTO system_samples VALUES($ts,$cpu,$load1,$mem_total,$mem_available,$swap_used,$disk_pct,$rx,$tx);"
+    record_metric_sql "INSERT INTO system_samples VALUES($ts,$cpu,$load1,$mem_total,$mem_available,$swap_used,$disk_pct,$rx,$tx);"
+    record_sample_health "$ts" '' system 1
+}
+
+collect_pressure_sample() {
+    local ts="$1" total wait steal previous_total=0 previous_wait=0 previous_steal=0
+    local wait_pct=-1 steal_pct=-1 memory_psi=-1 io_psi=-1 inode_pct oom=-1
+    read -r total wait steal < <(awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8+$9,$6,$9; exit}' /proc/stat)
+    if [[ -r "${METRICS_CURSOR_DIR:-$STATE_DIR}/pressure.state" ]]; then
+        read -r previous_total previous_wait previous_steal < "${METRICS_CURSOR_DIR:-$STATE_DIR}/pressure.state" || true
+        if ((total > previous_total && wait >= previous_wait && steal >= previous_steal)); then
+            wait_pct="$(awk -v a="$wait" -v b="$previous_wait" -v dt="$((total-previous_total))" 'BEGIN {printf "%.2f",100*(a-b)/dt}')"
+            steal_pct="$(awk -v a="$steal" -v b="$previous_steal" -v dt="$((total-previous_total))" 'BEGIN {printf "%.2f",100*(a-b)/dt}')"
+        fi
+    fi
+    printf '%s %s %s\n' "$total" "$wait" "$steal" > "${METRICS_CURSOR_DIR:-$STATE_DIR}/pressure.state"
+    [[ ! -r /proc/pressure/memory ]] || memory_psi="$(awk '/^some / {split($2,a,"="); print a[2]}' /proc/pressure/memory)"
+    [[ ! -r /proc/pressure/io ]] || io_psi="$(awk '/^some / {split($2,a,"="); print a[2]}' /proc/pressure/io)"
+    inode_pct="$(df -Pi / | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
+    [[ ! -r /proc/vmstat ]] || oom="$(awk 'BEGIN {v=-1} /^oom_kill / {v=$2} END {print v}' /proc/vmstat)"
+    record_metric_sql "INSERT INTO system_pressure VALUES($ts,$steal_pct,$wait_pct,$memory_psi,$io_psi,$(numeric_or_zero "$inode_pct"),$oom);"
 }
 
 collect_nginx_interval() {
-    local domain="$1" log_file="/var/www/$1/logs/nginx-access.log" hash offset_file offset=0 size=0 start temp stats
+    local domain="$1" log_file="/var/www/$1/logs/nginx-access.log" hash offset_file offset=0 size=0 temp stats valid=1
     hash="$(printf '%s' "$domain" | sha256sum | cut -c1-12)"
-    offset_file="$STATE_DIR/nginx-$hash.offset"
-    [[ -f "$log_file" ]] || { printf '0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0'; return; }
+    offset_file="${METRICS_CURSOR_DIR:-$STATE_DIR}/nginx-$hash.offset"
+    [[ -f "$log_file" ]] || { printf '0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0'; return; }
     size="$(stat -c '%s' "$log_file" 2>/dev/null || printf '0')"
     if [[ -r "$offset_file" ]]; then
         read -r offset < "$offset_file" || true
     fi
     [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
     ((size < offset)) && offset=0
-    if ((offset == 0 && size > 5242880)); then
+    if ((size - offset > 5242880)); then
         offset=$((size - 5242880))
+        valid=0
     fi
-    start=$((offset + 1))
     temp="$(mktemp /tmp/wp-shell-nginx.XXXXXX)"
-    tail -c "+$start" "$log_file" > "$temp" 2>/dev/null || true
+    timeout 4s dd if="$log_file" iflag=skip_bytes,count_bytes skip="$offset" count="$((size-offset))" status=none > "$temp" 2>/dev/null || valid=0
     printf '%s\n' "$size" > "$offset_file"
-    stats="$(jq -Rsr '
+    if ! stats="$(jq -Rsr '
       [split("\n")[] | fromjson?] as $r |
       if ($r|length)==0 then [0,0,0,0,0,0,0,0,0,0,0]
       else
@@ -2590,9 +3430,12 @@ collect_nginx_interval() {
          ($r|map(select(.cache=="MISS" or .cache=="EXPIRED"))|length),
          ($r|map(select(.cache=="BYPASS"))|length),
          ($r|map(select(.cache=="UPDATING" or .cache=="STALE"))|length)]
-      end | @tsv' "$temp" 2>/dev/null || printf '0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0')"
+      end | @tsv' "$temp" 2>/dev/null)"; then
+        stats=$'0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0'; valid=0
+    fi
     rm -f "$temp"
-    printf '%s' "$stats"
+    if ((size > offset)) && [[ "${stats%%$'\t'*}" == 0 ]]; then valid=0; fi
+    printf '%s\t%s' "$stats" "$valid"
 }
 
 collect_php_pool_status() {
@@ -2603,7 +3446,7 @@ collect_php_pool_status() {
     json=""
     if [[ -S "$socket" && -x "$(command -v cgi-fcgi 2>/dev/null || true)" ]]; then
         json="$(SCRIPT_NAME=/status SCRIPT_FILENAME=/status REQUEST_METHOD=GET QUERY_STRING=json \
-            cgi-fcgi -bind -connect "$socket" 2>/dev/null | sed -n '/^{/,$p' | tr -d '\r' || true)"
+            timeout 4s cgi-fcgi -bind -connect "$socket" 2>/dev/null | sed -n '/^{/,$p' | tr -d '\r' || true)"
     fi
     while read -r pid process_rss args; do
         [[ "$args" == "php-fpm: pool $pool_id" ]] || continue
@@ -2617,15 +3460,25 @@ collect_php_pool_status() {
     done < <(ps -eo pid=,rss=,args= 2>/dev/null)
     rss="$(awk -v kb="$rss_kb" 'BEGIN {printf "%.1f",kb/1024}')"
     pss="$(awk -v kb="$pss_kb" 'BEGIN {printf "%.1f",kb/1024}')"
-    if jq -e . >/dev/null 2>&1 <<< "$json"; then
-        jq -r --arg rss "$rss" --arg pss "$pss" '[.["active processes"]//0, .["idle processes"]//0, .["listen queue"]//0, .["max active processes"]//0, .["max children reached"]//0, ($rss|tonumber), ($pss|tonumber)] | @tsv' <<< "$json"
+    if jq -e '[.["active processes"],.["idle processes"],.["listen queue"],.["max children reached"]] | all(.[]; type=="number" and .>=0 and floor==.)' >/dev/null 2>&1 <<< "$json"; then
+        jq -r --arg rss "$rss" --arg pss "$pss" '[.["active processes"], .["idle processes"], .["listen queue"], .["max active processes"]//0, .["max children reached"], ($rss|tonumber), ($pss|tonumber), 1] | @tsv' <<< "$json"
     else
-        printf '0\t0\t0\t0\t0\t%s\t%s' "${rss:-0}" "${pss:-0}"
+        printf '0\t0\t0\t0\t0\t%s\t%s\t0' "${rss:-0}" "${pss:-0}"
     fi
 }
 
 directory_size_mb() {
-    [[ -e "$1" ]] && du -sm -- "$1" 2>/dev/null | awk '{print $1}' || printf '0'
+    local cache_file now timestamp=0 value=-1 measured
+    cache_file="${METRICS_CURSOR_DIR:-$STATE_DIR}/size-$(printf '%s' "$1" | sha256sum | cut -c1-16).state"
+    now="$(date +%s)"
+    if [[ -r "$cache_file" ]]; then read -r timestamp value < "$cache_file" || true; fi
+    [[ "$timestamp" =~ ^[0-9]+$ && "$value" =~ ^-?[0-9]+$ ]] || { timestamp=0; value=-1; }
+    if ((now-timestamp >= 900)); then
+        measured="$(timeout 1s du -sm -- "$1" 2>/dev/null | awk '{print $1}')" || measured=-1
+        if [[ "$measured" =~ ^[0-9]+$ ]]; then value="$measured"; fi
+        printf '%s %s\n' "$now" "$value" > "$cache_file"
+    fi
+    printf '%s' "$value"
 }
 
 tls_days_remaining() {
@@ -2647,15 +3500,16 @@ backup_age_hours() {
 
 collect_site_sample() {
     local ts="$1" index="$2" domain primary wp_path log_stats php_stats
-    local requests s2 s4 s5 bytes avg p95 hits misses bypass stale active idle queue _max_active reached rss pss
+    local requests s2 s4 s5 bytes avg p95 hits misses bypass stale active idle queue _max_active reached rss pss php_valid
     local http_code tls_days backup_age files_mb cache_mb logs_mb backups_mb
     domain="${SITE_DOMAINS[$index]}"
     primary="${SITE_PRIMARY_DOMAINS[$index]}"
     wp_path="${SITE_PATHS[$index]}"
     log_stats="$(collect_nginx_interval "$domain")"
-    read -r requests s2 s4 s5 bytes avg p95 hits misses bypass stale <<< "${log_stats//$'\t'/ }"
+    local traffic_valid
+    read -r requests s2 s4 s5 bytes avg p95 hits misses bypass stale traffic_valid <<< "${log_stats//$'\t'/ }"
     php_stats="$(collect_php_pool_status "$domain")"
-    read -r active idle queue _max_active reached rss pss <<< "${php_stats//$'\t'/ }"
+    read -r active idle queue _max_active reached rss pss php_valid <<< "${php_stats//$'\t'/ }"
     http_code="$(curl --silent --output /dev/null --max-time 5 --write-out '%{http_code}' "https://$primary" 2>/dev/null || printf '0')"
     [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code=0
     tls_days="$(tls_days_remaining "$domain")"
@@ -2664,12 +3518,31 @@ collect_site_sample() {
     cache_mb="$(directory_size_mb "$(site_cache_dir "$domain")")"
     logs_mb="$(directory_size_mb "/var/www/$domain/logs")"
     backups_mb="$(directory_size_mb "$(site_backup_dir "$domain")")"
-    sqlite3 "$METRICS_DB" "INSERT INTO site_samples VALUES($ts,'$domain',$(numeric_or_zero "$requests"),$(numeric_or_zero "$s2"),$(numeric_or_zero "$s4"),$(numeric_or_zero "$s5"),$(numeric_or_zero "$bytes"),$(numeric_or_zero "$avg"),$(numeric_or_zero "$p95"),$(numeric_or_zero "$hits"),$(numeric_or_zero "$misses"),$(( $(numeric_or_zero "$bypass") + $(numeric_or_zero "$stale") )),$(numeric_or_zero "$active"),$(numeric_or_zero "$idle"),$(numeric_or_zero "$queue"),${SITE_PHP_MAX_CHILDREN[$index]:-0},$(numeric_or_zero "$reached"),$(numeric_or_zero "$rss"),$http_code,$tls_days,$backup_age,$files_mb,$cache_mb,$logs_mb,$backups_mb,$(numeric_or_zero "$pss"));"
+    record_metric_sql "INSERT INTO site_samples VALUES($ts,'$domain',$(numeric_or_zero "$requests"),$(numeric_or_zero "$s2"),$(numeric_or_zero "$s4"),$(numeric_or_zero "$s5"),$(numeric_or_zero "$bytes"),$(numeric_or_zero "$avg"),$(numeric_or_zero "$p95"),$(numeric_or_zero "$hits"),$(numeric_or_zero "$misses"),$(( $(numeric_or_zero "$bypass") + $(numeric_or_zero "$stale") )),$(numeric_or_zero "$active"),$(numeric_or_zero "$idle"),$(numeric_or_zero "$queue"),${SITE_PHP_MAX_CHILDREN[$index]:-0},$(numeric_or_zero "$reached"),$(numeric_or_zero "$rss"),$http_code,$tls_days,$backup_age,$files_mb,$cache_mb,$logs_mb,$backups_mb,$(numeric_or_zero "$pss"));"
+    record_sample_health "$ts" "$domain" php "${php_valid:-0}"
+    record_sample_health "$ts" "$domain" nginx "${traffic_valid:-0}"
+    if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then collect_private_redis_sample "$ts" "$domain"; fi
+}
+
+collect_private_redis_sample() {
+    local ts="$1" domain="$2" info valid=0 used=0 hits=0 misses=0 evicted=0
+    info="$(REDISCLI_AUTH="$(site_policy_value "$domain" redis-secret)" timeout 4s redis-cli -s "$(site_redis_socket "$domain")" INFO stats memory 2>/dev/null | tr -d '\r' || true)"
+    if [[ "$info" == *used_memory:* ]]; then
+        valid=1
+        used="$(awk -F: '$1=="used_memory" {printf "%.1f",$2/1048576}' <<< "$info")"
+        hits="$(awk -F: '$1=="keyspace_hits" {print $2}' <<< "$info")"
+        misses="$(awk -F: '$1=="keyspace_misses" {print $2}' <<< "$info")"
+        evicted="$(awk -F: '$1=="evicted_keys" {print $2}' <<< "$info")"
+    fi
+    record_metric_sql "INSERT INTO redis_site_samples VALUES($ts,'$domain',$(numeric_or_zero "$used"),$(numeric_or_zero "$hits"),$(numeric_or_zero "$misses"),$(numeric_or_zero "$evicted"),$valid);"
+    record_sample_health "$ts" "$domain" redis "$valid"
 }
 
 collect_service_sample() {
     local ts="$1" mariadb_values threads=0 questions=0 slow=0 redis_info="" redis_used=0 hits=0 misses=0 evicted=0 key value
-    mariadb_values="$(mariadb --batch --skip-column-names -e "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Questions','Slow_queries');" 2>/dev/null || true)"
+    local db_valid=0 redis_valid=0
+    mariadb_values="$(timeout 4s mariadb --connect-timeout=3 --batch --skip-column-names -e "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Questions','Slow_queries');" 2>/dev/null || true)"
+    [[ "$mariadb_values" != *Threads_connected* ]] || db_valid=1
     while read -r key value; do
         case "$key" in
             Threads_connected) threads="$value" ;;
@@ -2678,30 +3551,50 @@ collect_service_sample() {
         esac
     done <<< "$mariadb_values"
     if [[ -s "$REDIS_SECRET_FILE" ]]; then
-        redis_info="$(REDISCLI_AUTH="$(<"$REDIS_SECRET_FILE")" redis-cli --no-auth-warning INFO stats memory 2>/dev/null | tr -d '\r' || true)"
+        redis_info="$(REDISCLI_AUTH="$(<"$REDIS_SECRET_FILE")" timeout 4s redis-cli --no-auth-warning INFO stats memory 2>/dev/null | tr -d '\r' || true)"
+        [[ "$redis_info" != *used_memory:* ]] || redis_valid=1
         redis_used="$(awk -F: '$1=="used_memory"{printf "%.1f",$2/1048576}' <<< "$redis_info")"
         hits="$(awk -F: '$1=="keyspace_hits"{print $2}' <<< "$redis_info")"
         misses="$(awk -F: '$1=="keyspace_misses"{print $2}' <<< "$redis_info")"
         evicted="$(awk -F: '$1=="evicted_keys"{print $2}' <<< "$redis_info")"
     fi
-    sqlite3 "$METRICS_DB" "INSERT INTO service_samples VALUES($ts,$(numeric_or_zero "$threads"),$(numeric_or_zero "$questions"),$(numeric_or_zero "$slow"),$(numeric_or_zero "$redis_used"),$(numeric_or_zero "$hits"),$(numeric_or_zero "$misses"),$(numeric_or_zero "$evicted"));"
+    record_metric_sql "INSERT INTO service_samples VALUES($ts,$(numeric_or_zero "$threads"),$(numeric_or_zero "$questions"),$(numeric_or_zero "$slow"),$(numeric_or_zero "$redis_used"),$(numeric_or_zero "$hits"),$(numeric_or_zero "$misses"),$(numeric_or_zero "$evicted"));"
+    record_sample_health "$ts" '' mariadb "$db_valid"
+    record_sample_health "$ts" '' redis "$redis_valid"
 }
 
-collect_metrics() {
+collect_metrics() (
     CURRENT_STEP="collect metrics"
     exec 8>"$STATE_DIR/collector.lock"
     flock -n 8 || return 0
     init_metrics_database
     calculate_resource_budget quiet
-    local ts i
+    refresh_actual_pool_limits
+    local ts i stage cursor
     ts="$(date +%s)"
+    [[ "$(sqlite3 "$METRICS_DB" "SELECT COUNT(*) FROM system_samples WHERE ts=$ts;")" == 0 ]] || return 0
+    stage="$(mktemp -d "$STATE_DIR/.sample.XXXXXX")"
+    COLLECTOR_SQL_FILE="$stage/transaction.sql"
+    METRICS_CURSOR_DIR="$stage/cursors"
+    mkdir "$METRICS_CURSOR_DIR"
+    trap 'rm -rf -- "$stage"' EXIT
+    for cursor in "$STATE_DIR"/*.state "$STATE_DIR"/nginx-*.offset; do
+        [[ ! -f "$cursor" ]] || cp -p "$cursor" "$METRICS_CURSOR_DIR/"
+    done
+    printf 'BEGIN IMMEDIATE;\n' > "$COLLECTOR_SQL_FILE"
     collect_system_sample "$ts"
     collect_service_sample "$ts"
     for ((i = 1; i <= SITE_COUNT; i++)); do
         collect_site_sample "$ts" "$i"
     done
-    sqlite3 "$METRICS_DB" "DELETE FROM system_samples WHERE ts < $((ts - 2592000)); DELETE FROM site_samples WHERE ts < $((ts - 2592000)); DELETE FROM service_samples WHERE ts < $((ts - 2592000)); PRAGMA wal_checkpoint(PASSIVE);" >/dev/null
-}
+    collect_pressure_sample "$ts"
+    record_metric_sql "DELETE FROM system_samples WHERE ts < $((ts - 2592000)); DELETE FROM site_samples WHERE ts < $((ts - 2592000)); DELETE FROM service_samples WHERE ts < $((ts - 2592000)); DELETE FROM sample_health WHERE ts < $((ts - 2592000)); DELETE FROM system_pressure WHERE ts < $((ts - 2592000)); DELETE FROM redis_site_samples WHERE ts < $((ts - 2592000)); COMMIT;"
+    sqlite3 -bail -cmd '.timeout 5000' "$METRICS_DB" < "$COLLECTOR_SQL_FILE" || exit 1
+    for cursor in "$METRICS_CURSOR_DIR"/*; do
+        [[ ! -f "$cursor" ]] || mv -f "$cursor" "$STATE_DIR/"
+    done
+    sqlite3 "$METRICS_DB" "PRAGMA wal_checkpoint(PASSIVE);" >/dev/null
+)
 
 show_metrics_status() {
     local timer_state collector_state="idle" counts="0|0|0" system_samples=0 site_samples=0 service_samples=0
@@ -2744,6 +3637,7 @@ After=nginx.service mariadb.service redis-server.service
 [Service]
 Type=oneshot
 ExecStart=$MANAGED_SCRIPT metrics collect
+TimeoutStartSec=120s
 Nice=10
 IOSchedulingClass=idle
 ProtectHome=true
@@ -2812,6 +3706,8 @@ def clamp(value, low=0.0, high=100.0):
 
 def human_bytes(value):
     value = float(value or 0)
+    if value < 0:
+        return "?"
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if value < 1024 or unit == "TB":
             return f"{value:.1f}{unit}" if value < 10 else f"{value:.0f}{unit}"
@@ -2877,6 +3773,16 @@ def fetch_data(modes):
     now = int(time.time())
     system = connection.execute("SELECT * FROM system_samples ORDER BY ts DESC LIMIT 1").fetchone()
     service = connection.execute("SELECT * FROM service_samples ORDER BY ts DESC LIMIT 1").fetchone()
+    has_health = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sample_health'").fetchone()
+    def valid_probe(ts, domain, component):
+        if not has_health:
+            return False
+        row = connection.execute("SELECT valid FROM sample_health WHERE ts=? AND domain=? AND component=?", (ts, domain, component)).fetchone()
+        return bool(row and row[0] == 1)
+    service = dict(service) if service else {}
+    if service:
+        service["_db_valid"] = valid_probe(service["ts"], "", "mariadb")
+        service["_redis_valid"] = valid_probe(service["ts"], "", "redis")
     sampled_domains = {row[0] for row in connection.execute("SELECT DISTINCT domain FROM site_samples")}
     domains = sorted(set(modes) | sampled_domains)
     sites = []
@@ -2900,6 +3806,8 @@ def fetch_data(modes):
         if latest:
             site = dict(latest)
             site["_has_sample"] = True
+            site["_php_valid"] = valid_probe(site["ts"], domain, "php")
+            site["_traffic_valid"] = valid_probe(site["ts"], domain, "nginx")
             previous = connection.execute(
                 "SELECT php_max_reached FROM site_samples "
                 "WHERE domain=? AND ts<? ORDER BY ts DESC LIMIT 1",
@@ -2908,7 +3816,7 @@ def fetch_data(modes):
             current_reached = int(latest["php_max_reached"] or 0)
             previous_reached = int(previous[0] or 0) if previous is not None else None
             site["_php_max_increased"] = bool(
-                previous_reached is not None
+                site["_php_valid"] and previous_reached is not None
                 and (
                     current_reached > previous_reached
                     or (current_reached < previous_reached and current_reached > 0)
@@ -2925,6 +3833,10 @@ def alert_for(site, agg):
     if not site.get("_has_sample", False):
         return "NO DATA"
     alerts = []
+    if not site.get("_php_valid", True):
+        alerts.append("PHP ?")
+    if not site.get("_traffic_valid", True):
+        alerts.append("Logs ?")
     code = int(site.get("http_code", 0) or 0)
     if code < 200 or code >= 400:
         alerts.append(f"HTTP {code or 'DOWN'}")
@@ -3037,16 +3949,21 @@ def values_for(view, site, agg, meta):
     health = alert_for(site, agg)
     if view == 0:
         return [site["domain"], requests, f"{float(agg.get('p95_ms',0)):.0f}ms", hit,
-                f"{site.get('php_active',0)}/{site.get('php_max_children',0)}", f"{float(site.get('php_pss_mb',0)):.0f}MB",
+                f"{site.get('php_active',0)}/{site.get('php_max_children',0)}" if site.get('_php_valid', True) else "?",
+                f"{float(site.get('php_pss_mb',0)):.0f}MB" if site.get('_php_valid', True) else "?",
                 site.get("http_code", 0), health]
     if view == 1:
         return [site["domain"], requests, agg.get("status_2xx", 0), agg.get("status_4xx", 0), agg.get("status_5xx", 0),
                 human_bytes(agg.get("bytes_sent", 0)), f"{float(agg.get('p95_ms',0)):.0f}ms", hit]
     if view == 2:
-        return [site["domain"], site.get("php_active", 0), site.get("php_idle", 0), site.get("php_queue", 0),
+        values = [site["domain"], site.get("php_active", 0), site.get("php_idle", 0), site.get("php_queue", 0),
                 site.get("php_max_children", 0), f"{float(site.get('php_pss_mb',0)):.0f}MB",
-                f"{float(site.get('php_rss_mb',0)):.0f}MB", f"{float(site.get('files_mb',0)):.0f}MB",
-                f"{float(site.get('cache_mb',0)):.0f}MB", f"{float(site.get('logs_mb',0)):.0f}MB"]
+                f"{float(site.get('php_rss_mb',0)):.0f}MB", human_bytes(float(site.get('files_mb',-1))*1048576),
+                human_bytes(float(site.get('cache_mb',-1))*1048576), human_bytes(float(site.get('logs_mb',-1))*1048576)]
+        if not site.get('_php_valid', True):
+            values[1:4] = ['?'] * 3
+            values[5:7] = ['?'] * 2
+        return values
     if view == 3:
         backup = float(site.get("backup_age_hours", -1) or -1)
         return [site["domain"], site.get("http_code", 0), f"{site.get('tls_days',-1)}d", "none" if backup < 0 else f"{backup:.1f}h",
@@ -3091,7 +4008,9 @@ def draw(stdscr, view, selected):
     if service:
         total = int(service.get("redis_hits", 0) or 0) + int(service.get("redis_misses", 0) or 0)
         ratio = 100 * int(service.get("redis_hits", 0) or 0) / total if total else 0
-        service_text = f"DB threads {service.get('mariadb_threads',0)} | Redis {float(service.get('redis_used_mb',0)):.1f}MB hit {ratio:.0f}%"
+        db_text = str(service.get('mariadb_threads',0)) if service.get('_db_valid') else '?'
+        redis_text = f"{float(service.get('redis_used_mb',0)):.1f}MB hit {ratio:.0f}%" if service.get('_redis_valid') else '?'
+        service_text = f"DB threads {db_text} | Redis {redis_text} | Sizes cached 15m"
     add(stdscr, height - 2, 0, service_text)
     footer = "F1 Overview  F2 Traffic  F3 Resources  F4 Operations  F5 Alerts  Up/Down Select  r Refresh  q Quit"
     style = curses.color_pair(1) if curses.has_colors() else curses.A_REVERSE
@@ -3148,31 +4067,51 @@ PY
 }
 
 build_tuning_recommendations() {
-    local output="$1" now since min_available_pct i domain current stats sample_count first_ts peak_active peak_queue max_events recommended reason
+    local output="$1" seconds="${2:-1209600}" now since i domain current stats count first last peak saturated worker
+    local system_stats system_count min_available_pct peak_cpu system_last allocation=0 recommended reason
+    local -A evidence=()
     : > "$output"
+    # Legacy rows and failed probes are historical evidence, not safe tuning input.
+    init_metrics_database
+    refresh_actual_pool_limits
     now="$(date +%s)"
-    since=$((now - 1209600))
-    min_available_pct="$(sqlite3 "$METRICS_DB" "SELECT COALESCE(MIN(100.0*mem_available_mb/NULLIF(mem_total_mb,0)),0) FROM system_samples WHERE ts >= $since;")"
+    since=$((now - seconds))
+    system_stats="$(sqlite3 -separator '|' "$METRICS_DB" "SELECT COUNT(*),COALESCE(MIN(100.0*s.mem_available_mb/NULLIF(s.mem_total_mb,0)),0),COALESCE(MAX(s.cpu_pct),100),COALESCE(MAX(s.ts),0) FROM system_samples s JOIN sample_health h ON h.ts=s.ts AND h.domain='' AND h.component='system' AND h.valid=1 WHERE s.ts >= $since;")"
+    IFS='|' read -r system_count min_available_pct peak_cpu system_last <<< "$system_stats"
+    ((system_count >= 1000 && now-system_last <= 180)) || return 0
     for ((i = 1; i <= SITE_COUNT; i++)); do
         domain="${SITE_DOMAINS[$i]}"
         current="${SITE_PHP_MAX_CHILDREN[$i]:-2}"
-        stats="$(sqlite3 -separator '|' "$METRICS_DB" "WITH ordered AS (SELECT ts,php_active,php_queue,php_max_reached,LAG(php_max_reached) OVER (ORDER BY ts) AS previous_reached FROM site_samples WHERE domain='$domain' AND ts >= $since) SELECT COUNT(*),COALESCE(MIN(ts),0),COALESCE(MAX(php_active),0),COALESCE(MAX(php_queue),0),COALESCE(SUM(CASE WHEN previous_reached IS NULL THEN 0 WHEN php_max_reached >= previous_reached THEN php_max_reached-previous_reached ELSE php_max_reached END),0) FROM ordered;")"
-        IFS='|' read -r sample_count first_ts peak_active peak_queue max_events <<< "$stats"
+        stats="$(sqlite3 -separator '|' "$METRICS_DB" "SELECT COUNT(*),COALESCE(MIN(s.ts),0),COALESCE(MAX(s.ts),0),COALESCE(MAX(s.php_active),0),COALESCE(SUM(CASE WHEN s.php_queue>0 OR (s.php_active>=s.php_max_children AND s.php_max_children>0) THEN 1 ELSE 0 END),0),CAST(MAX(96,COALESCE(MAX(1.25*s.php_pss_mb/NULLIF(s.php_active+s.php_idle,0)),96))+0.999 AS INTEGER) FROM site_samples s JOIN sample_health h ON h.ts=s.ts AND h.domain=s.domain AND h.component='php' AND h.valid=1 WHERE s.domain='$domain' AND s.ts >= $since;")"
+        IFS='|' read -r count first last peak saturated worker <<< "$stats"
+        # All pools need valid evidence, otherwise their future memory demand is unknown.
+        ((count >= 1000 && last-first >= 86400 && now-last <= 180)) || return 0
+        evidence[$domain]="$stats"
+        allocation=$((allocation + current * worker))
+    done
+    for ((i = 1; i <= SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        current="${SITE_PHP_MAX_CHILDREN[$i]:-2}"
+        IFS='|' read -r count first last peak saturated worker <<< "${evidence[$domain]}"
         recommended="$current"
-        reason="No high-confidence change"
-        if ((sample_count >= 1000)) && awk -v p="$min_available_pct" 'BEGIN{exit !(p>=20)}'; then
-            if ((peak_queue > 0 || max_events > 0)); then
+        reason=""
+        if awk -v m="$min_available_pct" -v c="$peak_cpu" 'BEGIN{exit !(m>=25 && c<85)}'; then
+            if ((saturated >= 10 && saturated * 100 >= count)); then
                 recommended=$((current + (current + 4) / 5))
                 ((recommended > 50)) && recommended=50
-                reason="Queue or pool saturation with at least 20% memory headroom"
-            elif ((now - first_ts >= 1200000 && peak_active * 3 < current && current > 2)); then
+                while ((recommended > current && allocation + (recommended-current)*worker > PHP_TOTAL_BUDGET_MB)); do
+                    recommended=$((recommended-1))
+                done
+                reason="Repeated saturation; CPU <85%; memory >=25%; measured worker estimate ${worker}MB; within global budget"
+            elif ((last-first >= 1200000 && peak * 3 < current && current > 2 && saturated == 0)); then
                 recommended=$((current - (current + 4) / 5))
                 ((recommended < 2)) && recommended=2
-                reason="Fourteen-day peak stayed below one third of the pool limit"
+                reason="Fourteen days of valid samples; peak below one third of the actual pool limit"
             fi
         fi
         if ((recommended != current)); then
             printf '%s|%s|%s|%s\n' "$domain" "$current" "$recommended" "$reason" >> "$output"
+            allocation=$((allocation + (recommended-current)*worker))
         fi
     done
 }
@@ -3191,25 +4130,40 @@ analyze_metrics() {
     sqlite3 -header -column "$METRICS_DB" "WITH ordered AS (SELECT *,LAG(mariadb_slow_queries) OVER (ORDER BY ts) AS previous_slow,LAG(redis_evicted) OVER (ORDER BY ts) AS previous_evicted FROM service_samples WHERE ts >= $since) SELECT MAX(mariadb_threads) AS 'Peak DB threads',COALESCE(SUM(CASE WHEN previous_slow IS NULL THEN 0 WHEN mariadb_slow_queries >= previous_slow THEN mariadb_slow_queries-previous_slow ELSE mariadb_slow_queries END),0) AS 'New slow queries',printf('%.1f MB',MAX(redis_used_mb)) AS 'Peak Redis',COALESCE(SUM(CASE WHEN previous_evicted IS NULL THEN 0 WHEN redis_evicted >= previous_evicted THEN redis_evicted-previous_evicted ELSE redis_evicted END),0) AS 'Redis evictions' FROM ordered;"
     printf '\nConfigured budget: MariaDB %sMB | Redis %sMB | shared OPcache %sMB | PHP-FPM workers %sMB\n' "$MARIADB_BUFFER_MB" "$REDIS_MAX_MEMORY_MB" "$OPCACHE_TOTAL_BUDGET_MB" "$PHP_TOTAL_BUDGET_MB"
     recommendation_file="$STATE_DIR/last-recommendations.tsv"
-    build_tuning_recommendations "$recommendation_file"
+    build_tuning_recommendations "$recommendation_file" "$seconds"
     printf '\nSafe automatic PHP recommendations\n'
     if [[ -s "$recommendation_file" ]]; then
         printf '%-28s %8s %8s  %s\n' "DOMAIN" "CURRENT" "PROPOSED" "REASON"
         while IFS='|' read -r domain current proposed reason; do
             printf '%-28s %8s %8s  %s\n' "$domain" "$current" "$proposed" "$reason"
         done < "$recommendation_file"
-        printf '\nReview with: sudo wp-shell tune --apply\n'
+        printf '\nReview with: sudo wp-shell tune --apply --range %s\n' "$range"
     else
-        printf 'No high-confidence automatic changes. At least 1,000 samples and memory headroom are required.\n'
+        printf 'No safe changes. Requires >=1,000 valid samples per pool spanning >=24h, fresh data, repeated saturation, CPU <85%%, memory >=25%%, and global budget headroom.\n'
     fi
+    printf '\nProbe validity (unmarked old samples are UNKNOWN; never used for automatic tuning)\n'
+    sqlite3 -header -column "$METRICS_DB" "SELECT component,domain,COUNT(*) AS probes,SUM(valid) AS valid FROM sample_health WHERE ts >= $since GROUP BY component,domain;"
+    printf '\nHost pressure (-1 means unavailable; OOM is a cumulative kernel counter)\n'
+    sqlite3 -header -column "$METRICS_DB" "SELECT MAX(cpu_steal) AS 'Peak steal %',MAX(io_wait) AS 'Peak IO wait %',MAX(memory_psi) AS 'Memory PSI %',MAX(io_psi) AS 'IO PSI %',MAX(inode_pct) AS 'Inodes %',MAX(oom_kills) AS OOM FROM system_pressure WHERE ts >= $since;"
+    printf '\nPrivate Redis instances (shared-service Redis counters above exclude these)\n'
+    sqlite3 -header -column "$METRICS_DB" "SELECT domain,COUNT(*) AS samples,SUM(valid) AS valid,MAX(CASE WHEN valid=1 THEN used_mb END) AS 'Peak MB' FROM redis_site_samples WHERE ts >= $since GROUP BY domain;"
     printf '\nMariaDB and Redis findings are advisory; wp-shell does not auto-change them from aggregate counters alone.\n'
 }
 
 apply_tuning() {
-    local assume_yes="${1:-}" recommendation_file="$STATE_DIR/last-recommendations.tsv" domain current proposed reason
+    local assume_yes="" range=14d seconds recommendation_file="$STATE_DIR/last-recommendations.tsv" domain current proposed reason
+    while (($#)); do
+        case "$1" in
+            --yes) assume_yes=--yes; shift ;;
+            --range) [[ -n "${2:-}" ]] || die "Missing range."; range="$2"; shift 2 ;;
+            '') shift ;;
+            *) die "Usage: wp-shell tune --apply [--yes] [--range 7d|14d|30d]" ;;
+        esac
+    done
+    seconds="$(duration_seconds "$range")" || die "Unsupported range: $range"
     [[ -s "$METRICS_DB" ]] || die "No metrics are available yet."
     calculate_resource_budget
-    build_tuning_recommendations "$recommendation_file"
+    build_tuning_recommendations "$recommendation_file" "$seconds"
     [[ -s "$recommendation_file" ]] || { log_message INFO "No high-confidence changes are available."; return 0; }
     printf 'The following PHP-FPM limits will be applied:\n'
     while IFS='|' read -r domain current proposed reason; do
@@ -3218,11 +4172,47 @@ apply_tuning() {
     if [[ "$assume_yes" != "--yes" ]]; then
         collect_yes_no "Apply these reversible tuning overrides" no || { log_message INFO "No changes were applied."; return 0; }
     fi
-    while IFS='|' read -r domain _current proposed _reason; do
-        PHP_CHILD_OVERRIDES["$domain"]="$proposed"
-    done < "$recommendation_file"
-    save_tuning_config
-    configure_php
+    (
+        local stage success=no index version pool_file i
+        local -A versions=()
+        stage="$(mktemp -d "$STATE_DIR/.tuning.XXXXXX")"
+        [[ ! -f "$TUNING_CONFIG_FILE" ]] || cp -a "$TUNING_CONFIG_FILE" "$stage/tuning.v1"
+        # shellcheck disable=SC2317,SC2329
+        cleanup_tuning() {
+            if [[ "$success" != yes ]]; then
+                while IFS='|' read -r domain _current _proposed _reason; do
+                    index="$(site_index_by_domain "$domain")"
+                    version="${SITE_PHP_VERSIONS[$index]}"
+                    pool_file="/etc/php/$version/fpm/pool.d/wp-shell-$(site_pool_id "$domain").conf"
+                    [[ ! -f "$stage/$domain.conf" ]] || cp -a "$stage/$domain.conf" "$pool_file"
+                done < "$recommendation_file"
+                if [[ -f "$stage/tuning.v1" ]]; then cp -a "$stage/tuning.v1" "$TUNING_CONFIG_FILE"; else rm -f "$TUNING_CONFIG_FILE"; fi
+                for version in "${!versions[@]}"; do php_fpm_service_action reload "$version" || true; done
+                log_message WARNING "PHP tuning failed; previous pool files and tuning policy restored."
+            fi
+            rm -rf -- "$stage"
+        }
+        trap cleanup_tuning EXIT
+        build_tuning_recommendations "$stage/rechecked.tsv" "$seconds"
+        cmp -s "$recommendation_file" "$stage/rechecked.tsv" || die "Metrics or pool configuration changed while waiting; review recommendations again."
+        # Preserve all actual limits; a future budget reapply must not silently undo them.
+        for ((i=1; i<=SITE_COUNT; i++)); do PHP_CHILD_OVERRIDES["${SITE_DOMAINS[$i]}"]="${SITE_PHP_MAX_CHILDREN[$i]}"; done
+        while IFS='|' read -r domain current proposed _reason; do
+            index="$(site_index_by_domain "$domain")"
+            version="${SITE_PHP_VERSIONS[$index]}"
+            pool_file="/etc/php/$version/fpm/pool.d/wp-shell-$(site_pool_id "$domain").conf"
+            [[ -f "$pool_file" && "$(read_pool_limit "$domain" "$version" 0)" == "$current" ]] || die "Pool configuration changed; review recommendations again."
+            cp -a "$pool_file" "$stage/$domain.conf"
+            sed -E "s/^[[:space:]]*pm[.]max_children[[:space:]]*=.*/pm.max_children = $proposed/" "$pool_file" > "$stage/new.conf"
+            install -m 0644 "$stage/new.conf" "$pool_file"
+            PHP_CHILD_OVERRIDES["$domain"]="$proposed"
+            versions[$version]=1
+        done < "$recommendation_file"
+        for version in "${!versions[@]}"; do "php-fpm$version" -t; done
+        save_tuning_config
+        for version in "${!versions[@]}"; do php_fpm_service_action reload "$version"; done
+        success=yes
+    )
     log_message SUCCESS "PHP-FPM tuning overrides were saved to $TUNING_CONFIG_FILE and applied."
 }
 
@@ -3263,12 +4253,15 @@ list_sites() {
         return
     fi
     calculate_resource_budget quiet
-    local i
+    refresh_actual_pool_limits
+    local i redis_label
     printf '%-3s %-28s %-28s %-5s %-8s %-8s %-5s\n' "ID" "DOMAIN" "PRIMARY" "PHP" "MODE" "REDIS" "POOL"
     for ((i = 1; i <= SITE_COUNT; i++)); do
+        redis_label="${SITE_REDIS_DATABASES[$i]}"
+        if [[ "$(site_policy_value "${SITE_DOMAINS[$i]}" redis-mode)" == isolated ]]; then redis_label="private"; fi
         printf '%-3s %-28s %-28s %-5s %-8s %-8s %-5s\n' \
             "$i" "${SITE_DOMAINS[$i]}" "${SITE_PRIMARY_DOMAINS[$i]}" "${SITE_PHP_VERSIONS[$i]}" \
-            "${SITE_MODES[$i]}" "${SITE_REDIS_DATABASES[$i]}" "${SITE_PHP_MAX_CHILDREN[$i]:--}"
+            "${SITE_MODES[$i]}" "$redis_label" "${SITE_PHP_MAX_CHILDREN[$i]:--}"
     done
 }
 
@@ -3284,7 +4277,7 @@ import_existing_sites() {
     if ! command -v wp >/dev/null 2>&1; then
         log_message INFO "WP-CLI is required for discovery and will be installed."
         apt-get update
-        apt_install ca-certificates curl php-cli
+        apt_install ca-certificates curl gnupg php-cli
         install_wp_cli
     fi
     local wp_config wp_path wp_owner url host domain primary www php_version next_index redis_db imported=0
@@ -3294,11 +4287,14 @@ import_existing_sites() {
         [[ -f "$wp_path/wp-includes/version.php" ]] || continue
         wp_owner="$(stat -c '%U' "$wp_config" 2>/dev/null || printf 'www-data')"
         id "$wp_owner" >/dev/null 2>&1 || wp_owner="www-data"
-        if [[ "$wp_owner" == "root" ]]; then
-            url="$(wp --allow-root option get home --path="$wp_path" 2>/dev/null || true)"
-        else
-            url="$(sudo -u "$wp_owner" wp option get home --path="$wp_path" 2>/dev/null || true)"
+        if [[ "$(id -u "$wp_owner")" == 0 ]] || id -nG "$wp_owner" | grep -Eq '(^| )(sudo|wheel|docker|lxd)( |$)'; then
+            wp_owner="www-data"
         fi
+        if ! sudo -u "$wp_owner" test -r "$wp_config"; then
+            log_message WARNING "Skipping $wp_path: wp-config.php is not readable by a non-root site user. Fix its owner/group explicitly before import."
+            continue
+        fi
+        url="$(timeout 20s sudo -u "$wp_owner" wp --skip-plugins --skip-themes option get home --path="$wp_path" 2>/dev/null || true)"
         host="$(printf '%s' "$url" | sed -E 's#^https?://([^/]+).*$#\1#')"
         primary="$host"
         domain="${host#www.}"
@@ -3322,6 +4318,7 @@ import_existing_sites() {
         SITE_TITLES[next_index]="$domain"
         SITE_PATHS[next_index]="$wp_path"
         SITE_MODES[next_index]="imported"
+        set_site_policy "$domain" user "$wp_owner"
         imported=$((imported + 1))
         log_message SUCCESS "Imported $domain from $wp_path."
     done < <(find /var/www /home -xdev -type f -name wp-config.php -print0 2>/dev/null)
@@ -3334,6 +4331,92 @@ headers_have_managed_hsts() {
     local headers="$1"
     grep -Eqi '^strict-transport-security:[[:space:]]*max-age=15552000([;[:space:]]|$)' <<< "$headers" &&
         ! grep -Eqi '^strict-transport-security:[[:space:]]*max-age=0([;[:space:]]|$)' <<< "$headers"
+}
+
+host_audit_line() {
+    printf '%-7s %-24s %s\n' "$1" "$2" "$3"
+}
+
+system_audit() {
+    local ssh_config listeners unsafe timer value i domain user_id
+    printf 'wp-shell host audit (read-only; UNKNOWN means not verified)\n\n'
+    if ssh_config="$(sshd -T 2>/dev/null)"; then
+        value="$(awk '$1=="permitrootlogin" {print $2}' <<< "$ssh_config")"
+        case "$value" in no|prohibit-password|without-password) host_audit_line PASS SSH-root "$value" ;; *) host_audit_line WARN SSH-root "$value: review root login policy" ;; esac
+        value="$(awk '$1=="passwordauthentication" {print $2}' <<< "$ssh_config")"
+        if [[ "$value" == no ]]; then host_audit_line PASS SSH-password disabled
+        else host_audit_line WARN SSH-password 'Enabled; verify a second key-based session before changing SSH settings.'; fi
+        host_audit_line INFO SSH-port "$(awk '$1=="port" {print $2}' <<< "$ssh_config" | paste -sd, -) (Match blocks may differ per user/address)"
+    else
+        host_audit_line UNKNOWN SSH 'Cannot read sshd effective defaults.'
+    fi
+    if listeners="$(ss -H -lnt 2>/dev/null)"; then
+        unsafe="$(awk '$4 ~ /:(3306|6379)$/ && $4 !~ /^(127[.]|\[::1\]:|::1:)/ {print $4}' <<< "$listeners")"
+        if [[ -z "$unsafe" ]]; then host_audit_line PASS DB-Redis-listeners 'No TCP listeners exposed on non-loopback addresses at 3306/6379.'
+        else host_audit_line WARN DB-Redis-listeners "Review public bind/firewall: $unsafe"; fi
+        printf '\nListening TCP addresses (review nonstandard ports separately):\n'
+        awk '{print "  "$4}' <<< "$listeners"
+    else host_audit_line UNKNOWN Listeners 'ss failed.'; fi
+    if value="$(timeout 4s mariadb --connect-timeout=3 -NBe "SELECT COUNT(*) FROM mysql.user WHERE User='' OR (User='root' AND Host NOT IN ('localhost','127.0.0.1','::1'));" 2>/dev/null)"; then
+        if [[ "$value" == 0 ]]; then host_audit_line PASS DB-accounts 'No anonymous or remote-root accounts found.'
+        else host_audit_line WARN DB-accounts "$value anonymous/remote-root account(s); review grants before removing."; fi
+    else host_audit_line UNKNOWN DB-accounts 'Could not inspect local MariaDB grants.'; fi
+    for timer in apt-daily.timer apt-daily-upgrade.timer certbot.timer wp-shell-backup.timer wp-shell-metrics.timer; do
+        if systemctl is-active --quiet "$timer"; then host_audit_line PASS "$timer" active
+        else host_audit_line WARN "$timer" 'inactive or not installed'; fi
+    done
+    if dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -Fq 'install ok installed'; then
+        value="$(apt-config dump | grep -E 'APT::Periodic::Unattended-Upgrade|Unattended-Upgrade::(Allowed-Origins|Origins-Pattern|Automatic-Reboot)' || true)"
+        printf '\nUnattended upgrade policy (timers alone do not prove package/origin coverage):\n%s\n' "$value"
+        host_audit_line WARN PPA-updates 'Verify PHP PPA coverage with unattended-upgrade --dry-run --debug; third-party origins are not implicitly trusted.'
+    else host_audit_line WARN Security-updates 'unattended-upgrades is not installed. Opt in: wp-shell system updates enable'; fi
+    if [[ -e /var/run/reboot-required ]]; then host_audit_line WARN Reboot 'A reboot is required; schedule it after checking backups.'
+    else host_audit_line PASS Reboot 'No reboot-required marker.'; fi
+    if command -v aa-status >/dev/null 2>&1; then
+        if aa-status --enabled >/dev/null 2>&1; then host_audit_line PASS AppArmor enabled
+        else host_audit_line WARN AppArmor 'Not enabled; review OS policy.'; fi
+    else host_audit_line UNKNOWN AppArmor 'aa-status is not installed.'; fi
+    printf '\nMemory, swap, filesystem capacity and inode use:\n'
+    free -m
+    df -h / /var/www
+    df -i / /var/www
+    for value in /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io; do
+        [[ ! -r "$value" ]] || { printf '%s: ' "$value"; head -n 1 "$value"; }
+    done
+    awk '/^oom_kill / {print "Kernel OOM kills since boot: " $2}' /proc/vmstat
+    printf '\nSite boundaries and schedules:\n'
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        user_id="$(site_run_user "$domain")"
+        if [[ "$user_id" == www-data ]]; then host_audit_line WARN "$domain" 'Legacy shared PHP UID; separate pools are not a security boundary.'
+        else host_audit_line PASS "$domain" "PHP user: $user_id"; fi
+        host_audit_line INFO "$domain" "Redis mode: $(site_policy_value "$domain" redis-mode shared); WP cron: $(site_policy_value "$domain" cron-mode request); cache invalidation: $(site_policy_value "$domain" cache-auto disabled)"
+    done
+    host_audit_line INFO Redis-boundary 'Redis DB numbers/prefixes do not isolate credentials. Use per-site instances for untrusted sites.'
+    host_audit_line INFO Scope 'No SSH/firewall/accounts/sysctl settings were changed. Review service updates, plugins and offsite restore tests separately.'
+}
+
+enable_security_updates() {
+    apt-get update
+    apt_install unattended-upgrades
+    cat > /etc/apt/apt.conf.d/52wp-shell-updates <<'EOF'
+// Managed opt-in. Preserve Ubuntu/vendor origin lists. Never reboot unattended.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+    log_message SUCCESS "Daily unattended upgrades enabled without automatic reboots. Existing allowed origins are preserved; review PHP PPA coverage with a dry run."
+}
+
+system_command() {
+    case "${1:-audit}" in
+        audit) system_audit ;;
+        updates) [[ "${2:-}" == enable ]] || die "Usage: wp-shell system updates enable"; enable_security_updates ;;
+        logs) [[ "${2:-}" == install ]] || die "Usage: wp-shell system logs install"; configure_log_rotation ;;
+        wp-cli) [[ "${2:-}" == verify ]] || die "Usage: wp-shell system wp-cli verify"; install_wp_cli --verify ;;
+        *) die "Usage: wp-shell system audit | system updates enable" ;;
+    esac
 }
 
 security_scan() {
@@ -3360,6 +4443,10 @@ security_scan() {
         if [[ -f "$wp_config" ]]; then
             perms="$(stat -c '%a' "$wp_config")"
             [[ "$perms" == "640" || "$perms" == "600" ]] || { log_message WARNING "$wp_config has permissions $perms."; failed=$((failed + 1)); }
+            if [[ "$(site_run_user "$domain")" != www-data && "$perms" != 600 ]]; then
+                log_message WARNING "$domain uses a dedicated PHP user; wp-config.php must be 600 to exclude legacy www-data sites."
+                failed=$((failed + 1))
+            fi
             for constant in FORCE_SSL_ADMIN DISALLOW_FILE_EDIT WP_CACHE; do
                 value="$(site_wp_cli "$domain" config get "$constant" 2>/dev/null || true)"
                 [[ "$value" == "1" || "$value" == "true" ]] || {
@@ -3375,8 +4462,21 @@ security_scan() {
                 log_message WARNING "$domain does not pass strict WordPress core checksum verification. Run: sudo wp-shell site $domain core-repair"
                 failed=$((failed + 1))
             fi
+        else
+            log_message ERROR "$domain is missing wp-config.php; its security state cannot be verified."
+            failed=$((failed + 1))
         fi
         [[ -s "/etc/letsencrypt/live/$domain/fullchain.pem" ]] || { log_message ERROR "$domain has no certificate."; failed=$((failed + 1)); }
+        if [[ "$(site_policy_value "$domain" cron-mode)" == system ]] && ! systemctl is-active --quiet "wp-shell-cron-$(site_pool_id "$domain").timer"; then
+            log_message ERROR "$domain has managed WP-Cron enabled but its timer is inactive."
+            failed=$((failed + 1))
+        fi
+        if [[ "$(site_policy_value "$domain" cache-auto)" == enabled ]]; then
+            if [[ ! -f "$(site_wp_path "$domain")/wp-content/mu-plugins/wp-shell-cache.php" ]] || ! systemctl is-active --quiet wp-shell-operations.timer; then
+                log_message ERROR "$domain automatic page-cache invalidation is incomplete."
+                failed=$((failed + 1))
+            fi
+        fi
         primary="${SITE_PRIMARY_DOMAINS[$i]}"
         origin_headers="$(curl --silent --show-error --output /dev/null --dump-header - --max-time 5 \
             --resolve "$primary:443:127.0.0.1" "https://$primary/wp-login.php" 2>/dev/null | tr -d '\r' || true)"
@@ -3407,7 +4507,7 @@ security_scan() {
         fi
     fi
     if ((failed == 0)); then
-        log_message SUCCESS "Security checks passed."
+        log_message SUCCESS "Security checks passed. This is a configuration check, not a complete security guarantee. Use 'wp-shell system audit' for host advisories."
     else
         die "Security checks found $failed issue(s)."
     fi
@@ -3419,6 +4519,7 @@ add_site_command() {
     wordpress_environment_detected || die "The Nginx/PHP-FPM/database environment is incomplete. Repair it before adding a website."
     collect_site_input
     index="$SITE_COUNT"
+    create_site_identity "${SITE_DOMAINS[$index]}"
     prepare_stack
     deploy_site "$index"
     install_self
@@ -3609,9 +4710,9 @@ management_menu() {
     printf '\nwp-shell v%s\n' "$WP_SHELL_VERSION"
     printf 'Environment: installed | Mode: %s | PHP: %s | Sites: %s\n\n' \
         "$ENVIRONMENT_MODE" "$DEFAULT_PHP_VERSION" "$SITE_COUNT"
-    printf '1) Dashboard\n2) Add a new website\n3) Website list\n4) Website status\n5) Deploy or repair a website\n6) Back up one website\n7) Back up all websites\n8) Restore a website\n9) Import existing websites\n10) Traffic and resource report\n11) Analyze resource usage\n12) Apply safe tuning recommendations\n13) Reapply service resource budget\n14) Security scan\n15) Repair backup and metrics timers\n16) OPcache settings\n0) Exit\n'
+    printf '1) Dashboard\n2) Add a new website\n3) Website list\n4) Website status\n5) Deploy or repair a website\n6) Back up one website\n7) Back up all websites\n8) Restore a website\n9) Import existing websites\n10) Traffic and resource report\n11) Analyze resource usage\n12) Apply safe tuning recommendations\n13) Reapply service resource budget\n14) Security scan\n15) Repair backup and metrics timers\n16) OPcache settings\n17) Host security and pressure audit\n18) Advanced operations help\n0) Exit\n'
     local choice domain backup_id range
-    read -r -p "Select [0-16]: " choice
+    read -r -p "Select [0-18]: " choice
     case "$choice" in
         1)
             if [[ ! -s "$METRICS_DB" ]]; then
@@ -3667,6 +4768,8 @@ management_menu() {
         14) security_scan ;;
         15) install_self; install_backup_timer; install_metrics_timer ;;
         16) opcache_menu ;;
+        17) system_audit ;;
+        18) show_help ;;
         0) return ;;
         *) die "Invalid selection." ;;
     esac
@@ -3711,6 +4814,22 @@ Usage:
   sudo wp-shell optimize                         Reapply the resource budget
   sudo wp-shell rotate-redis-secret              Rotate Redis auth and redact matching logs
   sudo wp-shell security-scan                    Validate services, TLS, and permissions
+  sudo wp-shell system audit                     Read-only host security/pressure review
+  sudo wp-shell system updates enable            Opt in to unattended security updates
+  sudo wp-shell system logs install              Install operation/site log rotation
+  sudo wp-shell system wp-cli verify             Verify and reinstall signed WP-CLI
+  sudo wp-shell site DOMAIN nginx-apply           Refresh managed Nginx; preserve custom includes
+  sudo wp-shell site DOMAIN cache-clear [page|object|opcache|all]
+  sudo wp-shell site DOMAIN cache-auto enable|disable|status
+  sudo wp-shell site DOMAIN cache-exclude /staging/
+  sudo wp-shell site DOMAIN cron enable|disable|status
+  sudo wp-shell site DOMAIN isolate [--yes]       Migrate a legacy site to its own PHP UID
+  sudo wp-shell site DOMAIN redis-isolate [MB]    Opt in to a private Redis socket/instance
+  sudo wp-shell site DOMAIN login-limit direct|off|status
+  sudo wp-shell backup verify DOMAIN [ID|latest]  Verify files, manifest and SHA256
+  sudo wp-shell backup drill DOMAIN [ID|latest]   Test files + disposable restricted database
+  sudo wp-shell backup remote DOMAIN crypt:PATH|off|status
+  sudo wp-shell site DOMAIN maintenance on|off|status
 
 Site actions: status, info, summary, core-verify, core-repair, cache-clear,
 backup, backups, restore, update, restart
@@ -3780,7 +4899,7 @@ execute_command() {
         dashboard) dashboard ;;
         report) metrics_report "${2:-24h}" ;;
         analyze) analyze_metrics "${2:-7d}" ;;
-        tune) [[ "${2:-}" == "--apply" ]] || die "Usage: wp-shell tune --apply [--yes]"; apply_tuning "${3:-}" ;;
+        tune) [[ "${2:-}" == "--apply" ]] || die "Usage: wp-shell tune --apply [--yes] [--range RANGE]"; shift 2; apply_tuning "$@" ;;
         opcache) shift; opcache_command "$@" ;;
         site) site_command "${2:-list}" "${3:-}" "${4:-}" ;;
         metrics)
@@ -3799,11 +4918,14 @@ execute_command() {
         deploy) [[ -n "${2:-}" ]] || die "A site ID or domain is required."; deploy_domain "$2" ;;
         import) import_existing_sites; install_self ;;
         backup-all) backup_all_sites ;;
-        backup) [[ -n "${2:-}" ]] || die "A site ID or domain is required."; site_action "$2" backup ;;
+        backup) shift; backup_command "$@" ;;
         restore) [[ -n "${2:-}" && -n "${3:-}" ]] || die "Usage: restore DOMAIN|ID BACKUP_ID"; site_action "$2" restore "$3" ;;
         optimize) configure_mariadb; configure_redis; configure_php ;;
         rotate-redis-secret) rotate_redis_secret ;;
         security-scan) security_scan ;;
+        system) shift; system_command "$@" ;;
+        cron-run) [[ -n "${2:-}" ]] || die "A managed domain is required."; run_site_cron "$2" ;;
+        ops) [[ "${2:-}" == run ]] || die "Use ops run."; run_operations ;;
         install-backup-timer) install_self; install_backup_timer ;;
         migrate) log_message SUCCESS "Configuration is using the current v3 format." ;;
         legacy-vps) shift; execute_command "$@" ;;
@@ -3825,7 +4947,7 @@ main() {
     check_platform
     require_command base64
     case "${1:-}" in
-        dashboard|report|analyze|tune|metrics)
+        dashboard|report|analyze|tune|metrics|cron-run|ops)
             init_paths
             migrate_legacy_configs
             load_sites_config

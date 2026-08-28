@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v9.4.8
+- 当前版本：`wp-shell.sh` v9.5.0
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -22,6 +22,9 @@
 - 可按域名查看请求量、状态码、P95 延迟、缓存命中率、PHP 内存、磁盘占用、TLS 和备份状态。
 - 可根据一段时间的历史数据生成资源分析和安全的 PHP-FPM 调整建议。
 - 按 PHP 版本持久保存 OPcache 容量，并通过本地 FPM socket 检查运行时缓存状态。
+- 新网站使用独立 PHP 用户；旧网站可显式迁移，并可选择独立 Redis socket/实例。
+- 可选系统 WP-Cron、内容变更触发的页面缓存清理、登录 POST 限速和加密异地备份。
+- 备份完成前验证归档和校验清单；调优受有效样本、CPU、实际内存证据和全站预算约束。
 - 自动迁移旧版多站点脚本和单站点脚本的配置。
 - 不提供 Web 控制面板，不开放远程监控端口，不上传遥测数据。
 
@@ -319,7 +322,7 @@ sudo ./wp-shell.sh
 
 建议先选择 `1`，运行备份并核对网站列表。确认无误后，再重新运行 `sudo wp-shell`，通过管理菜单或 `site deploy DOMAIN|ID` 接管单个网站。
 
-选择 `3` 接管站点时，脚本还会询问目标 PHP 版本、是否包含 `www` 和证书管理员邮箱。接管会生成新的 Nginx/PHP-FPM/缓存配置，启用 wp-shell Redis 设置，并把站点文件权限统一为 `www-data`。该操作前必须准备独立的网站和数据库备份。
+选择 `3` 接管站点时，脚本还会询问目标 PHP 版本、是否包含 `www` 和证书管理员邮箱。接管会生成新的 Nginx/PHP-FPM/缓存配置、启用 wp-shell Redis 设置，并按登记的非 root 运行用户整理权限。该操作前必须准备独立的网站和数据库备份。发现 root 或属于 sudo/docker/lxd 等管理组的文件所有者时，导入阶段不会以该用户执行网站代码；无法让 `www-data` 读取的配置会跳过，需管理员明确调整后重试。
 
 ### 3. 状态三：已经由 wp-shell 管理
 
@@ -342,6 +345,8 @@ sudo ./wp-shell.sh
 14) Security scan
 15) Repair backup and metrics timers
 16) OPcache settings
+17) Host security and pressure audit
+18) Advanced operations help
 0) Exit
 ```
 
@@ -597,7 +602,16 @@ sudo wp-shell site example.com core-repair
 sudo wp-shell site example.com cache-clear
 ```
 
-它只会清理该域名的 FastCGI 缓存和 WordPress 对象缓存，不会执行 Redis `FLUSHDB`，因此不会影响其他网站。
+v9.5.0 起，默认只清理该域名的 FastCGI **页面缓存**，不刷新 Redis，不重载 PHP-FPM。需要其他范围时明确指定：
+
+```bash
+sudo wp-shell site example.com cache-clear page
+sudo wp-shell site example.com cache-clear object
+sudo wp-shell site example.com cache-clear opcache
+sudo wp-shell site example.com cache-clear all
+```
+
+`object` 调用当前网站的 WordPress 对象缓存插件清理接口，其影响范围取决于插件和 Redis 配置；不要在不同网站之间复用同一个 Redis DB。`opcache` 和 `all` 会重载同一 PHP 版本的 FPM，因此会影响共用该 PHP 版本的其他网站。日常发布内容不需要这样做。
 
 ### 8. 统一站点操作语法
 
@@ -700,13 +714,15 @@ sudo wp-shell restore 2 20260817-020000
 
 恢复流程会：
 
-1. 校验 `SHA256SUMS`。
+1. 校验完整的 `SHA256SUMS`、站点归属和压缩包，并拒绝需要人工审查的链接/危险归档路径。
 2. 为当前网站自动创建一份恢复前安全备份。
-3. 启用 WordPress 维护模式。
+3. 启用 Nginx 层维护标记和 WordPress 维护模式，防止旧页面缓存绕过维护。
 4. 恢复网站文件。
 5. 恢复数据库。
 6. 重设文件权限。
 7. 清理缓存并关闭维护模式。
+
+恢复中途失败时，Nginx 维护标记会保留，避免继续提供半恢复的网站。先检查日志、数据库连接和文件状态，修复并验收后再运行 `sudo wp-shell site example.com maintenance off`，不要只为恢复访问而直接关闭维护模式。旧模板需先更新为支持 `.wp-shell-maintenance` 的模板。
 
 ### 5. 备份文件内容
 
@@ -849,7 +865,7 @@ sudo wp-shell tune --apply
 DOMAIN  CURRENT  PROPOSED  REASON
 ```
 
-确认后才会写入配置并重启相关 PHP-FPM 服务。
+确认并重新校验建议后，才会写入受影响的进程池配置，并重载相关 PHP-FPM 服务；配置检查或重载失败会回滚。
 
 无人值守确认：
 
@@ -863,9 +879,12 @@ sudo wp-shell tune --apply --yes
 
 自动调优目前只修改每个站点的 PHP-FPM `pm.max_children`：
 
-- 至少需要 1,000 个历史样本。
-- 增加进程数前要求观察到至少 20% 内存余量。
-- 增加额度必须有 PHP 排队或进程池饱和证据。
+- 每个站点至少有 1,000 个有效 PHP 样本，跨度不少于 24 小时，最近样本不超过 180 秒。
+- 老版本没有有效性标记的样本、失败探测得到的占位数值，不用于自动调优。
+- 增加进程数要求所选观察窗口内 CPU 峰值低于 85%，可用内存最低占比至少 25%。这是偏保守的门槛，短暂 CPU 峰值也可能阻止自动扩容。
+- 需要至少 10 次、且占有效样本至少 1% 的排队或活动进程达到配置上限的证据；一次历史累计饱和事件不再触发扩容。
+- 按实测 PSS/进程数加 25% 余量估算单进程消耗，最低按 96MB；所有建议合计不得超过共享 OPcache 扣除后的 PHP 工作进程预算。
+- 从实际进程池文件读取当前上限；`analyze 7d` 与 `tune --apply --range 7d` 使用相同时间范围。
 - 降低额度需要接近 14 天的持续低峰值使用。
 - 单次调整约为 20%。
 - 每站点限制在 2 至 50 个 PHP 子进程。
@@ -878,7 +897,7 @@ sudo wp-shell tune --apply --yes
 
 MariaDB 和 Redis 的分析结果目前只作为建议展示，不会仅凭聚合计数自动改写它们的内存配置。这样可以避免在缺少 buffer pool 命中率、业务峰值和磁盘延迟背景时做出危险调整。
 
-PHP-FPM 的 `max children reached`、MariaDB 慢查询和 Redis 淘汰都是服务启动以来的累计计数器。v9.4.5 起，看板只在最近两次采样之间出现新增 PHP 饱和事件时显示 `PHP max`；历史分析和自动调优也按相邻样本的正向增量统计。计数器保持不变不会持续告警；服务重启造成计数器归零不会被误算成负数，重启后新产生的事件仍会计入。
+PHP-FPM 的 `max children reached`、MariaDB 慢查询和 Redis 淘汰都是服务启动以来的累计计数器。看板和历史报告按相邻样本的正向增量展示新增事件，重启后的计数归零不计为负数。v9.5.0 的自动扩容另外要求持续的排队/活动进程证据，不再仅根据累计计数器增量决定。
 
 手动运行 `sudo wp-shell metrics collect` 成功时不会输出内容。v9.4.5 曾把 SQLite WAL checkpoint 的内部结果 `0|0|0` 打印到终端；该字符串不代表采样数量为零或采集失败，v9.4.6 已隐藏这项内部输出。采样数量应通过 `sudo wp-shell metrics status` 查看。
 
@@ -1018,6 +1037,10 @@ sudo systemctl daemon-reload
 /etc/wp-shell/tuning.v1                   可选 PHP-FPM 调优覆盖值
 /etc/wp-shell/opcache.v1                  按 PHP 版本保存的 OPcache 容量
 /etc/wp-shell/opcache-backups/            OPcache 应用前的受管文件备份
+/etc/wp-shell/site-policy/               每站点用户、定时任务、缓存和异地备份策略
+/etc/wp-shell/nginx-backups/             Nginx 模板更新前的配置快照
+/etc/nginx/wp-shell-custom/DOMAIN/        保留的每站点自定义 *.conf
+/etc/wp-shell-redis/                     可选独立 Redis 实例配置
 /etc/php/VERSION/fpm/conf.d/zz-wp-shell-opcache.ini
 /etc/nginx/conf.d/wp-shell-log-format.conf
 /usr/local/sbin/wp-shell                  安装后的主程序
@@ -1037,16 +1060,20 @@ sudo systemctl daemon-reload
 ```bash
 cd /path/to/wp-shell
 git pull --ff-only
-sudo ./wp-shell.sh install
+bash -n ./wp-shell.sh && sudo install -o root -g root -m 0755 ./wp-shell.sh /usr/local/sbin/wp-shell
+sudo wp-shell --version
 ```
 
 如果之前只下载了单个脚本：
 
 ```bash
-wget -O wp-shell.sh https://raw.githubusercontent.com/hwc0212/wp-shell/main/wp-shell.sh
-chmod +x wp-shell.sh
-sudo ./wp-shell.sh install
+wget -O wp-shell.sh.new https://raw.githubusercontent.com/hwc0212/wp-shell/main/wp-shell.sh &&
+bash -n wp-shell.sh.new &&
+sudo install -o root -g root -m 0755 wp-shell.sh.new /usr/local/sbin/wp-shell &&
+sudo wp-shell --version
 ```
+
+只更新脚本不需要重新运行 `install` 或 `site deploy`。这不会自动改动现有网站、PHP 用户、OPcache 手工参数或 SSH 登录方式。v9.5.0 新功能的应用和验收见下方“十八、v9.5.0 升级后的操作”。
 
 ### 2. 从 v9.4.2 或 v9.4.3 升级后的必要安全操作
 
@@ -1294,9 +1321,11 @@ bash tests/config-roundtrip.sh
 bash tests/render-nginx.sh
 bash tests/storage-layout.sh
 bash tests/metrics-roundtrip.sh
+bash tests/wordpress-core.sh
 bash tests/dashboard-smoke.sh
 bash tests/menu-routing.sh
 bash tests/opcache-config.sh
+bash tests/reliability-regression.sh
 ```
 
 ShellCheck：
@@ -1306,6 +1335,8 @@ shellcheck -x wp-shell.sh wp-vps-manager.sh deploy-single-wordpress.sh tests/*.s
 ```
 
 GitHub Actions 还会在 Ubuntu 24.04 容器中使用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 验证生成的配置。OPcache 测试覆盖手工参数接管、持久值重用、共享预算去重、无效参数/低内存拒绝、配置及重载失败回滚、INI 加载冲突，以及通过真实 FPM socket 读取运行时状态。
+
+v9.5.0 新增备份故障注入、全站调优预算、采集事务、缓存绕过与清理范围、站点用户/Redis socket 隔离、WP-Cron 启用门槛、MU 插件事件、WP-CLI 签名验证和临时数据库恢复演练测试。`nginx-integration.sh`、`service-config-integration.sh` 和 `operations-integration.sh` 会修改系统配置，只能按 CI 的方式在可丢弃容器中以 root 运行，不能在生产 VPS 上执行。
 
 ## 十七、当前边界
 
@@ -1317,11 +1348,199 @@ GitHub Actions 还会在 Ubuntu 24.04 容器中使用真实的 Nginx、MariaDB�
 - 数据库复制
 - 自动跨服务器迁移
 - 一键克隆网站
-- 自动上传云端备份
+- 在未配置目标和加密凭据时自动上传云端备份
 - 托管式控制平面
 - 自动完成所有 MariaDB 和 Redis 性能调优
 
-这些能力可以结合 WP-CLI、rsync、rclone、对象存储和云厂商工具实现，但在缺少完整验证和回滚机制前，不会作为已经完成的菜单功能提供。
+异地备份已提供显式选择的 rclone crypt 上传与下载校验；其余未列入命令帮助的能力不视为已实现。脚本也不会自动关闭 SSH 密码登录、修改内核/sysctl、创建 swap、关闭 Wordfence，或把 Redis DB 编号当作安全隔离。
+
+## 十八、v9.5.0 升级后的操作
+
+### 1. 先验证脚本和现有站点，不要重新部署全部环境
+
+完成“十三、从旧版本升级”中的脚本更新后运行：
+
+```bash
+sudo wp-shell --version
+sudo wp-shell site list
+sudo wp-shell site status
+sudo wp-shell opcache status
+sudo wp-shell metrics install
+sudo wp-shell metrics collect
+sudo wp-shell metrics status
+sudo wp-shell system audit
+```
+
+采样历史保留。新采样才带有探测有效性标记，因此升级后暂时没有自动扩容建议是正常保护，不是采集故障。看板中的 `PHP ?`、`Logs ?` 或共享服务的 `?` 表示探测不可用或日志覆盖不完整，不能解释为零负载。目录大小最多每 15 分钟刷新一次，单次扫描限时；失败时保留上次值或显示未知。访问日志每次最多处理 5MiB，超限会标记覆盖不完整。
+
+`analyze` 增加 CPU steal、IO wait、内存/IO PSI、inode 占用和内核累计 OOM 计数。共享 Redis 与独立 Redis 分开列出。`system audit` 的 `PASS/WARN/UNKNOWN` 是逐项检查结果：不能获取的信息不会当作通过，某个 PASS 也不表示整台服务器绝对安全。
+
+### 2. 应用 Nginx 缓存与安全模板
+
+每个站点单独操作。已有手工改过的 Nginx 规则，尤其是 staging 路由、反向代理和自定义 WooCommerce 路径，应先审查并移到 `/etc/nginx/wp-shell-custom/DOMAIN/*.conf`。这些文件会保留；脚本无法自动判断旧文件中的任意手工改动是否应当迁移。
+
+```bash
+sudo wp-shell backup example.com
+sudo wp-shell site example.com nginx-apply
+sudo wp-shell site example.com status
+sudo wp-shell security-scan
+```
+
+更新前的 Nginx 配置保存在终端显示的 `/etc/wp-shell/nginx-backups/` 快照中。新模板提供：
+
+- Authorization、非 GET/HEAD、查询参数、登录 Cookie、REST、嵌套后台/登录路径等页面缓存绕过规则；继续尊重上游 `Cache-Control` 和 `Set-Cookie`。
+- 对 CSS、JS、JSON、SVG 等文本资源启用 Gzip；HTTP/2 继续保留。
+- 静态资源默认 30 天，不再给可能同 URL 替换的文件统一加 `immutable`。已进入浏览器的旧缓存不能靠服务器清理立即撤回。
+- 拒绝直接下载常见 WPvivid、UpdraftPlus、All-in-One Migration 备份目录内容；自定义备份路径仍需单独检查。
+- 支持 Nginx 层维护标记。
+
+自定义商城路径和 staging 路径需要显式排除，例如：
+
+```bash
+sudo wp-shell site example.com cache-exclude /staging/
+sudo wp-shell site example.com cache-exclude /basket/
+```
+
+这里的路径只是示例，替换成实际 URL 路径，并以 `/` 结束。排除缓存不等于自动配置 staging 的 WordPress 路由、数据库、Cookie 或 Redis 隔离，也不等于解决所有插件授权问题。
+
+匿名访问同一公开页面两次，应能看到 MISS 后 HIT；登录/鉴权/后台路径应不命中，POST 可能不输出 `X-FastCGI-Cache`，不能要求它一定显示 BYPASS：
+
+```bash
+curl -sS -o /dev/null -D - https://example.com/ | grep -Ei 'HTTP/|x-fastcgi-cache|cache-control'
+curl -sS -o /dev/null -D - https://example.com/ | grep -Ei 'HTTP/|x-fastcgi-cache|cache-control'
+```
+
+有 CDN 时还要区分源站和公网响应。脚本无法替你清除 CDN、浏览器或其他页面缓存插件中的内容。
+
+### 3. 内容更新后自动清理页面缓存（可选）
+
+```bash
+sudo wp-shell site example.com cache-auto enable
+sudo wp-shell site example.com cache-auto status
+```
+
+此命令会安装一个小型 MU 插件 `wp-content/mu-plugins/wp-shell-cache.php`，监听文章、菜单、主题、分类、评论、升级等事件，在文档根目录外写入变更标记。systemd 任务约一分钟内清理该域名的页面缓存，不清空对象缓存、不重载 PHP-FPM，也没有常驻 Web 面板进程。
+
+不需要定时清空全部缓存。页面默认 TTL 仍为 30 分钟；第三方插件的特殊修改若不触发上述事件，可手动 `cache-clear page`。该功能目前仅支持 `/var/www/DOMAIN/public` 布局；复制到子目录的 staging 不会自动作为独立受管站点处理。
+
+```bash
+sudo wp-shell site example.com cache-auto disable
+```
+
+禁用只移除对应的 wp-shell MU 插件和策略，不删除其他插件或网站内容。
+
+### 4. 用系统任务运行 WP-Cron（可选）
+
+```bash
+sudo wp-shell site example.com cron enable
+sudo wp-shell site example.com cron status
+```
+
+先检查并避免已有 crontab/云平台重复调度。脚本会先完成一次真实任务运行、确认 timer 活跃，再设置 `DISABLE_WP_CRON=true`。任务以该站点用户和对应 PHP 版本运行，有防重叠锁与超时，约每分钟检查到期事件；不是以 root 执行网站 PHP。
+
+失败时检查 `journalctl -u wp-shell-cron-POOL_ID.service`，实际 POOL_ID 可从 PHP pool 文件或 `systemctl list-timers --all` 查看。切回之前的设置：
+
+```bash
+sudo wp-shell site example.com cron disable
+```
+
+会先恢复启用前的 `DISABLE_WP_CRON` 值，再停用 timer。如果原值已经是 true，应确认原来的外部调度仍然存在。
+
+### 5. 旧网站的用户和 Redis 隔离（可选，低流量时执行）
+
+新建网站默认采用独立 Linux/PHP 用户；仅升级脚本不会迁移旧站。旧站先完成 Nginx 模板更新，并安装 ACL 工具：
+
+```bash
+sudo apt-get install acl
+sudo wp-shell site example.com isolate
+```
+
+确认后会备份网站，短暂开启维护模式，记录原权限，然后调整 PHP pool 与文件所有者。目录/文件为 750/640，`wp-config.php` 为 600。迁移失败会尝试恢复原 PHP pool 和 ACL/所有者；若回滚也失败，会保留维护状态及现场快照，不会宣称已恢复。插件内写文件、备份、上传和 staging 功能都应再抽查。所有站点都迁出共享 UID 后，文件系统边界才更完整；这不是容器或虚拟机级隔离。
+
+Redis DB 编号和前缀不是访问控制。需要对象缓存隔离时，再执行：
+
+```bash
+sudo wp-shell site example.com redis-isolate 64
+sudo wp-shell site example.com status
+sudo wp-shell rotate-redis-secret
+sudo wp-shell security-scan
+```
+
+`64` 表示从原有 Redis 总预算中划出 64MB，而不是额外再给每站点一份总预算。共享实例至少保留 32MB，超过总预算会拒绝。独立实例有单独 Redis 用户、Unix socket、密码，不监听 TCP，使用自己的 DB 0。减少共享实例容量可能触发旧缓存淘汰。
+
+迁移后应轮换共享 Redis 密钥，撤销该站点此前可能保存在旧配置/插件备份中的共享密码；轮换会跳过独立 Redis 站点。不能只迁移一个站点就宣称所有旧站已经完全隔离。独立实例当前不提供自动合并回共享实例或自动调整其容量，需按实际数据审查配置后处理。
+
+### 6. 备份校验、恢复演练和加密异地备份
+
+```bash
+sudo wp-shell backup example.com
+sudo wp-shell backup verify example.com latest
+sudo wp-shell backup drill example.com latest
+```
+
+备份会在空间预检、文件归档、数据库导出、完整清单生成和实际校验都成功后才发布为正式备份。任一步失败返回非零值，不会以空清单假装成功；批量备份仍会继续处理其他站点，并最终报告失败。日志、缓存和私有备份目录不会在旧的非 public 布局中被递归打进自身备份。
+
+`verify` 检查校验和、站点归属及压缩包。`drill` 额外解包到临时目录，把 SQL 导入临时数据库；专用临时数据库用户没有其他数据库/服务器权限，导入禁用客户端 shell 命令和 LOCAL 文件读取，结束后清理临时数据库和用户。它**不会运行插件、发送邮件或执行网站 PHP，也不等于完成真实访客页面、下单和邮件功能的恢复验收**。含链接或特殊 DEFINER 权限的备份可能需人工处理，不会强行继续。
+
+异地备份默认关闭。先自行选择存储目标、安装 `rclone`，并以 root 配置一个 **crypt 加密 remote**；密钥在服务器终端配置，不要发送到聊天或写进 GitHub：
+
+```bash
+sudo rclone config
+sudo wp-shell backup remote example.com encrypted:wp-backups
+sudo wp-shell backup example.com
+```
+
+`encrypted` 替换成你配置的 crypt remote 名称。脚本拒绝普通未加密 remote，并在上传后下载校验，因此会产生额外上传/下载流量与存储费用。远端失败时保留本地备份，跳过本地过期清理，整次任务报告失败。脚本不会删除远端文件或为你购买云存储。
+
+```bash
+sudo wp-shell backup remote example.com status
+sudo wp-shell backup remote example.com off
+```
+
+请把 crypt 密钥保存在服务器外；只存于同一 VPS 的密钥和备份无法应对整机丢失。灾难恢复仍需你从远端取回解密后的归档，验证后再走恢复流程。
+
+### 7. 系统安全和登录保护
+
+```bash
+sudo wp-shell system audit
+sudo wp-shell system logs install
+sudo wp-shell system wp-cli verify
+```
+
+巡检覆盖 SSH 有效默认值、数据库/Redis 监听地址、匿名/远程 root 数据库账号、更新与备份/证书/指标 timer、待重启标记、AppArmor、磁盘/inode、内存和压力信息。SSH Match 块、非默认数据库端口、云安全组和 CDN 防护仍需结合实际配置检查。Fail2ban 的 SSH jail 使用检测到的 SSH 端口；`nginx-http-auth` 不等于 WordPress 表单登录防护。
+
+`system wp-cli verify` 会下载固定版本 PHAR 与签名，检查官方固定 GPG 指纹并验签，成功后才执行/安装；需 `curl`、`gpg` 和 PHP CLI。不要把单纯下载到文件视为已经验签。
+
+自动安全更新需要明确选择：
+
+```bash
+sudo wp-shell system updates enable
+sudo unattended-upgrade --dry-run --debug
+```
+
+保留现有允许来源列表，并禁止自动重启。尤其要核实 PHP PPA 是否被允许，不能因为 timer 活跃就认为第三方 PHP 安全更新也已覆盖。
+
+仅对直接到达 Nginx 的访客连接，可选择登录 POST 限速：
+
+```bash
+sudo wp-shell site example.com login-limit direct
+sudo wp-shell site example.com login-limit status
+sudo wp-shell site example.com login-limit off
+```
+
+默认每客户端 IP 10 次/分钟、突发 10 次，只限制 `wp-login.php` POST，超限返回 429，不拦截普通后台 AJAX。该全局限速区可在启用站点间共享计数。**有 Cloudflare/CDN/负载均衡时，必须先核验可信代理与真实 IP 配置，否则可能把全部访客当成一个代理 IP 限速；不能信任任意来源的 X-Forwarded-For。** 限速不替代密码强度、2FA、漏洞修复或 Wordfence。
+
+### 8. 最后验收
+
+```bash
+sudo wp-shell security-scan
+sudo wp-shell site status
+sudo wp-shell metrics status
+sudo wp-shell analyze 7d
+sudo systemctl --failed --no-pager
+```
+
+再抽查两个网站的匿名页面缓存、登录/后台、媒体上传、插件更新、WP-Cron 和实际备份恢复。脚本的自动测试不能代替你 VPS 上现有插件、staging 和自定义规则的验收。不要为了看到“推荐扩容”而降低采样/CPU/内存安全门槛，也不要把同一分钟各站点以外的历史峰值简单相加当成实测总内存。
 
 ## 免责声明
 

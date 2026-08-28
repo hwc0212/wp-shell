@@ -76,7 +76,7 @@ grep -q 'strictly verified WordPress 7.1 core' <<< "$output"
 [[ -f "$test_root/backup-called" ]]
 [[ -f "$test_root/download-called" ]]
 [[ -f "$test_root/permissions-called" ]]
-[[ -f "$test_root/nginx-refresh-called" ]]
+[[ ! -f "$test_root/nginx-refresh-called" ]]
 [[ -f "$test_root/cache-clear-called" ]]
 [[ ! -e "$test_root/public/wp-admin/error_log" ]]
 [[ ! -e "$test_root/public/wp-includes/php-ai-client/third-party/Http/Discovery/Exception/NoCandidateFoundException.p" ]]
