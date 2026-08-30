@@ -27,7 +27,7 @@ if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.s
 fi
 
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
-grep -Fq 'readonly WP_SHELL_VERSION="10.0.0"' "$repo_root/wp-shell.sh"
+grep -Fq 'readonly WP_SHELL_VERSION="10.0.1"' "$repo_root/wp-shell.sh"
 grep -Fq 'PRAGMA wal_checkpoint(PASSIVE);" >/dev/null' "$repo_root/wp-shell.sh"
 grep -Fq 'core download "$download_url" --force --skip-content --locale="$locale"' "$repo_root/wp-shell.sh"
 grep -Fq 'verify_wordpress_core_strict "$domain"' "$repo_root/wp-shell.sh"
@@ -36,7 +36,7 @@ grep -Fq "} > \"\$TERMINAL_DEVICE\"" "$repo_root/wp-shell.sh"
 grep -Fq 'END {printf "%d %d\n", rx, tx}' "$repo_root/wp-shell.sh"
 grep -Fq 'php_pss_mb REAL NOT NULL DEFAULT 0' "$repo_root/wp-shell.sh"
 grep -Fq 'Load {float(system.get('"'"'load1'"'"', 0)):.2f} / {cores} cores' "$repo_root/wp-shell.sh"
-grep -Fq "\"\$initial_mode\" == \"managed\" && \"\$wordpress_installed_now\" == \"yes\"" "$repo_root/wp-shell.sh"
+grep -Fq 'adopt_object_cache_policy "$domain"' "$repo_root/wp-shell.sh"
 grep -Fq 'try_files \$uri =404;' "$repo_root/wp-shell.sh"
 grep -Fq 'ssl_reject_handshake on;' "$repo_root/wp-shell.sh"
 grep -Fq 'Permissions-Policy' "$repo_root/wp-shell.sh"
@@ -79,6 +79,14 @@ if grep -q 'install_site_wrapper' "$repo_root/wp-shell.sh"; then
     printf 'Per-domain command generation must not be reintroduced.\n' >&2
     exit 1
 fi
+if grep -Eq 'config set WP_CACHE|rewrite structure|plugin delete hello|enable_cloudflare_login_limits' "$repo_root/wp-shell.sh"; then
+    printf 'A compatibility-sensitive default was reintroduced.\n' >&2
+    exit 1
+fi
+grep -Fq 'site_policy_value "$domain" xmlrpc enabled' "$repo_root/wp-shell.sh"
+grep -Fq 'site_policy_value "$domain" page-cache disabled' "$repo_root/wp-shell.sh"
+grep -Fq 'site_policy_value "$domain" object-cache disabled' "$repo_root/wp-shell.sh"
+grep -Fq 'expires 7d;' "$repo_root/wp-shell.sh"
 if grep -q 'sudo -u www-data wp' "$repo_root/wp-shell.sh"; then
     printf 'Site WP-CLI calls must use the controlled site_wp_cli context.\n' >&2
     exit 1

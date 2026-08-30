@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 10.0.0
+# Version 10.0.1
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="10.0.0"
+readonly WP_SHELL_VERSION="10.0.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -1544,6 +1544,7 @@ rotate_redis_secret() {
 
     for ((i = 1; i <= SITE_COUNT; i++)); do
         domain="${SITE_DOMAINS[$i]}"
+        [[ "$(site_policy_value "$domain" object-cache disabled)" == enabled ]] || continue
         wp_path="$(site_wp_path "$domain")"
         [[ ! -f "$wp_path/wp-config.php" ]] || \
             site_wp_cli "$domain" config get DB_NAME >/dev/null 2>&1 || \
@@ -1579,12 +1580,14 @@ rotate_redis_secret() {
 
     for ((i = 1; i <= SITE_COUNT; i++)); do
         domain="${SITE_DOMAINS[$i]}"
+        [[ "$(site_policy_value "$domain" object-cache disabled)" == enabled ]] || continue
         wp_path="$(site_wp_path "$domain")"
         [[ -f "$wp_path/wp-config.php" ]] || continue
         [[ "$(site_policy_value "$domain" redis-mode)" != isolated ]] || continue
         if ! site_wp_config_set_redis_secret "$domain" "$new_secret"; then
             for ((j = 1; j <= i; j++)); do
                 domain="${SITE_DOMAINS[$j]}"
+                [[ "$(site_policy_value "$domain" object-cache disabled)" == enabled ]] || continue
                 wp_path="$(site_wp_path "$domain")"
                 [[ -f "$wp_path/wp-config.php" ]] || continue
                 [[ "$(site_policy_value "$domain" redis-mode)" != isolated ]] || continue
@@ -1710,6 +1713,7 @@ site_redis_socket() { printf '/run/wp-shell-redis-%s/redis.sock' "$(site_pool_id
 
 apply_site_redis_connection() {
     local domain="$1" index secret
+    [[ "$(site_policy_value "$domain" object-cache disabled)" == enabled ]] || return 0
     index="$(site_index_by_domain "$domain")" || return 1
     if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
         secret="$(site_policy_value "$domain" redis-secret)"
@@ -1734,6 +1738,8 @@ isolate_site_redis() (
     local index="$1" memory="${2:-64}" domain run_user redis_user pool unit config stage secret
     local old_memory remaining success=no wp_config redis_status
     domain="${SITE_DOMAINS[$index]}"
+    [[ "$(site_policy_value "$domain" object-cache disabled)" == enabled ]] || \
+        die "Enable the site's Redis object-cache integration before isolating its Redis instance."
     pool="$(site_pool_id "$domain")"
     run_user="$(site_run_user "$domain")"
     [[ "$run_user" == "$pool" ]] || die "First migrate this site to its own PHP user: wp-shell site $domain isolate"
@@ -1963,24 +1969,29 @@ print(f"source={source} trusted={'yes' if trusted else 'no'} claimed={claimed} e
 PY
 }
 
-enable_cloudflare_login_limits() {
-    local i domain policy_file
-    for ((i=1; i<=SITE_COUNT; i++)); do
-        [[ "${SITE_MODES[$i]}" == managed ]] || continue
-        domain="${SITE_DOMAINS[$i]}"
-        policy_file="$SITE_POLICY_DIR/$domain/login-limit"
-        [[ ! -e "$policy_file" && -f "/etc/nginx/sites-available/$domain" ]] || continue
-        site_login_limit "$domain" direct
-    done
-}
-
 cloudflare_command() {
     case "${1:-status}" in
         enable)
             [[ "${2:-}" == --confirm ]] || die "Impact: trust verified Cloudflare proxy ranges for client IPs and install a weekly updater. Re-run with --confirm."
             cloudflare_update
             install_cloudflare_timer
-            enable_cloudflare_login_limits
+            log_message INFO "No site cache, login-limit, DNS, TLS, or WordPress policy was changed. Configure each proxied site explicitly."
+            ;;
+        disable)
+            [[ "${2:-}" == --confirm ]] || die "Impact: stop trusting Cloudflare client-IP headers and remove its updater. No site/DNS setting changes. Re-run with --confirm."
+            CURRENT_STEP="disable Cloudflare trusted proxy ranges"
+            transaction_begin "$CURRENT_STEP"
+            transaction_mark_service nginx
+            transaction_mark_service systemd
+            remove_managed_file /etc/nginx/conf.d/wp-shell-cloudflare-realip.conf
+            remove_managed_file /etc/systemd/system/wp-shell-cloudflare-ips.timer
+            remove_managed_file /etc/systemd/system/wp-shell-cloudflare-ips.service
+            nginx -t || die "Nginx rejected Cloudflare removal; configuration will be restored."
+            systemctl disable --now wp-shell-cloudflare-ips.timer 2>/dev/null || true
+            systemctl daemon-reload
+            systemctl reload nginx
+            set_host_policy cloudflare disabled
+            log_message SUCCESS "Cloudflare trusted proxy handling disabled. Per-site cache and login policies were not changed."
             ;;
         update)
             [[ "$(host_policy_value cloudflare disabled)" == enabled ]] || die "Cloudflare mode is disabled. Use: wp-shell cloudflare enable --confirm"
@@ -1992,7 +2003,7 @@ cloudflare_command() {
             printf 'Updater: %s\n' "$(systemctl is-active wp-shell-cloudflare-ips.timer 2>/dev/null || true)"
             ;;
         check) cloudflare_check_ip "${2:-}" "${3:-}" ;;
-        *) die "Usage: wp-shell cloudflare enable --confirm | update | status | check SOURCE_IP CF_CONNECTING_IP" ;;
+        *) die "Usage: wp-shell cloudflare enable --confirm | disable --confirm | update | status | check SOURCE_IP CF_CONNECTING_IP" ;;
     esac
 }
 
@@ -2317,7 +2328,7 @@ issue_ssl_certificate() {
 configure_https_site() {
     CURRENT_STEP="configure the HTTPS site"
     local index="$1" domain primary server_names zone site_temp cache_temp wp_path pool_socket
-    local hsts_header="" xmlrpc_location
+    local hsts_header="" xmlrpc_location page_cache cache_directives="" strict_server_headers="" strict_location_headers=""
     domain="${SITE_DOMAINS[$index]}"
     primary="${SITE_PRIMARY_DOMAINS[$index]}"
     wp_path="${SITE_PATHS[$index]}"
@@ -2325,7 +2336,7 @@ configure_https_site() {
     server_names="$(site_server_names "$index")"
     zone="$(nginx_zone_name "$domain")"
     site_temp="$(mktemp "${TMPDIR:-/tmp}/nginx-site.XXXXXX")"
-    cache_temp="$(mktemp "${TMPDIR:-/tmp}/nginx-cache.XXXXXX")"
+    cache_temp=""
     if [[ ! -f "$SITE_POLICY_DIR/$domain/hsts" && -f "/etc/nginx/sites-available/$domain" ]] && \
        grep -Fq 'add_header Strict-Transport-Security "max-age=15552000" always;' "/etc/nginx/sites-available/$domain"; then
         set_site_policy "$domain" hsts enabled
@@ -2334,15 +2345,54 @@ configure_https_site() {
     if [[ "$(site_policy_value "$domain" hsts disabled)" == enabled ]]; then
         hsts_header='    add_header Strict-Transport-Security "max-age=15552000" always;'
     fi
-    if [[ "$(site_policy_value "$domain" xmlrpc disabled)" == enabled ]]; then
+    if ! site_policy_is_set "$domain" page-cache; then
+        if [[ -f "/etc/nginx/sites-available/$domain" ]] && \
+           grep -Fq 'fastcgi_cache ' "/etc/nginx/sites-available/$domain"; then
+            set_site_policy "$domain" page-cache enabled
+            log_message INFO "$domain: adopted the existing FastCGI page-cache behavior during upgrade."
+        else
+            set_site_policy "$domain" page-cache disabled
+        fi
+    fi
+    page_cache="$(site_policy_value "$domain" page-cache disabled)"
+    if ! site_policy_is_set "$domain" header-profile; then
+        if [[ -f "/etc/nginx/sites-available/$domain" ]] && \
+           grep -Fq 'add_header Permissions-Policy' "/etc/nginx/sites-available/$domain"; then
+            set_site_policy "$domain" header-profile strict
+            log_message INFO "$domain: adopted the existing strict response-header profile during upgrade."
+        else
+            set_site_policy "$domain" header-profile compatible
+        fi
+    fi
+    if [[ "$(site_policy_value "$domain" header-profile compatible)" == strict ]]; then
+        strict_server_headers=$'    add_header X-Frame-Options "SAMEORIGIN" always;\n    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(self)" always;'
+        strict_location_headers=$'        add_header X-Frame-Options "SAMEORIGIN" always;\n        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(self)" always;'
+    fi
+    if [[ "$(site_policy_value "$domain" xmlrpc enabled)" == enabled ]]; then
         xmlrpc_location='# XML-RPC is explicitly enabled for this site.'
     else
         xmlrpc_location=$'    location = /xmlrpc.php {\n        deny all;\n    }'
     fi
     install -d -m 0755 "/etc/nginx/wp-shell-custom/$domain"
-    cat > "$cache_temp" <<EOF
+    if [[ "$page_cache" == enabled ]]; then
+        cache_temp="$(mktemp "${TMPDIR:-/tmp}/nginx-cache.XXXXXX")"
+        cat > "$cache_temp" <<EOF
 fastcgi_cache_path $(site_cache_dir "$domain") levels=1:2 keys_zone=${zone}:16m inactive=60m max_size=512m use_temp_path=off;
 EOF
+        cache_directives="$(cat <<EOF
+        fastcgi_cache $zone;
+        fastcgi_cache_key \"\$scheme\$request_method\$host\$request_uri\";
+        fastcgi_cache_methods GET HEAD;
+        fastcgi_cache_valid 200 301 302 30m;
+        fastcgi_cache_use_stale error timeout updating http_500 http_503;
+        fastcgi_cache_background_update on;
+        fastcgi_cache_lock on;
+        fastcgi_cache_bypass \$skip_cache;
+        fastcgi_no_cache \$skip_cache;
+        add_header X-FastCGI-Cache \$upstream_cache_status;
+EOF
+)"
+    fi
     cat > "$site_temp" <<EOF
 server {
     listen 80;
@@ -2375,10 +2425,9 @@ server {
     ssl_session_tickets off;
 
 $hsts_header
-    add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(self)" always;
+$strict_server_headers
 
     if (\$host != $primary) { return 301 https://$primary\$request_uri; }
 
@@ -2455,30 +2504,19 @@ $xmlrpc_location
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         fastcgi_pass unix:$pool_socket;
         fastcgi_hide_header Strict-Transport-Security;
-        fastcgi_cache $zone;
-        fastcgi_cache_key "\$scheme\$request_method\$host\$request_uri";
-        fastcgi_cache_methods GET HEAD;
-        fastcgi_cache_valid 200 301 302 30m;
-        fastcgi_cache_use_stale error timeout updating http_500 http_503;
-        fastcgi_cache_background_update on;
-        fastcgi_cache_lock on;
-        fastcgi_cache_bypass \$skip_cache;
-        fastcgi_no_cache \$skip_cache;
+$cache_directives
 $hsts_header
-        add_header X-Frame-Options "SAMEORIGIN" always;
         add_header X-Content-Type-Options "nosniff" always;
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(self)" always;
-        add_header X-FastCGI-Cache \$upstream_cache_status;
+$strict_location_headers
     }
 
     location ~* \.(?:css|js|jpg|jpeg|gif|png|ico|webp|avif|svg|woff2?|ttf|eot)$ {
-        expires 30d;
+        expires 7d;
 $hsts_header
-        add_header X-Frame-Options "SAMEORIGIN" always;
         add_header X-Content-Type-Options "nosniff" always;
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(self)" always;
+$strict_location_headers
         # Same-URL media may be replaced. Do not promise immutability.
         access_log off;
         try_files \$uri =404;
@@ -2488,10 +2526,8 @@ EOF
     install -d -o www-data -g www-data -m 0750 "$(site_cache_dir "$domain")"
     install_nginx_log_format
     install_nginx_files "$domain" "$site_temp" "$cache_temp"
-    rm -f "$site_temp" "$cache_temp"
-    if [[ "$(host_policy_value cloudflare disabled)" == enabled && ! -e "$SITE_POLICY_DIR/$domain/login-limit" ]]; then
-        site_login_limit "$domain" direct
-    fi
+    rm -f "$site_temp"
+    [[ -z "$cache_temp" ]] || rm -f "$cache_temp"
 }
 
 create_site_directories() {
@@ -2791,18 +2827,11 @@ repair_wordpress_core() {
 
 install_wordpress_site() {
     CURRENT_STEP="install WordPress"
-    local index="$1" domain primary wp_path admin_password credentials_file redis_password memory_limit initial_mode download_url db_prefix
-    local wordpress_installed_now="no"
+    local index="$1" domain primary wp_path admin_password credentials_file redis_password="" memory_limit download_url db_prefix
+    local object_cache
     domain="${SITE_DOMAINS[$index]}"
     primary="${SITE_PRIMARY_DOMAINS[$index]}"
     wp_path="${SITE_PATHS[$index]}"
-    initial_mode="${SITE_MODES[$index]}"
-    load_or_create_redis_secret
-    redis_password="$REDIS_PASSWORD"
-    if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
-        redis_password="$(site_policy_value "$domain" redis-secret)"
-        [[ "$redis_password" =~ ^[a-f0-9]{48}$ ]] || die "Invalid private Redis credential."
-    fi
 
     if [[ ! -f "$wp_path/wp-load.php" ]]; then
         download_url="$(wordpress_release_zip_url "$WORDPRESS_LOCALE")"
@@ -2824,19 +2853,6 @@ install_wordpress_site() {
     site_wp_cli "$domain" config set FORCE_SSL_ADMIN true --raw
     site_wp_cli "$domain" config set DISALLOW_FILE_EDIT true --raw
     site_wp_cli "$domain" config set WP_ENVIRONMENT_TYPE production
-    site_wp_cli "$domain" config set WP_CACHE true --raw
-    site_wp_cli "$domain" config set WP_REDIS_HOST 127.0.0.1
-    site_wp_cli "$domain" config set WP_REDIS_PORT 6379 --raw
-    site_wp_config_set_redis_secret "$domain" "$redis_password" || \
-        die "The Redis credential could not be written safely for $domain."
-    if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
-        site_wp_cli "$domain" config set WP_REDIS_SCHEME unix
-        site_wp_cli "$domain" config set WP_REDIS_PATH "$(site_redis_socket "$domain")"
-        site_wp_cli "$domain" config set WP_REDIS_DATABASE 0 --raw
-    else
-        site_wp_cli "$domain" config set WP_REDIS_DATABASE "${SITE_REDIS_DATABASES[$index]}" --raw
-    fi
-    site_wp_cli "$domain" config set WP_REDIS_PREFIX "${domain}:"
     memory_limit="256M"
     (( $(memory_mb) >= 4096 )) && memory_limit="512M"
     site_wp_cli "$domain" config set WP_MEMORY_LIMIT "$memory_limit"
@@ -2860,19 +2876,34 @@ install_wordpress_site() {
         chmod 0600 "$credentials_file"
         NEW_SITE_CREDENTIAL_DOMAIN="$domain"
         NEW_SITE_ADMIN_PASSWORD="$admin_password"
-        wordpress_installed_now="yes"
     fi
 
-    if [[ "$initial_mode" == "managed" ]]; then
-        site_wp_cli "$domain" rewrite structure '/%postname%/'
+    adopt_object_cache_policy "$domain"
+    object_cache="$(site_policy_value "$domain" object-cache disabled)"
+    if [[ "$object_cache" == enabled ]]; then
+        load_or_create_redis_secret
+        redis_password="$REDIS_PASSWORD"
+        if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
+            redis_password="$(site_policy_value "$domain" redis-secret)"
+            [[ "$redis_password" =~ ^[a-f0-9]{48}$ ]] || die "Invalid private Redis credential."
+        fi
+        site_wp_cli "$domain" config set WP_REDIS_HOST 127.0.0.1
+        site_wp_cli "$domain" config set WP_REDIS_PORT 6379 --raw
+        site_wp_config_set_redis_secret "$domain" "$redis_password" || \
+            die "The Redis credential could not be written safely for $domain."
+        if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
+            site_wp_cli "$domain" config set WP_REDIS_SCHEME unix
+            site_wp_cli "$domain" config set WP_REDIS_PATH "$(site_redis_socket "$domain")"
+            site_wp_cli "$domain" config set WP_REDIS_DATABASE 0 --raw
+        else
+            site_wp_cli "$domain" config set WP_REDIS_DATABASE "${SITE_REDIS_DATABASES[$index]}" --raw
+        fi
+        site_wp_cli "$domain" config set WP_REDIS_PREFIX "${domain}:"
+        site_wp_cli "$domain" plugin install redis-cache --activate
+        site_wp_cli "$domain" redis enable
     fi
-    site_wp_cli "$domain" plugin install redis-cache --activate
-    site_wp_cli "$domain" redis enable
     if [[ "${SITE_WOOCOMMERCE[$index]}" == "yes" ]]; then
         site_wp_cli "$domain" plugin install woocommerce --activate
-    fi
-    if [[ "$initial_mode" == "managed" && "$wordpress_installed_now" == "yes" ]]; then
-        site_wp_cli "$domain" plugin delete hello akismet 2>/dev/null || true
     fi
     set_site_permissions "$domain"
 }
@@ -2933,6 +2964,7 @@ collect_yes_no() {
 
 collect_site_input() {
     local next_index=$((SITE_COUNT + 1)) domain email admin title www woo primary redis_db max_sites
+    local page_cache object_cache
     max_sites="$(max_sites_for_memory "$(memory_mb)")"
     if [[ "$ENVIRONMENT_MODE" == "single" ]]; then
         max_sites=1
@@ -2966,6 +2998,8 @@ collect_site_input() {
         primary="www.$domain"
     fi
     collect_yes_no "Install WooCommerce" no && woo=yes || woo=no
+    collect_yes_no "Enable Nginx FastCGI page cache for anonymous visitors" no && page_cache=enabled || page_cache=disabled
+    collect_yes_no "Install and enable the Redis Object Cache integration" no && object_cache=enabled || object_cache=disabled
     redis_db="$(first_available_redis_database)" || die "No Redis database is available."
 
     SITE_COUNT=$next_index
@@ -2981,6 +3015,8 @@ collect_site_input() {
     SITE_PATHS[next_index]="/var/www/$domain/public"
     SITE_MODES[next_index]="managed"
     save_sites_config
+    set_site_policy "$domain" page-cache "$page_cache"
+    set_site_policy "$domain" object-cache "$object_cache"
 }
 
 prepare_stack() {
@@ -3139,11 +3175,14 @@ site_status() {
     printf '  Nginx: %s\n' "$(systemctl is-active nginx 2>/dev/null || true)"
     printf '  PHP-FPM: %s\n' "$(systemctl is-active "php${php_version}-fpm" 2>/dev/null || true)"
     printf '  MariaDB: %s\n' "$(systemctl is-active mariadb 2>/dev/null || true)"
-    if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
-        printf '  Redis: %s (private socket)\n' "$(systemctl is-active "wp-shell-redis-$(site_pool_id "$domain")" 2>/dev/null || true)"
+    if [[ "$(site_policy_value "$domain" object-cache disabled)" != enabled ]]; then
+        printf '  Object cache: disabled\n'
+    elif [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
+        printf '  Object cache: %s (private Redis socket)\n' "$(systemctl is-active "wp-shell-redis-$(site_pool_id "$domain")" 2>/dev/null || true)"
     else
-        printf '  Redis: %s (shared)\n' "$(systemctl is-active redis-server 2>/dev/null || true)"
+        printf '  Object cache: %s (shared Redis)\n' "$(systemctl is-active redis-server 2>/dev/null || true)"
     fi
+    printf '  Page cache: %s\n' "$(site_policy_value "$domain" page-cache disabled)"
 }
 
 site_tls_expiry() {
@@ -3213,11 +3252,14 @@ show_site_deployment_summary() {
     printf 'WordPress      %s (%s)\n' "$wordpress_version" "$WORDPRESS_LOCALE"
     printf 'PHP            %s\n' "${SITE_PHP_VERSIONS[$index]}"
     printf 'WooCommerce    %s\n' "$woo_state"
-    if [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
+    if [[ "$(site_policy_value "$domain" object-cache disabled)" != enabled ]]; then
+        printf 'Object cache   disabled\n'
+    elif [[ "$(site_policy_value "$domain" redis-mode)" == isolated ]]; then
         printf 'Redis cache    enabled (private Unix socket, DB 0)\n'
     else
         printf 'Redis cache    enabled (shared instance, DB %s)\n' "${SITE_REDIS_DATABASES[$index]}"
     fi
+    printf 'Page cache     %s\n' "$(site_policy_value "$domain" page-cache disabled)"
     printf 'TLS expires    %s\n' "$(site_tls_expiry "$domain")"
     printf 'Document root  %s\n' "${SITE_PATHS[$index]}"
     printf 'Credentials    %s\n' "$credentials_state"
@@ -3285,6 +3327,12 @@ site_policy_value() {
     fi
 }
 
+site_policy_is_set() {
+    local domain="$1" key="$2"
+    validate_domain "$domain" && [[ "$key" =~ ^[a-z-]+$ ]] || return 1
+    [[ -f "$SITE_POLICY_DIR/$domain/$key" && ! -L "$SITE_POLICY_DIR/$domain/$key" ]]
+}
+
 set_site_policy() {
     local domain="$1" key="$2" value="$3" target
     validate_domain "$domain" && [[ "$key" =~ ^[a-z-]+$ && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
@@ -3293,6 +3341,17 @@ set_site_policy() {
     write_managed_file "$target" 0600 root root <<EOF
 $value
 EOF
+}
+
+adopt_object_cache_policy() {
+    local domain="$1"
+    site_policy_is_set "$domain" object-cache && return 0
+    if site_wp_cli "$domain" plugin is-active redis-cache >/dev/null 2>&1; then
+        set_site_policy "$domain" object-cache enabled
+        log_message INFO "$domain: adopted the already-active Redis Object Cache integration."
+    else
+        set_site_policy "$domain" object-cache disabled
+    fi
 }
 
 host_policy_value() {
@@ -3559,7 +3618,9 @@ clear_site_cache() {
         if [[ -d "$cache_dir" ]]; then find "$cache_dir" -mindepth 1 -delete || return 1; fi
         if [[ -d "$legacy_cache_dir" ]]; then find "$legacy_cache_dir" -mindepth 1 -delete || return 1; fi
     fi
-    if [[ "$scope" == object || "$scope" == all ]] && [[ -f "$wp_path/wp-config.php" ]]; then
+    if [[ ( "$scope" == object || "$scope" == all ) && \
+          "$(site_policy_value "$domain" object-cache disabled)" == enabled && \
+          -f "$wp_path/wp-config.php" ]]; then
         site_wp_cli "$domain" cache flush || return 1
     fi
     if [[ "$scope" == opcache || "$scope" == all ]]; then
@@ -3700,6 +3761,8 @@ site_cache_auto() {
     run_user="$(site_run_user "$domain")"
     case "$action" in
         enable)
+            [[ "$(site_policy_value "$domain" page-cache disabled)" == enabled ]] || \
+                die "Enable this site's FastCGI page cache before installing automatic invalidation."
             CURRENT_STEP="configure automatic page-cache invalidation"
             [[ "$wp_path" == "/var/www/$domain/public" ]] || die "Automatic invalidation requires the managed public-directory layout."
             if [[ -e "$plugin" ]] && ! grep -Fq 'Plugin Name: wp-shell Cache Signals' "$plugin"; then die "An unrelated MU plugin already uses $plugin."; fi
@@ -3715,6 +3778,7 @@ function wp_shell_signal_page_change() {
         touch($directory . '/cache-dirty');
     }
 }
+
 foreach (array('save_post', 'deleted_post', 'trashed_post', 'untrashed_post',
                'wp_update_nav_menu', 'switch_theme', 'customize_save_after',
                'edited_term', 'delete_term', 'comment_post', 'edit_comment',
@@ -3735,6 +3799,61 @@ PHP
             ;;
         status) printf '%s: automatic page invalidation %s\n' "$domain" "$(site_policy_value "$domain" cache-auto disabled)" ;;
         *) die "Use cache-auto enable|disable|status." ;;
+    esac
+}
+
+site_page_cache_action() {
+    local domain="$1" action="${2:-status}" confirmation="${3:-}" index
+    index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
+    case "$action" in
+        enable)
+            [[ "$confirmation" == --confirm ]] || \
+                die "Impact: cache anonymous public HTML. Personalized plugin routes/cookies may need explicit exclusions. Re-run with --confirm."
+            set_site_policy "$domain" page-cache enabled
+            configure_https_site "$index"
+            clear_site_cache "$index" page
+            log_message SUCCESS "$domain FastCGI page cache enabled. Review every dynamic route used by its theme and plugins."
+            ;;
+        disable)
+            set_site_policy "$domain" page-cache disabled
+            configure_https_site "$index"
+            clear_site_cache "$index" page
+            log_message SUCCESS "$domain FastCGI page cache disabled; static browser caching remains enabled."
+            ;;
+        status) printf '%s page cache: %s\n' "$domain" "$(site_policy_value "$domain" page-cache disabled)" ;;
+        *) die "Use page-cache enable --confirm|disable|status." ;;
+    esac
+}
+
+site_object_cache_action() {
+    local domain="$1" action="${2:-status}" confirmation="${3:-}" index
+    index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
+    case "$action" in
+        enable)
+            [[ "$confirmation" == --confirm ]] || \
+                die "Impact: install/activate Redis Object Cache and create its drop-in. Re-run with --confirm."
+            backup_site "$index" >/dev/null
+            set_site_policy "$domain" object-cache enabled
+            apply_site_redis_connection "$domain"
+            site_wp_cli "$domain" plugin install redis-cache --activate
+            site_wp_cli "$domain" redis enable
+            log_message SUCCESS "$domain Redis object-cache integration enabled."
+            ;;
+        disable)
+            [[ "$confirmation" == --confirm ]] || \
+                die "Impact: disable the Redis Object Cache drop-in without deleting the plugin or Redis data. Re-run with --confirm."
+            backup_site "$index" >/dev/null
+            site_wp_cli "$domain" redis disable 2>/dev/null || true
+            set_site_policy "$domain" object-cache disabled
+            log_message SUCCESS "$domain Redis object-cache integration disabled; plugin files and configuration constants were preserved."
+            ;;
+        status)
+            printf '%s object cache: %s\n' "$domain" "$(site_policy_value "$domain" object-cache disabled)"
+            if [[ "$(site_policy_value "$domain" object-cache disabled)" == enabled ]]; then
+                site_wp_cli "$domain" redis status || true
+            fi
+            ;;
+        *) die "Use object-cache enable --confirm|disable --confirm|status." ;;
     esac
 }
 
@@ -3885,12 +4004,31 @@ site_header_policy() {
     case "$action" in
         enable) value=enabled ;;
         disable) value=disabled ;;
-        status) printf '%s %s: %s\n' "$domain" "$policy" "$(site_policy_value "$domain" "$policy" disabled)"; return 0 ;;
+        status)
+            if [[ "$policy" == xmlrpc ]]; then value="$(site_policy_value "$domain" "$policy" enabled)"
+            else value="$(site_policy_value "$domain" "$policy" disabled)"; fi
+            printf '%s %s: %s\n' "$domain" "$policy" "$value"
+            return 0
+            ;;
         *) die "Use $policy enable|disable|status." ;;
     esac
     set_site_policy "$domain" "$policy" "$value"
     configure_https_site "$(site_index_by_domain "$domain")"
     log_message SUCCESS "$domain $policy policy: $value"
+}
+
+site_header_profile() {
+    local domain="$1" action="${2:-status}" value index
+    index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
+    case "$action" in
+        strict) value=strict ;;
+        compatible) value=compatible ;;
+        status) printf '%s response headers: %s\n' "$domain" "$(site_policy_value "$domain" header-profile compatible)"; return 0 ;;
+        *) die "Use headers strict|compatible|status." ;;
+    esac
+    set_site_policy "$domain" header-profile "$value"
+    configure_https_site "$index"
+    log_message SUCCESS "$domain response-header profile: $value"
 }
 
 site_action() {
@@ -3917,11 +4055,14 @@ site_action() {
         isolate) isolate_site "$index" "$arg1" ;;
         redis-isolate) isolate_site_redis "$index" "${arg1:-64}" ;;
         cron) site_cron_action "$domain" "${arg1:-status}" ;;
+        page-cache) site_page_cache_action "$domain" "${arg1:-status}" "$arg2" ;;
+        object-cache) site_object_cache_action "$domain" "${arg1:-status}" "$arg2" ;;
         cache-auto) site_cache_auto "$domain" "${arg1:-status}" ;;
         cache-exclude) site_cache_exclude "$domain" "$arg1" ;;
         login-limit) site_login_limit "$domain" "${arg1:-status}" ;;
         staging) site_staging_action "$domain" "${arg1:-status}" "$arg2" "$arg3" "$arg4" "${7:-}" ;;
         hsts|xmlrpc) site_header_policy "$domain" "$action" "${arg1:-status}" ;;
+        headers) site_header_profile "$domain" "${arg1:-status}" ;;
         nginx-apply)
             [[ "${SITE_MODES[$index]}" == managed ]] || die "Imported Nginx sites must be reviewed before adopting a managed template."
             configure_https_site "$index"
@@ -5356,9 +5497,11 @@ control_plane_audit() {
             printf '  PHP active/max/queue: %s\n' "${php_pressure:-unknown}"
         fi
         wordpress_queue_status "$domain"
-        printf '  Policies: HSTS=%s XML-RPC=%s login-limit=%s staging=%s\n' \
-            "$(site_policy_value "$domain" hsts disabled)" "$(site_policy_value "$domain" xmlrpc disabled)" \
-            "$(site_policy_value "$domain" login-limit disabled)" "$(site_policy_value "$domain" staging-path none)"
+        printf '  Policies: page-cache=%s object-cache=%s headers=%s HSTS=%s XML-RPC=%s login-limit=%s staging=%s\n' \
+            "$(site_policy_value "$domain" page-cache disabled)" "$(site_policy_value "$domain" object-cache disabled)" \
+            "$(site_policy_value "$domain" header-profile compatible)" "$(site_policy_value "$domain" hsts disabled)" \
+            "$(site_policy_value "$domain" xmlrpc enabled)" "$(site_policy_value "$domain" login-limit disabled)" \
+            "$(site_policy_value "$domain" staging-path none)"
     done
     printf '\nRecent severe log tail (up to 2,000 lines per file; counts only)\n'
     for log_file in /var/log/nginx/error.log /var/log/mysql/error.log /var/log/redis/redis-server.log /var/www/*/logs/php-error.log; do
@@ -5390,6 +5533,7 @@ apply_wordpress_baseline() {
         domain="${SITE_DOMAINS[$i]}"
         wp_config="$(site_wp_path "$domain")/wp-config.php"
         [[ -f "$wp_config" && ! -L "$wp_config" ]] || continue
+        adopt_object_cache_policy "$domain"
         transaction_begin "$CURRENT_STEP"
         [[ "$TRANSACTION_ACTIVE" != yes ]] || transaction_backup_file "$wp_config"
         site_wp_cli "$domain" config set WP_DEBUG false --raw
@@ -5477,7 +5621,7 @@ security_scan() {
                 log_message WARNING "$domain wp-config.php must be root-owned and readable only by its PHP group."
                 failed=$((failed + 1))
             fi
-            for constant in FORCE_SSL_ADMIN DISALLOW_FILE_EDIT WP_CACHE; do
+            for constant in FORCE_SSL_ADMIN DISALLOW_FILE_EDIT; do
                 value="$(site_wp_cli "$domain" config get "$constant" 2>/dev/null || true)"
                 [[ "$value" == "1" || "$value" == "true" ]] || {
                     log_message WARNING "$domain does not have $constant enabled."
@@ -5488,7 +5632,8 @@ security_scan() {
             [[ "$value" == 0 || "$value" == false ]] || { log_message WARNING "$domain must have WP_DEBUG disabled."; failed=$((failed + 1)); }
             value="$(site_wp_cli "$domain" config get WP_ENVIRONMENT_TYPE 2>/dev/null || true)"
             [[ "$value" == production ]] || { log_message WARNING "$domain main site environment type is not production."; failed=$((failed + 1)); }
-            if ! site_wp_cli "$domain" redis status 2>/dev/null | grep -Fq 'Status: Connected'; then
+            if [[ "$(site_policy_value "$domain" object-cache disabled)" == enabled ]] && \
+               ! site_wp_cli "$domain" redis status 2>/dev/null | grep -Fq 'Status: Connected'; then
                 log_message WARNING "$domain is not connected to Redis Object Cache."
                 failed=$((failed + 1))
             fi
@@ -5859,6 +6004,7 @@ Usage:
   sudo wp-shell optimize --confirm               Compatibility alias for the audited baseline apply
   sudo wp-shell rotate-redis-secret              Rotate Redis auth and redact matching logs
   sudo wp-shell cloudflare enable --confirm      Trust verified official Cloudflare proxy ranges
+  sudo wp-shell cloudflare disable --confirm     Remove Cloudflare trust/updater without changing sites
   sudo wp-shell cloudflare check SOURCE CLAIMED  Test trusted vs forged CF-Connecting-IP handling
   sudo wp-shell security-scan                    Validate services, TLS, and permissions
   sudo wp-shell system audit                     Read-only host security/pressure review
@@ -5870,6 +6016,8 @@ Usage:
   sudo wp-shell system aide apply --confirm
   sudo wp-shell system mail external --confirm-external-mail
   sudo wp-shell site DOMAIN nginx-apply           Refresh managed Nginx; preserve custom includes
+  sudo wp-shell site DOMAIN page-cache enable --confirm|disable|status
+  sudo wp-shell site DOMAIN object-cache enable --confirm|disable --confirm|status
   sudo wp-shell site DOMAIN cache-clear [page|object|opcache|all]
   sudo wp-shell site DOMAIN cache-auto enable|disable|status
   sudo wp-shell site DOMAIN cache-exclude /staging/
@@ -5877,6 +6025,7 @@ Usage:
   sudo wp-shell site DOMAIN staging configure ABS_PATH URL_PATH PREFIX|off --confirm
   sudo wp-shell site DOMAIN hsts enable|disable|status
   sudo wp-shell site DOMAIN xmlrpc enable|disable|status
+  sudo wp-shell site DOMAIN headers strict|compatible|status
   sudo wp-shell site DOMAIN isolate [--yes]       Migrate a legacy site to its own PHP UID
   sudo wp-shell site DOMAIN redis-isolate [MB]    Opt in to a private Redis socket/instance
   sudo wp-shell site DOMAIN login-limit direct|off|status

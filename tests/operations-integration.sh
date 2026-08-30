@@ -28,6 +28,8 @@ for i in 1 2; do
     printf 'test\n' > "${SITE_PATHS[$i]}/index.html"
     set_site_permissions "$domain"
 done
+set_site_policy ops1.example.com object-cache enabled
+set_site_policy ops1.example.com page-cache enabled
 first_user="$(site_run_user ops1.example.com)"
 second_user="$(site_run_user ops2.example.com)"
 if runuser -u "$first_user" -- test -r /var/www/ops2.example.com/public/wp-config.php; then exit 1; fi

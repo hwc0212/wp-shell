@@ -23,6 +23,7 @@ SITE_WOOCOMMERCE[1]="no"
 SITE_WWW[1]="no"
 SITE_REDIS_DATABASES[1]="0"
 SITE_MODES[1]="managed"
+set_site_policy example.com object-cache enabled
 SITE_ADMIN_USERS[1]="wpadmin"
 SITE_ADMIN_EMAILS[1]="admin@example.com"
 SITE_TITLES[1]="Example"

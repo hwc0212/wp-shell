@@ -46,6 +46,12 @@ SITE_WOOCOMMERCE[2]="no"
 SITE_WWW[2]="yes"
 SITE_PATHS[2]="/var/www/single.example.com/public"
 SITE_MODES[2]="managed"
+set_site_policy example.com page-cache enabled
+set_site_policy example.com xmlrpc disabled
+set_site_policy example.com header-profile strict
+set_site_policy single.example.com page-cache disabled
+set_site_policy single.example.com xmlrpc enabled
+set_site_policy single.example.com header-profile compatible
 configure_https_site 1
 configure_https_site 2
 curl() {
@@ -60,6 +66,8 @@ curl() {
 cloudflare_update
 unset -f curl
 grep -Fq 'set_real_ip_from 173.245.48.0/20;' /etc/nginx/conf.d/wp-shell-cloudflare-realip.conf
+[[ ! -e /etc/nginx/wp-shell-custom/example.com/30-login-limit.conf ]]
+[[ ! -e /etc/nginx/wp-shell-custom/single.example.com/30-login-limit.conf ]]
 cloudflare_hash="$(sha256sum /etc/nginx/conf.d/wp-shell-cloudflare-realip.conf)"
 if (
     curl() { printf 'not-a-cidr\n'; }
@@ -80,7 +88,16 @@ grep -Fq 'add_header Permissions-Policy' /etc/nginx/sites-available/example.com
 grep -Fq 'location ^~ /wp-admin/includes/' /etc/nginx/sites-available/example.com
 grep -Fq 'location ~* ^/wp-includes/[^/]+\.php$' /etc/nginx/sites-available/example.com
 grep -Fq 'fastcgi_cache wp_example_com;' /etc/nginx/sites-available/example.com
-grep -Fq 'fastcgi_cache wp_single_example_com;' /etc/nginx/sites-available/single.example.com
+if grep -Fq 'fastcgi_cache ' /etc/nginx/sites-available/single.example.com || \
+   [[ -e /etc/nginx/conf.d/wp-cache-single.example.com.conf ]]; then
+    printf 'The compatibility-mode site unexpectedly enabled FastCGI page caching.\n' >&2
+    exit 1
+fi
+grep -Fq 'location = /xmlrpc.php' /etc/nginx/sites-available/example.com
+if grep -Eq 'location = /xmlrpc[.]php|X-Frame-Options|Permissions-Policy' /etc/nginx/sites-available/single.example.com; then
+    printf 'The compatibility-mode site received an opt-in security policy.\n' >&2
+    exit 1
+fi
 [[ "$(site_pool_socket example.com)" != "$(site_pool_socket single.example.com)" ]]
 
 # Exercise actual requests, not only nginx -t / template text matching.
@@ -152,7 +169,7 @@ request_headers /debug.log | grep -q '403'
 request_headers /wp-config.php | grep -q '403'
 request_headers /not-created.php | grep -q '404'
 headers="$(request_headers /style.css)"
-grep -qi 'max-age=2592000' <<< "$headers"
+grep -qi 'max-age=604800' <<< "$headers"
 if grep -qi immutable <<< "$headers"; then exit 1; fi
 printf '# operator customization\n' > /etc/nginx/wp-shell-custom/example.com/90-local.conf
 configure_https_site 1
@@ -184,6 +201,10 @@ sleep 0.2
 request_headers /real-ip-trusted/ -H 'CF-Connecting-IP: 203.0.113.25' >/dev/null
 tail -n 1 /var/www/example.com/logs/nginx-access.log | grep -q '"client_ip":"203.0.113.25"'
 tail -n 1 /var/www/example.com/logs/nginx-access.log | grep -q '"edge_ip":"127.0.0.1"'
+cloudflare_command disable --confirm
+[[ ! -e /etc/nginx/conf.d/wp-shell-cloudflare-realip.conf ]]
+[[ -e /etc/nginx/wp-shell-custom/example.com/30-login-limit.conf ]]
+[[ "$(host_policy_value cloudflare enabled)" == disabled ]]
 unknown_code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H 'Host: forged.example' http://127.0.0.1/ 2>/dev/null || true)"
 [[ "$unknown_code" == 000 || "$unknown_code" == 444 ]]
 printf 'Real Nginx cache, dynamic bypass, staging noindex, hardening, real-IP trust and default Host tests passed.\n'

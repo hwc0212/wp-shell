@@ -30,6 +30,7 @@ jobs:
           bash tests/reliability-regression.sh
           bash tests/control-plane.sh
           bash tests/cloudflare-policy.sh
+          bash tests/compatibility-policies.sh
 
       - name: ShellCheck
         run: >-
@@ -52,6 +53,7 @@ jobs:
           /mnt/tests/reliability-regression.sh
           /mnt/tests/control-plane.sh
           /mnt/tests/cloudflare-policy.sh
+          /mnt/tests/compatibility-policies.sh
           /mnt/tests/nginx-integration.sh
           /mnt/tests/service-config-integration.sh
           /mnt/tests/operations-integration.sh

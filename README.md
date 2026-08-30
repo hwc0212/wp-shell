@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v10.0.0
+- 当前版本：`wp-shell.sh` v10.0.1
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -77,6 +77,18 @@ sudo wp-shell status
 
 这些高影响功能均有独立命令和显式确认参数，便于先审计影响再执行。
 
+### 兼容优先的站点默认值
+
+v10.0.1 不再把性能或安全偏好当成所有 WordPress 网站的共同前提：
+
+- FastCGI 匿名整页缓存、Redis Object Cache、严格 iframe/Permissions 响应头、HSTS、登录限速、系统 WP-Cron 和 Cloudflare 信任均默认关闭。
+- XML-RPC 保持 WordPress 默认可用；确认不依赖移动端、远程发布或外部集成后才禁用。
+- 不自动修改固定链接，不设置通用 `WP_CACHE`，不删除 WordPress 随附插件。
+- WooCommerce 只有在添加网站时明确选择才安装；其他主题和插件不由脚本安装或配置。
+- 旧受管站点已有 FastCGI 缓存、严格响应头或已激活 Redis Object Cache 时，应用升级会登记并保留原状态，不借版本升级突然改变线上行为。
+
+安全文件权限、TLS、未知 Host、防止 PHP 在 uploads 执行、敏感文件阻断、数据库/Redis loopback 和配置语法验证仍属于通用基线，因为这些不依赖具体主题或插件的业务行为。
+
 ### Cloudflare 代理与真实访客 IP
 
 Cloudflare 模式默认关闭。确认域名使用橙云代理后执行：
@@ -84,6 +96,12 @@ Cloudflare 模式默认关闭。确认域名使用橙云代理后执行：
 ```bash
 sudo wp-shell cloudflare enable --confirm
 sudo wp-shell cloudflare status
+```
+
+这是主机级的“只信任 Cloudflare 官方出口网段”能力，不代表所有域名都使用 Cloudflare。直连网站不会因为该能力而自动获得缓存、登录限速或 WordPress 改动；可信头只在连接来源确实属于官方网段时生效。服务器上已经没有任何 Cloudflare 代理站时可撤销：
+
+```bash
+sudo wp-shell cloudflare disable --confirm
 ```
 
 脚本只从 Cloudflare 官方 `ips-v4`、`ips-v6` 地址读取代理网段，分别验证为严格 IPv4/IPv6 CIDR，生成候选配置并通过 `nginx -t` 后才原子替换：
@@ -155,17 +173,24 @@ sudo wp-shell site example.com hsts enable
 sudo wp-shell site example.com hsts status
 ```
 
-从 v9 升级时，如果原受管 Nginx 配置已经包含 wp-shell 的 HSTS 值，首次重新渲染会把它登记为显式启用，不会静默撤销。XML-RPC 对新站默认禁用；确有 Jetpack、移动客户端或外部发布依赖时再执行：
+从 v9 升级时，如果原受管 Nginx 配置已经包含 wp-shell 的 HSTS 值，首次重新渲染会把它登记为显式启用，不会静默撤销。XML-RPC 默认保持 WordPress 原生可用状态，避免破坏移动客户端、远程发布和依赖 XML-RPC 的集成；确认站点不需要时再逐站点禁用：
 
 ```bash
-sudo wp-shell site example.com xmlrpc enable
+sudo wp-shell site example.com xmlrpc disable
 ```
 
-登录限速只限制 `wp-login.php` 的 POST：每个验证后的访客 IP 10 次/分钟，burst 20。首次确认启用 Cloudflare 后，脚本会给尚未明确选择限速策略的受管站点安装该规则；之后新建的 Cloudflare 站也会默认安装。曾执行 `login-limit off` 的站点不会被自动重新启用。Cloudflare 站应先启用并检查真实 IP：
+登录限速只限制 `wp-login.php` 的 POST：每个验证后的访客 IP 10 次/分钟，burst 20。启用 Cloudflare 只安装可信代理 IP 能力，不会自动改变任何网站的登录、缓存、DNS、TLS 或 WordPress 设置。需要限速的网站必须逐站点启用；Cloudflare 代理站应先启用并检查真实 IP：
 
 ```bash
 sudo wp-shell cloudflare status
 sudo wp-shell site example.com login-limit direct
+```
+
+`X-Content-Type-Options` 和 `Referrer-Policy` 使用兼容性较高的默认值。可能影响跨域 iframe 或第三方支付组件的 `X-Frame-Options`、`Permissions-Policy` 默认不强制；确认主题和插件兼容后可逐站点启用严格响应头：
+
+```bash
+sudo wp-shell site example.com headers strict
+sudo wp-shell site example.com headers compatible
 ```
 
 ### SSH、UFW、AIDE 和外部邮件
@@ -359,6 +384,8 @@ sudo wp-shell site add
 5. 是否把 `www` 加入证书。
 6. 根域名和 `www` 中哪一个作为主域名。
 7. 是否安装 WooCommerce。
+8. 是否启用 Nginx FastCGI 匿名整页缓存。
+9. 是否安装并启用 Redis Object Cache 集成。
 
 输入基础域名时只输入：
 
@@ -375,7 +402,7 @@ https://example.com/
 
 如果选择把 `www` 加入证书，脚本才会继续询问是否使用 `www.example.com` 作为主域名。未把 `www` 加入证书时，根域名自动成为主域名。
 
-添加网站时，脚本会创建独立 PHP-FPM pool、数据库账号、Redis DB、站点目录、证书和 Nginx 配置，并安装 WordPress、Redis Object Cache 以及可选的 WooCommerce。网站沿用环境安装时选择的 PHP 版本，不会再次询问 PHP。
+添加网站时，脚本会创建独立 PHP-FPM pool、数据库账号、Redis DB、站点目录、证书和 Nginx 配置，并安装 WordPress。WooCommerce、Nginx 匿名整页缓存和 Redis Object Cache 都只在明确选择后启用；脚本不会修改固定链接结构，也不会删除 WordPress 随附插件。网站沿用环境安装时选择的 PHP 版本，不会再次询问 PHP。
 
 ### 5. 安装完成后检查
 
@@ -389,7 +416,7 @@ systemctl status wp-shell-backup.timer
 systemctl status wp-shell-metrics.timer
 ```
 
-`security-scan` 不只检查服务是否启动，还会验证 Nginx 和 Fail2ban 配置、每站点 `wp-config.php` 权限/属主、`WP_DEBUG`、`WP_ENVIRONMENT_TYPE`、`FORCE_SSL_ADMIN`、`DISALLOW_FILE_EDIT`、`WP_CACHE`、Redis Object Cache 连接、WordPress 核心严格校验、证书文件、root-only 凭据文件权限，以及环境选择启用 UFW 时的实际状态。只有站点明确启用 HSTS 时，扫描才会分别检查本机源站和公网代理端点。扫描还会检查当前 Redis 密钥是否意外出现在本机 wp-shell 日志中，但不会输出密钥内容。
+`security-scan` 不只检查服务是否启动，还会验证 Nginx 和 Fail2ban 配置、每站点 `wp-config.php` 权限/属主、`WP_DEBUG`、`WP_ENVIRONMENT_TYPE`、`FORCE_SSL_ADMIN`、`DISALLOW_FILE_EDIT`、WordPress 核心严格校验、证书文件、root-only 凭据文件权限，以及环境选择启用 UFW 时的实际状态。只有站点明确启用 Redis Object Cache 时才检查其连接；只有明确启用 HSTS 时才分别检查本机源站和公网代理端点。扫描不会把 `WP_CACHE` 当作通用安全要求。它还会检查当前 Redis 密钥是否意外出现在本机 wp-shell 日志中，但不会输出密钥内容。
 
 新建 WordPress 网站成功后，脚本会在当前交互式 SSH 终端中一次性显示登录地址、管理员用户名和自动生成的管理员密码。密码直接写入终端设备，不经过普通标准输出，因此不会被写入 `/var/log/wp-shell/` 的部署日志。
 
@@ -645,6 +672,8 @@ sudo wp-shell site add
 | `Include www...in the certificate` | 只有 `www` DNS 已解析到当前 VPS 时才选择 yes |
 | `Use www...as the canonical domain` | 仅在证书包含 `www` 时出现；选择网站的唯一主域名 |
 | `Install WooCommerce` | 需要电商功能时选择 yes |
+| `Enable Nginx FastCGI page cache...` | 只有纯匿名公共页面及动态路由已经确认可绕过时选择 yes |
+| `Install and enable Redis Object Cache...` | 接受安装 Redis Object Cache 插件并需要对象缓存时选择 yes |
 
 站点 PHP 版本由 `/etc/wp-shell/environment.v1` 决定，添加网站时不会单独询问。如果环境模式是 `single`，已有一个网站后脚本会拒绝添加第二个；如果是 `multi`，脚本会根据整机内存策略检查允许的网站数量。
 
@@ -654,7 +683,7 @@ sudo wp-shell site add
 
 - 网站地址和 WordPress 后台地址。
 - 基础域名、`www` 别名和管理员用户名/邮箱。
-- WordPress/PHP 版本、WooCommerce 和 Redis Object Cache 状态。
+- WordPress/PHP 版本、WooCommerce、页面缓存和 Redis Object Cache 状态。
 - TLS 到期日期、文档根目录、HTTP/Nginx/PHP 健康状态。
 - root-only 管理员凭据文件位置和终端看板命令。
 
@@ -714,8 +743,8 @@ sudo wp-shell site deploy example.com
 - MariaDB、Redis 和 PHP-FPM 配置
 - 站点目录和权限
 - 证书
-- Nginx HTTPS 和 FastCGI 缓存配置
-- WordPress Redis Object Cache
+- Nginx HTTPS、安全模板以及该站点已经明确选择的 FastCGI 缓存策略
+- 仅重新应用已经明确启用或从旧配置识别并保留的 Redis Object Cache 集成
 
 在已有生产站点执行前，仍建议先创建备份。
 
@@ -1158,6 +1187,8 @@ sudo systemctl daemon-reload
 
 2GB 主机的 PHP 基线为 `memory_limit=256M`、执行/输入时间 120 秒、上传 16M、POST 20M、`expose_php=Off`、`pm.max_requests=300`。脚本不默认设置容易破坏插件调用的 `disable_functions`。上传大备份应优先使用所选备份工具的分片或远端传输能力；确需提高限制时，应作为明确的主机策略修改并重新做内存与超时验收。
 
+主题或插件明确要求不同 PHP 限制时，不要修改脚本生成的 `99-wp-shell.ini`。可为对应 PHP 版本创建排序更晚的本机兼容文件，例如 `/etc/php/8.3/fpm/conf.d/zz-wp-shell-compat.ini`，只写插件文档明确要求的项目；wp-shell 会保留该文件，并在每次重载前运行 FPM 配置测试。不同 PHP 版本分别维护，避免把一个网站的特殊要求误当成所有版本和站点的通用默认值。
+
 若剩余内存不足最低 PHP worker 额度，脚本会提示预算紧张；最低额度不是内核级内存限制。不要依赖它替代真实 PSS、可用内存和峰值观测。`opcache set` 仅核算并调整缓存，不会主动重新分配已有 worker。
 
 ## 十一、站点目录结构
@@ -1234,7 +1265,7 @@ sudo install -o root -g root -m 0755 wp-shell.sh.new /usr/local/sbin/wp-shell &&
 sudo wp-shell --version
 ```
 
-只更新脚本不需要重新运行 `install` 或 `site deploy`。这不会自动改动现有网站、PHP 用户、OPcache 手工参数或 SSH 登录方式。v10 功能的应用和验收见下方“十八、v10.0.0 升级后的操作”。
+只更新脚本不需要重新运行 `install` 或 `site deploy`。这不会自动改动现有网站、PHP 用户、OPcache 手工参数或 SSH 登录方式。v10 功能的应用和验收见下方“十八、v10.0.1 升级后的操作”。
 
 ### 2. 从 v9.4.2 或 v9.4.3 升级后的必要安全操作
 
@@ -1489,6 +1520,7 @@ bash tests/opcache-config.sh
 bash tests/reliability-regression.sh
 bash tests/control-plane.sh
 bash tests/cloudflare-policy.sh
+bash tests/compatibility-policies.sh
 ```
 
 ShellCheck：
@@ -1499,7 +1531,7 @@ shellcheck -x wp-shell.sh wp-vps-manager.sh deploy-single-wordpress.sh tests/*.s
 
 GitHub Actions 还会在 Ubuntu 24.04 容器中使用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 验证生成的配置。OPcache 测试覆盖手工参数接管、持久值重用、共享预算去重、无效参数/低内存拒绝、配置及重载失败回滚、INI 加载冲突，以及通过真实 FPM socket 读取运行时状态。
 
-v10.0.0 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签名和恢复演练测试，并新增配置事务首次执行/重复执行/dry-run/失败回滚/回滚冲突、Cloudflare CIDR、staging noindex、未知 Host、敏感路径和不存在 PHP 404 测试。`nginx-integration.sh`、`service-config-integration.sh` 和 `operations-integration.sh` 会修改系统配置，只能按 CI 的方式在可丢弃容器中以 root 运行，不能在生产 VPS 上执行。
+v10.0.1 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签名和恢复演练测试，并覆盖配置事务、失败回滚、Cloudflare CIDR、staging noindex、未知 Host、敏感路径、不存在 PHP 404，以及页面缓存、对象缓存、XML-RPC、响应头和 Cloudflare 登录策略不会在未选择时自动启用。`nginx-integration.sh`、`service-config-integration.sh` 和 `operations-integration.sh` 会修改系统配置，只能按 CI 的方式在可丢弃容器中以 root 运行，不能在生产 VPS 上执行。
 
 ## 十七、当前边界
 
@@ -1517,7 +1549,7 @@ v10.0.0 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签�
 
 异地备份已提供显式选择的 rclone crypt 上传与下载校验；其余未列入命令帮助的能力不视为已实现。脚本也不会自动关闭 SSH 密码登录、修改内核/sysctl、创建 swap、关闭或配置第三方安全插件，或把 Redis DB 编号当作安全隔离。
 
-## 十八、v10.0.0 升级后的操作
+## 十八、v10.0.1 升级后的操作
 
 ### 1. 先验证脚本和现有站点，不要重新部署全部环境
 
@@ -1553,11 +1585,18 @@ sudo wp-shell security-scan
 
 - Authorization、非 GET/HEAD、查询参数、登录 Cookie、REST、嵌套后台/登录路径等页面缓存绕过规则；继续尊重上游 `Cache-Control` 和 `Set-Cookie`。
 - 对 CSS、JS、JSON、SVG 等文本资源启用 Gzip；HTTP/2 继续保留。
-- 静态资源默认 30 天，不再给可能同 URL 替换的文件统一加 `immutable`。已进入浏览器的旧缓存不能靠服务器清理立即撤回。
+- 静态资源采用较保守的 7 天浏览器缓存，不添加 `immutable`，降低主题、插件或媒体使用同 URL 替换文件时长期显示旧内容的风险。已进入浏览器的旧缓存不能靠服务器清理立即撤回。
 - 拒绝直接下载多种常见备份工具的默认目录内容；这是通用的路径级防护，不会安装或配置这些插件。自定义备份路径仍需单独检查。
 - 支持 Nginx 层维护标记。
 
-自定义商城路径和 staging 路径需要显式排除，例如：
+FastCGI 匿名整页缓存默认关闭。它可能缓存主题或插件没有正确声明为私有的个性化 HTML，启用前应先列出登录、会员、表单、搜索、API、购物车和账户路径。确认后执行：
+
+```bash
+sudo wp-shell site example.com page-cache enable --confirm
+sudo wp-shell site example.com page-cache status
+```
+
+升级旧版时，如果现有受管 Nginx 文件已经启用 FastCGI 缓存，首次重新渲染会登记并保留原行为，不会借升级静默关闭线上缓存；全新站点及没有缓存证据的站点保持关闭。自定义动态路径需要显式排除，例如：
 
 ```bash
 sudo wp-shell site example.com cache-exclude /staging/
@@ -1566,7 +1605,7 @@ sudo wp-shell site example.com cache-exclude /basket/
 
 这里的路径只是示例，替换成实际 URL 路径，并以 `/` 结束。排除缓存不等于自动配置 staging 的 WordPress 路由、数据库、Cookie 或 Redis 隔离，也不等于解决所有插件授权问题。
 
-匿名访问同一公开页面两次，应能看到 MISS 后 HIT；登录/鉴权/后台路径应不命中，POST 可能不输出 `X-FastCGI-Cache`，不能要求它一定显示 BYPASS：
+明确启用页面缓存后，匿名访问同一公开页面两次应能看到 MISS 后 HIT；登录/鉴权/后台路径应不命中，POST 可能不输出 `X-FastCGI-Cache`，不能要求它一定显示 BYPASS：
 
 ```bash
 curl -sS -o /dev/null -D - https://example.com/ | grep -Ei 'HTTP/|x-fastcgi-cache|cache-control'
@@ -1574,6 +1613,16 @@ curl -sS -o /dev/null -D - https://example.com/ | grep -Ei 'HTTP/|x-fastcgi-cach
 ```
 
 有 CDN 时还要区分源站和公网响应。脚本无法替你清除 CDN、浏览器或其他页面缓存插件中的内容。
+
+Redis 服务可以安装在主机上而不接管某个 WordPress 网站。对象缓存集成默认关闭，因为网站可能已经使用其他对象缓存 drop-in，或插件作者要求不同配置。需要时逐站点执行：
+
+```bash
+sudo wp-shell site example.com object-cache enable --confirm
+sudo wp-shell site example.com object-cache status
+sudo wp-shell site example.com object-cache disable --confirm
+```
+
+禁用只移除 Redis Object Cache 的活动 drop-in，不删除插件文件、Redis 数据或已有常量。升级旧版时，脚本只会把已经处于 active 状态的 `redis-cache` 集成登记为启用，不会因为服务器装有 Redis 就给其他网站自动安装插件。
 
 ### 3. 内容更新后自动清理页面缓存（可选）
 
