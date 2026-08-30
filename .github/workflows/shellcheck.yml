@@ -63,7 +63,7 @@ jobs:
           ubuntu:24.04
           bash -c
           'apt-get update >/dev/null &&
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nginx openssl php8.3-fpm curl >/dev/null &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nginx openssl php8.3-fpm curl python3 >/dev/null &&
           bash /mnt/tests/nginx-integration.sh'
 
       - name: Service configuration integration test
