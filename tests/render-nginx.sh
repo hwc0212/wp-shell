@@ -7,6 +7,9 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf -- "$test_root"' EXIT
+export WP_SHELL_CONFIG_DIR="$test_root/config"
+export WP_SHELL_STATE_DIR="$test_root/state"
+mkdir -p "$WP_SHELL_CONFIG_DIR" "$WP_SHELL_STATE_DIR"
 
 source "$repo_root/wp-shell.sh"
 SITE_COUNT=1
@@ -43,7 +46,15 @@ grep -Fq 'log|sql|ini|conf|bak|old|orig|save|swp' "$test_root/site.conf"
 grep -Fq "fastcgi_pass unix:$pool_socket;" "$test_root/site.conf"
 grep -Fq 'return 301 https://www.example.com$request_uri;' "$test_root/site.conf"
 grep -q 'access_log /var/www/example.com/logs/nginx-access.log wp_shell;' "$test_root/site.conf"
-[[ "$(grep -c 'add_header Strict-Transport-Security' "$test_root/site.conf")" -eq 3 ]]
+[[ "$(grep -c 'add_header Strict-Transport-Security' "$test_root/site.conf" || true)" -eq 0 ]]
+grep -Fq 'add_header Permissions-Policy' "$test_root/site.conf"
+grep -Fq 'try_files $uri =404;' "$test_root/site.conf"
+grep -Fq 'location = /xmlrpc.php' "$test_root/site.conf"
+grep -Fq 'uploads|cache|files' "$test_root/site.conf"
+grep -Fq 'phtml|phar|cgi|pl|py|sh' "$test_root/site.conf"
+grep -Fq 'upgrade-temp-backup' "$test_root/site.conf"
+grep -Fq 'woff2?|ttf|eot' "$test_root/site.conf"
+grep -Fq 'request-a-quote' "$test_root/site.conf"
 if grep -Eq 'php-status|php-ping|/var/cache/nginx' "$test_root/site.conf" "$test_root/cache.conf"; then
     printf 'An unsafe or legacy Nginx path was rendered.\n' >&2
     exit 1

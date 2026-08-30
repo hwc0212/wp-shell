@@ -5,6 +5,11 @@
 set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+test_root="$(mktemp -d /tmp/wp-shell-nginx-test.XXXXXX)"
+export WP_SHELL_CONFIG_DIR="$test_root/config"
+export WP_SHELL_STATE_DIR="$test_root/state"
+export WP_SHELL_TEST_ROOT_WRITES=yes
+install -d -m 0700 "$WP_SHELL_CONFIG_DIR" "$WP_SHELL_STATE_DIR"
 [[ $EUID -eq 0 ]] || { printf 'This test must run as root in an isolated container.\n' >&2; exit 1; }
 command -v nginx >/dev/null 2>&1 || { printf 'nginx is missing.\n' >&2; exit 1; }
 command -v openssl >/dev/null 2>&1 || { printf 'openssl is missing.\n' >&2; exit 1; }
@@ -43,9 +48,35 @@ SITE_PATHS[2]="/var/www/single.example.com/public"
 SITE_MODES[2]="managed"
 configure_https_site 1
 configure_https_site 2
+curl() {
+    if [[ "$*" == *"$CLOUDFLARE_IPV4_URL"* ]]; then
+        printf '173.245.48.0/20\n'
+    elif [[ "$*" == *"$CLOUDFLARE_IPV6_URL"* ]]; then
+        printf '2400:cb00::/32\n'
+    else
+        return 22
+    fi
+}
+cloudflare_update
+unset -f curl
+grep -Fq 'set_real_ip_from 173.245.48.0/20;' /etc/nginx/conf.d/wp-shell-cloudflare-realip.conf
+cloudflare_hash="$(sha256sum /etc/nginx/conf.d/wp-shell-cloudflare-realip.conf)"
+if (
+    curl() { printf 'not-a-cidr\n'; }
+    cloudflare_update
+) >/dev/null 2>&1; then
+    printf 'Invalid Cloudflare data unexpectedly replaced the trusted ranges.\n' >&2
+    exit 1
+fi
+[[ "$(sha256sum /etc/nginx/conf.d/wp-shell-cloudflare-realip.conf)" == "$cloudflare_hash" ]]
+staging_candidate="$(mktemp /tmp/wp-shell-staging-test.XXXXXX)"
+render_staging_nginx /staging/ "$(site_pool_socket example.com)" "$staging_candidate"
+install -D -o root -g root -m 0644 "$staging_candidate" /etc/nginx/wp-shell-custom/example.com/10-staging.conf
+rm -f -- "$staging_candidate"
 
 nginx -t
-grep -Fq 'fastcgi_hide_header Strict-Transport-Security;' /etc/nginx/sites-available/example.com
+grep -Fq 'try_files $uri =404;' /etc/nginx/sites-available/example.com
+grep -Fq 'add_header Permissions-Policy' /etc/nginx/sites-available/example.com
 grep -Fq 'location ^~ /wp-admin/includes/' /etc/nginx/sites-available/example.com
 grep -Fq 'location ~* ^/wp-includes/[^/]+\.php$' /etc/nginx/sites-available/example.com
 grep -Fq 'fastcgi_cache wp_example_com;' /etc/nginx/sites-available/example.com
@@ -71,15 +102,20 @@ header('Content-Type: text/html');
 echo microtime(true), str_repeat(' cache test body ', 1024);
 PHP
 chmod 0644 /var/www/example.com/public/index.php
-install -d -m 0755 /var/www/example.com/public/staging/wp-admin /var/www/example.com/public/wp-content/wpvividbackups
+install -d -m 0755 /var/www/example.com/public/staging/wp-admin \
+    /var/www/example.com/public/wp-content/wpvividbackups \
+    /var/www/example.com/public/wp-content/uploads
 cp /var/www/example.com/public/index.php /var/www/example.com/public/staging/wp-admin/index.php
 cp /var/www/example.com/public/index.php /var/www/example.com/public/wp-login.php
 printf 'private backup\n' > /var/www/example.com/public/wp-content/wpvividbackups/test.zip
+printf '<?php echo "unsafe";\n' > /var/www/example.com/public/wp-content/uploads/unsafe.phtml
+printf '<?php echo "missing protection";\n' > /var/www/example.com/public/debug.log
+printf '<?php echo "secret";\n' > /var/www/example.com/public/wp-config.php
 printf 'body { color: blue; }\n' > /var/www/example.com/public/style.css
 chmod -R a+rX /var/www/example.com/public
 php-fpm8.3 -D
 nginx
-trap 'nginx -s quit >/dev/null 2>&1 || true; if [[ -f /run/php/php8.3-fpm.pid ]]; then kill "$(< /run/php/php8.3-fpm.pid)" 2>/dev/null || true; fi' EXIT
+trap 'nginx -s quit >/dev/null 2>&1 || true; if [[ -f /run/php/php8.3-fpm.pid ]]; then kill "$(< /run/php/php8.3-fpm.pid)" 2>/dev/null || true; fi; rm -rf -- "$test_root"' EXIT
 request_headers() {
     local path="$1"
     shift
@@ -87,19 +123,34 @@ request_headers() {
 }
 request_headers / | grep -qi 'x-fastcgi-cache: MISS'
 request_headers / | grep -qi 'x-fastcgi-cache: HIT'
+request_headers / | grep -q '200'
+request_headers /product/fixture/ | grep -qi 'x-fastcgi-cache: MISS'
+request_headers /product/fixture/ | grep -qi 'x-fastcgi-cache: HIT'
+request_headers /wp-login.php | grep -q '200'
 request_headers / -H 'Authorization: Bearer fixture' | grep -qi 'x-fastcgi-cache: BYPASS'
 request_headers / -H 'Cookie: wordpress_logged_in_fixture=1' | grep -qi 'x-fastcgi-cache: BYPASS'
 headers="$(request_headers / -X POST)"
 grep -q '200' <<< "$headers"
 if grep -qi 'x-fastcgi-cache: HIT' <<< "$headers"; then exit 1; fi
 request_headers /wp-json/fixture | grep -qi 'x-fastcgi-cache: BYPASS'
-request_headers /staging/wp-admin/index.php | grep -qi 'x-fastcgi-cache: BYPASS'
+headers="$(request_headers /staging/wp-admin/index.php)"
+grep -q '200' <<< "$headers"
+grep -qi 'x-robots-tag: noindex, nofollow, noarchive' <<< "$headers"
+if grep -qi 'x-fastcgi-cache: HIT' <<< "$headers"; then exit 1; fi
+for dynamic_path in /cart/ /checkout/ /my-account/ /quote/ /feed/ /wp-sitemap.xml; do
+    request_headers "$dynamic_path" >/dev/null
+    if request_headers "$dynamic_path" | grep -qi 'x-fastcgi-cache: HIT'; then exit 1; fi
+done
 request_headers / -H 'Accept-Encoding: gzip' | grep -qi 'content-encoding: gzip'
 for uncached in /private/ /cookie/; do
     request_headers "$uncached" >/dev/null
     if request_headers "$uncached" | grep -qi 'x-fastcgi-cache: HIT'; then exit 1; fi
 done
 request_headers /wp-content/wpvividbackups/test.zip | grep -q '403'
+request_headers /wp-content/uploads/unsafe.phtml | grep -q '403'
+request_headers /debug.log | grep -q '403'
+request_headers /wp-config.php | grep -q '403'
+request_headers /not-created.php | grep -q '404'
 headers="$(request_headers /style.css)"
 grep -qi 'max-age=2592000' <<< "$headers"
 if grep -qi immutable <<< "$headers"; then exit 1; fi
@@ -113,8 +164,26 @@ site_login_limit example.com direct
 nginx -s reload
 sleep 0.2
 limited=no
-for ((attempt=0; attempt<16; attempt++)); do
+for ((attempt=0; attempt<36; attempt++)); do
     if request_headers /wp-login.php -X POST | grep -q '429'; then limited=yes; break; fi
 done
 [[ "$limited" == yes ]]
-printf 'Real Nginx cache HIT/BYPASS, privacy headers, gzip, static TTL and maintenance tests passed.\n'
+
+# A forged Cloudflare header from an untrusted peer must not change client_ip.
+request_headers /real-ip-untrusted/ -H 'CF-Connecting-IP: 203.0.113.25' >/dev/null
+tail -n 1 /var/www/example.com/logs/nginx-access.log | grep -q '"client_ip":"127.0.0.1"'
+cat > /etc/nginx/conf.d/wp-shell-cloudflare-realip.conf <<'EOF'
+# Disposable integration fixture: loopback stands in for an official Cloudflare edge.
+set_real_ip_from 127.0.0.1;
+real_ip_header CF-Connecting-IP;
+real_ip_recursive on;
+EOF
+nginx -t
+nginx -s reload
+sleep 0.2
+request_headers /real-ip-trusted/ -H 'CF-Connecting-IP: 203.0.113.25' >/dev/null
+tail -n 1 /var/www/example.com/logs/nginx-access.log | grep -q '"client_ip":"203.0.113.25"'
+tail -n 1 /var/www/example.com/logs/nginx-access.log | grep -q '"edge_ip":"127.0.0.1"'
+unknown_code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H 'Host: forged.example' http://127.0.0.1/ 2>/dev/null || true)"
+[[ "$unknown_code" == 000 || "$unknown_code" == 444 ]]
+printf 'Real Nginx cache, dynamic bypass, staging noindex, hardening, real-IP trust and default Host tests passed.\n'

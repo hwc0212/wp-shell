@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# shellcheck disable=SC1091,SC2016,SC2034,SC2317,SC2329
+# shellcheck disable=SC1091,SC2016,SC2034,SC2079,SC2317,SC2329
 set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

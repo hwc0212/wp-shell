@@ -27,7 +27,7 @@ if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.s
 fi
 
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
-grep -Fq 'readonly WP_SHELL_VERSION="9.5.0"' "$repo_root/wp-shell.sh"
+grep -Fq 'readonly WP_SHELL_VERSION="10.0.0"' "$repo_root/wp-shell.sh"
 grep -Fq 'PRAGMA wal_checkpoint(PASSIVE);" >/dev/null' "$repo_root/wp-shell.sh"
 grep -Fq 'core download "$download_url" --force --skip-content --locale="$locale"' "$repo_root/wp-shell.sh"
 grep -Fq 'verify_wordpress_core_strict "$domain"' "$repo_root/wp-shell.sh"
@@ -37,7 +37,15 @@ grep -Fq 'END {printf "%d %d\n", rx, tx}' "$repo_root/wp-shell.sh"
 grep -Fq 'php_pss_mb REAL NOT NULL DEFAULT 0' "$repo_root/wp-shell.sh"
 grep -Fq 'Load {float(system.get('"'"'load1'"'"', 0)):.2f} / {cores} cores' "$repo_root/wp-shell.sh"
 grep -Fq "\"\$initial_mode\" == \"managed\" && \"\$wordpress_installed_now\" == \"yes\"" "$repo_root/wp-shell.sh"
-grep -Fq 'fastcgi_hide_header Strict-Transport-Security;' "$repo_root/wp-shell.sh"
+grep -Fq 'try_files \$uri =404;' "$repo_root/wp-shell.sh"
+grep -Fq 'ssl_reject_handshake on;' "$repo_root/wp-shell.sh"
+grep -Fq 'Permissions-Policy' "$repo_root/wp-shell.sh"
+grep -Fq 'real_ip_header CF-Connecting-IP;' "$repo_root/wp-shell.sh"
+grep -Fq 'real_ip_recursive on;' "$repo_root/wp-shell.sh"
+grep -Fq 'WP_ENVIRONMENT_TYPE staging' "$repo_root/wp-shell.sh"
+grep -Fq '*/5 * * * *' "$repo_root/wp-shell.sh"
+grep -Fq 'timeout 30m nice -n 19 ionice -c3 aide --check' "$repo_root/wp-shell.sh"
+grep -Fq 'rollback [ID] --confirm' "$repo_root/wp-shell.sh"
 grep -Fq 'site_wp_config_set_redis_secret "$domain" "$redis_password"' "$repo_root/wp-shell.sh"
 grep -Fq 'rotate-redis-secret) rotate_redis_secret ;;' "$repo_root/wp-shell.sh"
 grep -Fq 'REDISCLI_AUTH="$(<"$REDIS_SECRET_FILE")" timeout 4s redis-cli --no-auth-warning' "$repo_root/wp-shell.sh"
@@ -62,7 +70,11 @@ grep -Fq "readonly ENVIRONMENT_CONFIG_FILE=\"\$CONFIG_DIR/environment.v1\"" "$re
 grep -Fq "readonly WORDPRESS_LOCALE=\"\${WORDPRESS_LOCALE:-en_US}\"" "$repo_root/wp-shell.sh"
 grep -Fq 'readonly WORDPRESS_VERSION_API="https://api.wordpress.org/core/version-check/1.7/"' "$repo_root/wp-shell.sh"
 grep -Fq "fastcgi_pass unix:\$pool_socket;" "$repo_root/wp-shell.sh"
-grep -Fq 'It intentionally excludes client IPs, cookies, and query strings.' "$repo_root/wp-shell.sh"
+grep -Fq 'Cookies, query strings, referrers and user agents are excluded.' "$repo_root/wp-shell.sh"
+if grep -q 'image_filter' "$repo_root/wp-shell.sh"; then
+    printf 'Global Nginx image filtering must not be introduced.\n' >&2
+    exit 1
+fi
 if grep -q 'install_site_wrapper' "$repo_root/wp-shell.sh"; then
     printf 'Per-domain command generation must not be reintroduced.\n' >&2
     exit 1
@@ -76,6 +88,13 @@ if grep -E 'wp rewrite structure .*--hard' "$repo_root/wp-shell.sh"; then
     exit 1
 fi
 grep -Fq "WP_CLI_CACHE_DIR=\"\$wp_cli_home/cache\"" "$repo_root/wp-shell.sh"
+grep -Fq 'WP_CLI_CACHE_DIR=/dev/null' "$repo_root/wp-shell.sh"
+grep -Fq '/usr/local/bin/wp --no-color --skip-plugins --skip-themes' "$repo_root/wp-shell.sh"
+grep -Fq 'due="$(site_wp_cli_readonly "$domain" cron event list' "$repo_root/wp-shell.sh"
+if grep -nEi 'wflogs|wordfence|wpvivid staging' "$repo_root/wp-shell.sh"; then
+    printf 'Plugin-specific policy must not be hard-coded into the generic control plane.\n' >&2
+    exit 1
+fi
 if LC_ALL=C grep -nP '[^\x00-\x7F]' "${scripts[@]}"; then
     printf 'Non-ASCII text was found in terminal scripts.\n' >&2
     exit 1

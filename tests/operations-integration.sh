@@ -7,6 +7,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d /tmp/wp-shell-operations-test.XXXXXX)"
 export WP_SHELL_CONFIG_DIR="$test_root/config"
 export WP_SHELL_STATE_DIR="$test_root/state"
+export WP_SHELL_TEST_ROOT_WRITES=yes
 source "$repo_root/wp-shell.sh"
 trap 'printf "Operations integration failed at line %s.\n" "$LINENO" >&2; if [[ -s "$test_root/isolation-failure.log" ]]; then tail -80 "$test_root/isolation-failure.log" >&2; fi' ERR
 install -d -m 0700 "$CONFIG_DIR" "$DATABASE_CONFIG_DIR" "$STATE_DIR"
@@ -32,22 +33,20 @@ second_user="$(site_run_user ops2.example.com)"
 if runuser -u "$first_user" -- test -r /var/www/ops2.example.com/public/wp-config.php; then exit 1; fi
 if runuser -u "$second_user" -- test -w /var/www/ops1.example.com/public/index.html; then exit 1; fi
 runuser -u www-data -- test -r /var/www/ops1.example.com/public/index.html
-[[ "$(stat -c %a /var/www/ops1.example.com/public/wp-config.php)" == 600 ]]
+[[ "$(stat -c '%a %U %G' /var/www/ops1.example.com/public/wp-config.php)" == "640 root $(id -gn "$first_user")" ]]
 
-cron_trial_failure=no
 legacy_core_failure=no
 systemctl() {
     printf '%s\n' "$*" >> "$test_root/service-calls"
-    if [[ "$*" == start\ wp-shell-cron-* ]]; then
-        [[ "$cron_trial_failure" != yes ]] || return 1
-        run_site_cron ops1.example.com
-    fi
     if [[ "$*" == enable\ --now\ wp-shell-redis-* ]]; then
         local unit="${3%.service}" run_user run_group
         run_user="$(sed -n 's/^User=//p' "/etc/systemd/system/$unit.service")"
         run_group="$(sed -n 's/^Group=//p' "/etc/systemd/system/$unit.service")"
         install -d -o "$run_user" -g "$run_group" -m 0750 "/run/$unit" "/var/lib/$unit"
-        runuser -u "$run_user" -g "$run_group" -- redis-server "/etc/wp-shell-redis/${unit#wp-shell-redis-}.conf" --daemonize yes --pidfile "/run/$unit/test.pid" --logfile "/run/$unit/test.log"
+        if ! runuser -u "$run_user" -g "$run_group" -- redis-server "/etc/wp-shell-redis/${unit#wp-shell-redis-}.conf" --daemonize yes --pidfile "/run/$unit/test.pid" --logfile "/run/$unit/test.log"; then
+            [[ ! -f "/run/$unit/test.log" ]] || tail -n 40 "/run/$unit/test.log" >&2
+            return 1
+        fi
     fi
     return 0
 }
@@ -85,20 +84,36 @@ configure_redis
 configure_php
 php-fpm8.3 -D
 redis-server /etc/redis/wp-shell.conf --supervised no --daemonize yes --pidfile "$test_root/shared.pid" --logfile "$test_root/shared.log"
-trap 'if [[ -f "$test_root/shared.pid" ]]; then kill "$(<"$test_root/shared.pid")" 2>/dev/null || true; fi; if [[ -n "${db_pid:-}" ]]; then kill "$db_pid" 2>/dev/null || true; fi; if [[ -f /run/php/php8.3-fpm.pid ]]; then kill "$(< /run/php/php8.3-fpm.pid)" 2>/dev/null || true; fi; rm -rf -- "$test_root"' EXIT
+cleanup_operations_test() {
+    local pid_file attempt
+    for pid_file in "$test_root/shared.pid" /run/wp-shell-redis-*/test.pid /run/php/php8.3-fpm.pid; do
+        [[ -f "$pid_file" ]] || continue
+        kill "$(<"$pid_file")" 2>/dev/null || true
+    done
+    if [[ -n "${db_pid:-}" ]]; then
+        kill "$db_pid" 2>/dev/null || true
+        wait "$db_pid" 2>/dev/null || true
+    fi
+    for ((attempt=0; attempt<10; attempt++)); do
+        rm -rf -- "$test_root" 2>/dev/null || true
+        [[ -e "$test_root" ]] || break
+        sleep 0.1
+    done
+}
+trap cleanup_operations_test EXIT
 legacy_pool="/etc/php/8.3/fpm/pool.d/wp-shell-$(site_pool_id ops2.example.com).conf"
 legacy_pool_hash="$(sha256sum "$legacy_pool")"
 legacy_core_failure=yes
 if (isolate_site 2 --yes) > "$test_root/isolation-failure.log" 2>&1; then exit 1; fi
 [[ "$(site_run_user ops2.example.com)" == www-data ]]
 [[ "$(sha256sum "$legacy_pool")" == "$legacy_pool_hash" ]]
-[[ "$(stat -c '%a %U' /var/www/ops2.example.com/public/wp-config.php)" == '640 www-data' ]]
+[[ "$(stat -c '%a %U %G' /var/www/ops2.example.com/public/wp-config.php)" == '640 root www-data' ]]
 [[ "$(stat -c %U /var/www/ops2.example.com/.wp-shell)" == www-data ]]
 [[ ! -e /var/www/ops2.example.com/.wp-shell-maintenance ]]
 legacy_core_failure=no
 isolate_site 2 --yes
 [[ "$(site_run_user ops2.example.com)" == "$second_user" ]]
-[[ "$(stat -c '%a %U' /var/www/ops2.example.com/public/wp-config.php)" == "600 $second_user" ]]
+[[ "$(stat -c '%a %U %G' /var/www/ops2.example.com/public/wp-config.php)" == "640 root $(id -gn "$second_user")" ]]
 [[ ! -e /var/www/ops2.example.com/.wp-shell-maintenance ]]
 if runuser -u "$first_user" -- test -r /var/www/ops2.example.com/public/wp-config.php; then exit 1; fi
 isolate_site_redis 1 64
@@ -112,15 +127,14 @@ if runuser -u "$second_user" -- redis-cli -s "$(site_redis_socket ops1.example.c
 if (isolate_site_redis 2 128) >/dev/null 2>&1; then exit 1; fi
 [[ "$(site_policy_value ops2.example.com redis-mode shared)" == shared ]]
 
-cron_trial_failure=yes
-if (site_cron_action ops1.example.com enable) >/dev/null 2>&1; then exit 1; fi
-if grep -q DISABLE_WP_CRON /var/www/ops1.example.com/public/wp-config.php; then exit 1; fi
-cron_trial_failure=no
 site_cron_action ops1.example.com enable
 grep -q "DISABLE_WP_CRON', 'true'" /var/www/ops1.example.com/public/wp-config.php
-[[ -s "$STATE_DIR/cron-$(site_pool_id ops1.example.com).success" ]]
+grep -Fq '*/5 * * * *' "/etc/cron.d/wp-shell-$(site_pool_id ops1.example.com)"
+grep -Fq "$first_user" "/etc/cron.d/wp-shell-$(site_pool_id ops1.example.com)"
+[[ ! -e "$test_root/cron-calls" ]]
 site_cron_action ops1.example.com disable
 grep -q "DISABLE_WP_CRON', 'false'" /var/www/ops1.example.com/public/wp-config.php
+[[ ! -e "/etc/cron.d/wp-shell-$(site_pool_id ops1.example.com)" ]]
 
 site_cache_auto ops1.example.com enable
 php -l /var/www/ops1.example.com/public/wp-content/mu-plugins/wp-shell-cache.php >/dev/null

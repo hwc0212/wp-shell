@@ -28,6 +28,8 @@ jobs:
           bash tests/menu-routing.sh
           bash tests/opcache-config.sh
           bash tests/reliability-regression.sh
+          bash tests/control-plane.sh
+          bash tests/cloudflare-policy.sh
 
       - name: ShellCheck
         run: >-
@@ -48,6 +50,8 @@ jobs:
           /mnt/tests/menu-routing.sh
           /mnt/tests/opcache-config.sh
           /mnt/tests/reliability-regression.sh
+          /mnt/tests/control-plane.sh
+          /mnt/tests/cloudflare-policy.sh
           /mnt/tests/nginx-integration.sh
           /mnt/tests/service-config-integration.sh
           /mnt/tests/operations-integration.sh

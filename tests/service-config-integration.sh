@@ -12,6 +12,7 @@ done
 
 export WP_SHELL_CONFIG_DIR=/tmp/wp-shell-test
 export WP_SHELL_STATE_DIR=/tmp/wp-shell-state-test
+export WP_SHELL_TEST_ROOT_WRITES=yes
 source "$repo_root/wp-shell.sh"
 install -d -m 0700 "$CONFIG_DIR" "$DATABASE_CONFIG_DIR"
 SITE_COUNT=1

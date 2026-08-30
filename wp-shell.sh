@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 9.5.0
+# Version 10.0.0
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="9.5.0"
+readonly WP_SHELL_VERSION="10.0.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -21,6 +21,11 @@ readonly METRICS_DB="$STATE_DIR/metrics.sqlite3"
 readonly TUNING_CONFIG_FILE="$CONFIG_DIR/tuning.v1"
 readonly OPCACHE_CONFIG_FILE="$CONFIG_DIR/opcache.v1"
 readonly SITE_POLICY_DIR="$CONFIG_DIR/site-policy"
+readonly TRANSACTION_DIR="$CONFIG_DIR/transactions"
+readonly LAST_TRANSACTION_FILE="$CONFIG_DIR/last-transaction"
+readonly HOST_POLICY_FILE="$CONFIG_DIR/host-policy.v1"
+readonly CLOUDFLARE_IPV4_URL="https://www.cloudflare.com/ips-v4"
+readonly CLOUDFLARE_IPV6_URL="https://www.cloudflare.com/ips-v6"
 readonly LEGACY_VPS_CONFIG_DIR="${WP_SHELL_LEGACY_VPS_CONFIG_DIR:-/etc/wp-vps-manager}"
 readonly LEGACY_SINGLE_CONFIG_DIR="${WP_SHELL_LEGACY_SINGLE_CONFIG_DIR:-/etc/wp-single-deploy}"
 readonly LEGACY_BACKUP_ROOT="${WP_SHELL_LEGACY_BACKUP_ROOT:-/var/backups/wp-shell}"
@@ -33,7 +38,8 @@ readonly MANAGED_SCRIPT="/usr/local/sbin/wp-shell"
 readonly WP_CLI_VERSION="${WP_CLI_VERSION:-2.12.0}"
 readonly WORDPRESS_LOCALE="${WORDPRESS_LOCALE:-en_US}"
 readonly WORDPRESS_VERSION_API="https://api.wordpress.org/core/version-check/1.7/"
-readonly BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
+# Automatic deletion is opt-in. A zero value keeps every completed backup.
+readonly BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-0}"
 readonly TERMINAL_DEVICE="${WP_SHELL_TERMINAL_DEVICE:-/dev/tty}"
 
 readonly RED=$'\033[0;31m'
@@ -65,13 +71,20 @@ DEFAULT_PHP_VERSION="8.3"
 ENVIRONMENT_UFW="no"
 CURRENT_STEP="initialization"
 MARIADB_BUFFER_MB=256
-MARIADB_MAX_CONNECTIONS=50
-MARIADB_TMP_TABLE_MB=32
 REDIS_MAX_MEMORY_MB=64
 PHP_TOTAL_BUDGET_MB=256
 OPCACHE_TOTAL_BUDGET_MB=128
 NEW_SITE_CREDENTIAL_DOMAIN=""
 NEW_SITE_ADMIN_PASSWORD=""
+DRY_RUN="no"
+TRANSACTION_CONTEXT="no"
+TRANSACTION_ACTIVE="no"
+TRANSACTION_ROLLING_BACK="no"
+TRANSACTION_ID=""
+TRANSACTION_PATH=""
+TRANSACTION_MANIFEST=""
+TRANSACTION_FILE_COUNT=0
+declare -a REGISTERED_TEMP_PATHS=()
 
 supports_color() {
     [[ -t 1 && "${NO_COLOR:-}" == "" ]]
@@ -104,16 +117,40 @@ log_message() {
 
 die() {
     log_message ERROR "$*"
+    # `exit` does not trigger Bash's ERR trap.  Validation paths deliberately
+    # use die(), so restore an active configuration transaction here too.
+    if [[ "$TRANSACTION_ACTIVE" == yes && "$TRANSACTION_ROLLING_BACK" == no ]]; then
+        transaction_rollback_internal "$TRANSACTION_PATH" automatic || \
+            log_message ERROR "Automatic rollback was incomplete. Inspect: $TRANSACTION_PATH"
+    fi
     exit 1
 }
 
 on_error() {
     local exit_code=$?
     local function_name="${FUNCNAME[1]:-main}" line_number="${BASH_LINENO[0]:-unknown}"
+    if [[ "$TRANSACTION_ACTIVE" == yes && "$TRANSACTION_ROLLING_BACK" == no ]]; then
+        transaction_rollback_internal "$TRANSACTION_PATH" "automatic" || \
+            log_message ERROR "Automatic rollback was incomplete. Inspect: $TRANSACTION_PATH"
+    fi
     log_message ERROR "Step '$CURRENT_STEP' failed in $function_name at line $line_number with exit code $exit_code. Log: $LOG_FILE"
     exit "$exit_code"
 }
 trap on_error ERR
+
+cleanup_registered_temp_paths() {
+    local path
+    for path in "${REGISTERED_TEMP_PATHS[@]}"; do
+        [[ -z "$path" || ! -e "$path" || -L "$path" ]] || rm -rf -- "$path"
+    done
+}
+trap cleanup_registered_temp_paths EXIT
+
+register_temp_path() {
+    local path="$1"
+    [[ "$path" == /tmp/wp-shell.* || "$path" == "${TMPDIR:-/tmp}"/wp-shell.* ]] || die "Refusing to register an unsafe temporary path: $path"
+    REGISTERED_TEMP_PATHS+=("$path")
+}
 
 ensure_root() {
     if [[ $EUID -eq 0 ]]; then
@@ -124,9 +161,215 @@ ensure_root() {
 }
 
 init_paths() {
-    install -d -m 0700 "$CONFIG_DIR" "$DATABASE_CONFIG_DIR" "$STATE_DIR"
+    install -d -m 0700 "$CONFIG_DIR" "$DATABASE_CONFIG_DIR" "$TRANSACTION_DIR" "$STATE_DIR"
     install -d -m 0755 /var/www
     install -d -m 0750 "$LOG_DIR"
+}
+
+safe_temp_dir() {
+    local base="${TMPDIR:-/tmp}"
+    [[ "$base" == /* && -d "$base" && ! -L "$base" ]] || die "Unsafe temporary directory base: $base"
+    mktemp -d "$base/wp-shell.XXXXXXXX"
+}
+
+safe_managed_target() {
+    local target="$1"
+    [[ "$target" == /* && "$target" != *$'\n'* && "$target" != *'/../'* && "$target" != */.. ]] || return 1
+    case "$target" in
+        "$CONFIG_DIR"/*|"$STATE_DIR"/*|/tmp/*) return 0 ;;
+    esac
+    if [[ "$CONFIG_DIR" != /etc/wp-shell && ! ( "${WP_SHELL_TEST_ROOT_WRITES:-no}" == yes && $EUID -eq 0 && "$CONFIG_DIR" == /tmp/* ) ]]; then
+        return 1
+    fi
+    case "$target" in
+        /etc/*|/usr/local/bin/wp|/usr/local/sbin/wp-*|/usr/local/bin/wp-*|/usr/local/bin/manage-*|/var/lib/wp-shell/*|/var/www/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+transaction_begin() {
+    local label="${1:-configuration change}" slug timestamp
+    [[ "$TRANSACTION_CONTEXT" == yes && "$DRY_RUN" == no ]] || return 0
+    [[ "$TRANSACTION_ACTIVE" == no ]] || return 0
+    if [[ $EUID -eq 0 ]]; then
+        install -d -o root -g root -m 0700 "$TRANSACTION_DIR"
+    else
+        install -d -m 0700 "$TRANSACTION_DIR"
+    fi
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    slug="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//' | cut -c1-40)"
+    [[ -n "$slug" ]] || slug=operation
+    TRANSACTION_PATH="$(mktemp -d "$TRANSACTION_DIR/${timestamp}-${slug}.XXXXXX")"
+    chmod 0700 "$TRANSACTION_PATH"
+    TRANSACTION_ID="${TRANSACTION_PATH##*/}"
+    TRANSACTION_MANIFEST="$TRANSACTION_PATH/manifest.v1"
+    {
+        printf 'version|1\n'
+        printf 'id|%s\n' "$TRANSACTION_ID"
+        printf 'label|%s\n' "$(b64_encode "$label")"
+        printf 'started|%s\n' "$(date --iso-8601=seconds)"
+        printf 'state|pending\n'
+    } > "$TRANSACTION_MANIFEST"
+    chmod 0600 "$TRANSACTION_MANIFEST"
+    install -d -m 0700 "$TRANSACTION_PATH/files"
+    TRANSACTION_ACTIVE=yes
+}
+
+transaction_backup_file() {
+    local target="$1" encoded backup_name exists=no
+    [[ "$TRANSACTION_ACTIVE" == yes ]] || return 0
+    safe_managed_target "$target" || die "Refusing to transact an unsafe path: $target"
+    encoded="$(b64_encode "$target")"
+    grep -Fq "|$encoded|" "$TRANSACTION_MANIFEST" && return 0
+    TRANSACTION_FILE_COUNT=$((TRANSACTION_FILE_COUNT + 1))
+    backup_name="files/$TRANSACTION_FILE_COUNT"
+    if [[ -e "$target" || -L "$target" ]]; then
+        cp -a -- "$target" "$TRANSACTION_PATH/$backup_name"
+        exists=yes
+    fi
+    printf 'file|%s|%s|%s\n' "$encoded" "$exists" "$backup_name" >> "$TRANSACTION_MANIFEST"
+}
+
+transaction_mark_service() {
+    local service="$1"
+    [[ "$TRANSACTION_ACTIVE" == yes ]] || return 0
+    [[ "$service" =~ ^(nginx|sshd|mariadb|redis|fail2ban|postfix|php:[0-9]+\.[0-9]+|systemd)$ ]] || die "Invalid transaction service marker: $service"
+    grep -Fxq "service|$service" "$TRANSACTION_MANIFEST" || printf 'service|%s\n' "$service" >> "$TRANSACTION_MANIFEST"
+}
+
+timestamp_backup_file() {
+    local target="$1" timestamp
+    [[ -e "$target" || -L "$target" ]] || return 0
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    cp -a -- "$target" "$target.wp-shell-backup-$timestamp"
+}
+
+write_managed_file() {
+    local target="$1" mode="${2:-0644}" owner="${3:-root}" group="${4:-root}" directory temp
+    safe_managed_target "$target" || die "Refusing to write an unsafe path: $target"
+    directory="$(dirname "$target")"
+    [[ -d "$directory" && ! -L "$directory" ]] || die "Managed target directory is missing or unsafe: $directory"
+    temp="$(mktemp "$directory/.wp-shell-candidate.XXXXXXXX")"
+    cat > "$temp"
+    if [[ -f "$target" && ! -L "$target" ]] && cmp -s "$temp" "$target" && \
+       [[ "$(stat -c '%a:%U:%G' "$target")" == "${mode#0}:$owner:$group" ]]; then
+        rm -f -- "$temp"
+        return 0
+    fi
+    if [[ "$DRY_RUN" == yes ]]; then
+        printf 'PLAN write %s mode=%s owner=%s:%s\n' "$target" "$mode" "$owner" "$group"
+        rm -f -- "$temp"
+        return 0
+    fi
+    transaction_begin "$CURRENT_STEP"
+    if [[ "$TRANSACTION_ACTIVE" == yes ]]; then transaction_backup_file "$target"; else timestamp_backup_file "$target"; fi
+    chmod "$mode" "$temp"
+    if [[ $EUID -eq 0 ]]; then chown "$owner:$group" "$temp"; fi
+    mv -T -- "$temp" "$target"
+}
+
+remove_managed_file() {
+    local target="$1"
+    safe_managed_target "$target" || die "Refusing to remove an unsafe path: $target"
+    [[ -e "$target" || -L "$target" ]] || return 0
+    if [[ "$DRY_RUN" == yes ]]; then printf 'PLAN remove %s\n' "$target"; return 0; fi
+    transaction_begin "$CURRENT_STEP"
+    if [[ "$TRANSACTION_ACTIVE" == yes ]]; then transaction_backup_file "$target"; else timestamp_backup_file "$target"; fi
+    rm -f -- "$target"
+}
+
+write_managed_symlink() {
+    local link="$1" destination="$2"
+    safe_managed_target "$link" || die "Refusing to create an unsafe managed link: $link"
+    [[ "$destination" == /* && "$destination" != *$'\n'* ]] || die "Managed link destination must be absolute."
+    if [[ -L "$link" && "$(readlink "$link")" == "$destination" ]]; then return 0; fi
+    if [[ "$DRY_RUN" == yes ]]; then printf 'PLAN link %s -> %s\n' "$link" "$destination"; return 0; fi
+    transaction_begin "$CURRENT_STEP"
+    if [[ "$TRANSACTION_ACTIVE" == yes ]]; then transaction_backup_file "$link"; else timestamp_backup_file "$link"; fi
+    ln -sfn "$destination" "$link"
+}
+
+transaction_rollback_internal() {
+    local transaction="$1" reason="${2:-manual}" manifest record encoded existed backup target temp service version
+    local -a transaction_records=()
+    manifest="$transaction/manifest.v1"
+    [[ -f "$manifest" ]] || { log_message ERROR "Transaction manifest is missing: $transaction"; return 1; }
+    TRANSACTION_ROLLING_BACK=yes
+    if [[ "$reason" == manual ]]; then
+        while IFS='|' read -r _record encoded expected; do
+            target="$(b64_decode "$encoded")"
+            if [[ "$(managed_file_fingerprint "$target")" != "$expected" ]]; then
+                log_message ERROR "Refusing rollback because a managed file changed after commit: $target"
+                TRANSACTION_ROLLING_BACK=no
+                return 1
+            fi
+        done < <(grep '^after|' "$manifest")
+    fi
+    mapfile -t transaction_records < <(grep '^file|' "$manifest" | tac)
+    for record in "${transaction_records[@]}"; do
+        IFS='|' read -r _record encoded existed backup <<< "$record"
+        target="$(b64_decode "$encoded")"
+        safe_managed_target "$target" || { log_message ERROR "Unsafe rollback target in manifest: $target (config root: $CONFIG_DIR)"; return 1; }
+        if [[ "$existed" == yes ]]; then
+            [[ -e "$transaction/$backup" || -L "$transaction/$backup" ]] || return 1
+            temp="$(mktemp "$(dirname "$target")/.wp-shell-rollback.XXXXXXXX")"
+            rm -f -- "$temp"
+            cp -a -- "$transaction/$backup" "$temp"
+            rm -rf -- "$target"
+            mv -T -- "$temp" "$target"
+        else
+            rm -rf -- "$target"
+        fi
+    done
+    while IFS='|' read -r _record service; do
+        case "$service" in
+            nginx) nginx -t && systemctl reload nginx || return 1 ;;
+            sshd)
+                sshd -t || return 1
+                systemctl reload ssh 2>/dev/null || systemctl reload sshd || return 1
+                ;;
+            mariadb) systemctl restart mariadb || return 1 ;;
+            redis) systemctl restart redis-server || return 1 ;;
+            fail2ban) fail2ban-client -t && systemctl reload-or-restart fail2ban || return 1 ;;
+            postfix) postfix check && systemctl reload postfix || return 1 ;;
+            php:*) version="${service#php:}"; "php-fpm$version" -t && php_fpm_service_action reload "$version" || return 1 ;;
+            systemd) systemctl daemon-reload || return 1 ;;
+        esac
+    done < <(grep '^service|' "$manifest" | tac)
+    printf 'rolled-back|%s|%s\n' "$reason" "$(date --iso-8601=seconds)" >> "$manifest"
+    TRANSACTION_ACTIVE=no
+    TRANSACTION_ROLLING_BACK=no
+    log_message WARNING "Rolled back transaction ${transaction##*/} ($reason)."
+}
+
+managed_file_fingerprint() {
+    local target="$1"
+    if [[ -L "$target" ]]; then
+        printf 'symlink:%s' "$(readlink "$target")"
+    elif [[ -f "$target" ]]; then
+        printf 'file:%s:%s' "$(stat -c '%a:%U:%G' "$target")" "$(sha256sum "$target" | cut -d' ' -f1)"
+    elif [[ -e "$target" ]]; then
+        printf 'other:%s' "$(stat -c '%F:%a:%U:%G' "$target")"
+    else
+        printf absent
+    fi
+}
+
+transaction_commit() {
+    local record encoded target temp
+    [[ "$TRANSACTION_ACTIVE" == yes ]] || return 0
+    while IFS= read -r record; do
+        IFS='|' read -r _record encoded _existed _backup <<< "$record"
+        target="$(b64_decode "$encoded")"
+        printf 'after|%s|%s\n' "$encoded" "$(managed_file_fingerprint "$target")" >> "$TRANSACTION_MANIFEST"
+    done < <(grep '^file|' "$TRANSACTION_MANIFEST")
+    printf 'committed|%s\n' "$(date --iso-8601=seconds)" >> "$TRANSACTION_MANIFEST"
+    temp="$(mktemp "$CONFIG_DIR/.last-transaction.XXXXXXXX")"
+    printf '%s\n' "$TRANSACTION_ID" > "$temp"
+    chmod 0600 "$temp"
+    mv -T -- "$temp" "$LAST_TRANSACTION_FILE"
+    TRANSACTION_ACTIVE=no
+    log_message SUCCESS "Committed transaction $TRANSACTION_ID. Roll back with: wp-shell rollback $TRANSACTION_ID --confirm"
 }
 
 init_runtime() {
@@ -353,11 +596,7 @@ save_sites_config() {
                 "$(b64_encode "${SITE_PATHS[$i]}")"
         done
     } > "$temp_file"
-    if [[ $EUID -eq 0 ]]; then
-        install -o root -g root -m 0600 "$temp_file" "$SITES_CONFIG_FILE"
-    else
-        install -m 0600 "$temp_file" "$SITES_CONFIG_FILE"
-    fi
+    write_managed_file "$SITES_CONFIG_FILE" 0600 root root < "$temp_file"
     rm -f "$temp_file"
 }
 
@@ -407,11 +646,7 @@ save_tuning_config() {
 
 install_private_file() {
     local source="$1" target="$2"
-    if [[ $EUID -eq 0 ]]; then
-        install -o root -g root -m 0600 "$source" "$target"
-    else
-        install -m 0600 "$source" "$target"
-    fi
+    write_managed_file "$target" 0600 root root < "$source"
 }
 
 validate_opcache_values() {
@@ -456,7 +691,8 @@ save_opcache_config() {
             printf 'php|%s|%s|%s\n' "$version" "${OPCACHE_MEMORY_OVERRIDES[$version]}" "${OPCACHE_STRINGS_OVERRIDES[$version]}"
         done
     } > "$temp_file" || { rm -f "$temp_file"; return 1; }
-    chmod 0600 "$temp_file" && mv -fT "$temp_file" "$OPCACHE_CONFIG_FILE"
+    install_private_file "$temp_file" "$OPCACHE_CONFIG_FILE"
+    rm -f -- "$temp_file"
 }
 
 opcache_values() {
@@ -497,7 +733,8 @@ write_opcache_ini() {
     temp_file="$(mktemp "$(opcache_scan_dir "$version")/.wp-shell-opcache.XXXXXX")" || return 1
     printf '; Managed by wp-shell OPcache settings.\nopcache.memory_consumption = %s\nopcache.interned_strings_buffer = %s\n' \
         "$memory" "$strings" > "$temp_file" || { rm -f "$temp_file"; return 1; }
-    chmod 0644 "$temp_file" && mv -fT "$temp_file" "$target"
+    write_managed_file "$target" 0644 root root < "$temp_file"
+    rm -f -- "$temp_file"
 }
 
 php_fpm_service_action() {
@@ -803,6 +1040,10 @@ memory_mb() {
     awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo
 }
 
+swap_memory_mb() {
+    awk '/^SwapTotal:/ {print int($2 / 1024)}' /proc/meminfo
+}
+
 cpu_count() {
     nproc
 }
@@ -821,7 +1062,7 @@ max_sites_for_memory() {
 }
 
 calculate_resource_budget() {
-    local total_mem site_count os_reserve cache_reserve available version opcache
+    local total_mem site_count os_reserve cache_reserve available version opcache redis_override
     total_mem="$(memory_mb)"
     site_count="${SITE_COUNT:-1}"
     ((site_count < 1)) && site_count=1
@@ -839,6 +1080,15 @@ calculate_resource_budget() {
     REDIS_MAX_MEMORY_MB=$((total_mem * 5 / 100))
     ((REDIS_MAX_MEMORY_MB < 32)) && REDIS_MAX_MEMORY_MB=32
     ((REDIS_MAX_MEMORY_MB > 512)) && REDIS_MAX_MEMORY_MB=512
+    redis_override="${WP_SHELL_REDIS_MAX_MEMORY_MB:-$(host_policy_value redis-maxmemory '')}"
+    if [[ -n "$redis_override" ]]; then
+        if [[ ! "$redis_override" =~ ^[1-9][0-9]{1,3}$ ]] || ((redis_override < 32 || redis_override > 512)); then
+            die "Redis maxmemory override must be 32-512MB."
+        fi
+        REDIS_MAX_MEMORY_MB="$redis_override"
+    elif ((total_mem >= 1800 && total_mem <= 2300)); then
+        REDIS_MAX_MEMORY_MB=96
+    fi
     cache_reserve=$((site_count * 16))
     OPCACHE_TOTAL_BUDGET_MB=0
     while IFS= read -r version; do
@@ -851,19 +1101,10 @@ calculate_resource_budget() {
     if ((PHP_TOTAL_BUDGET_MB > total_mem * 35 / 100)); then
         PHP_TOTAL_BUDGET_MB=$((total_mem * 35 / 100))
     fi
-
-    if ((total_mem < 2048)); then
-        MARIADB_MAX_CONNECTIONS=30
-        MARIADB_TMP_TABLE_MB=16
-    elif ((total_mem < 4096)); then
-        MARIADB_MAX_CONNECTIONS=60
-        MARIADB_TMP_TABLE_MB=32
-    elif ((total_mem < 8192)); then
-        MARIADB_MAX_CONNECTIONS=120
-        MARIADB_TMP_TABLE_MB=48
-    else
-        MARIADB_MAX_CONNECTIONS=200
-        MARIADB_TMP_TABLE_MB=64
+    # With one ondemand pool, a 2GB host that also has at least 1GB swap can use
+    # an eight-worker starting ceiling while retaining the normal evidence tuner.
+    if ((total_mem >= 1800 && total_mem <= 2300 && site_count == 1 && $(swap_memory_mb) >= 1024 && PHP_TOTAL_BUDGET_MB < 768)); then
+        PHP_TOTAL_BUDGET_MB=768
     fi
 
     calculate_site_php_allocations
@@ -959,7 +1200,7 @@ install_wp_cli() {
         gpg --homedir "$temp_dir/gnupg" --batch --import "$temp_dir/wp.pgp"
         gpg --homedir "$temp_dir/gnupg" --batch --verify "$temp_dir/wp.asc" "$temp_dir/wp.phar" || die "WP-CLI signature verification failed; download was not executed."
         php "$temp_dir/wp.phar" --info >/dev/null
-        install -o root -g root -m 0755 "$temp_dir/wp.phar" /usr/local/bin/wp
+        write_managed_file /usr/local/bin/wp 0755 root root < "$temp_dir/wp.phar"
     )
 }
 
@@ -1067,7 +1308,7 @@ isolate_site() (
     php_fpm_service_action reload "$version" || exit 1
     site_wp_cli "$domain" core is-installed || exit 1
     success=yes
-    log_message SUCCESS "$domain now uses $new_user and wp-config.php mode 600. Redis isolation is a separate opt-in."
+    log_message SUCCESS "$domain now uses $new_user and root-owned wp-config.php mode 640 with its private group. Redis isolation is a separate opt-in."
 )
 
 configure_php() {
@@ -1082,27 +1323,29 @@ configure_php() {
         [[ -n "$version" ]] || continue
         before[$version]="$(php_config_fingerprint "$version")"
         install -d -m 0755 "/etc/php/$version/fpm/pool.d" "/etc/php/$version/fpm/conf.d"
+        transaction_begin "$CURRENT_STEP"
+        transaction_mark_service "php:$version"
         values="$(opcache_values "$version")"
         read -r opcache_memory opcache_strings <<< "$values"
         OPCACHE_MEMORY_OVERRIDES[$version]="$opcache_memory"
         OPCACHE_STRINGS_OVERRIDES[$version]="$opcache_strings"
         write_opcache_ini "$version" "$opcache_memory" "$opcache_strings"
-        cat > "/etc/php/$version/fpm/pool.d/99-wp-shell.conf" <<EOF
+        write_managed_file "/etc/php/$version/fpm/pool.d/99-wp-shell.conf" 0644 root root <<EOF
 ; Managed by wp-shell. Keep the distribution pool available with minimal idle use.
 [www]
 pm = ondemand
 pm.max_children = 2
 pm.process_idle_timeout = 20s
-pm.max_requests = 500
+pm.max_requests = 300
 EOF
-        cat > "/etc/php/$version/fpm/conf.d/99-wp-shell.ini" <<EOF
+        write_managed_file "/etc/php/$version/fpm/conf.d/99-wp-shell.ini" 0644 root root <<EOF
 ; Managed by wp-shell.
 memory_limit = $memory_limit
-max_execution_time = 300
-max_input_time = 300
-upload_max_filesize = 128M
-post_max_size = 128M
-max_file_uploads = 30
+max_execution_time = 120
+max_input_time = 120
+upload_max_filesize = 16M
+post_max_size = 20M
+max_file_uploads = 20
 display_errors = Off
 log_errors = On
 expose_php = Off
@@ -1127,7 +1370,7 @@ EOF
         run_user="$(site_run_user "$domain")"
         run_group="$(id -gn "$run_user")"
         install -d -o "$run_user" -g www-data -m 0750 "/var/www/$domain/logs"
-        cat > "$pool_file" <<EOF
+        write_managed_file "$pool_file" 0644 root root <<EOF
 ; Managed by wp-shell for $domain.
 [$pool_id]
 user = $run_user
@@ -1139,11 +1382,11 @@ listen.mode = 0660
 pm = ondemand
 pm.max_children = $max_children
 pm.process_idle_timeout = 20s
-pm.max_requests = 500
+pm.max_requests = 300
 pm.status_path = /status
 pm.status_listen = $(site_pool_status_socket "$domain")
 ping.path = /ping
-request_terminate_timeout = 300s
+request_terminate_timeout = 120s
 request_slowlog_timeout = 5s
 slowlog = /var/www/$domain/logs/php-fpm-slow.log
 catch_workers_output = yes
@@ -1181,35 +1424,41 @@ php_config_fingerprint() {
 
 configure_mariadb() {
     CURRENT_STEP="configure MariaDB"
-    calculate_resource_budget
-    local config_file backup_file temp_file
+    local config_file backup_file temp_file preserved_tuning=""
     config_file="/etc/mysql/mariadb.conf.d/60-wp-shell.cnf"
     backup_file="$config_file.previous"
     temp_file="$(mktemp /etc/mysql/mariadb.conf.d/.wp-shell.XXXXXX)"
+    if [[ -f "$config_file" && ! -L "$config_file" ]]; then
+        preserved_tuning="$(awk '
+            /^[[:space:]]*(innodb_buffer_pool_size|max_connections|tmp_table_size|max_heap_table_size)[[:space:]]*=/ {
+                if ($0 ~ /^[[:space:]]*[a-z_]+[[:space:]]*=[[:space:]]*[0-9]+[Mm]?([[:space:]]*)$/) print
+            }' "$config_file")"
+    fi
     cat > "$temp_file" <<EOF
 [mysqld]
-innodb_buffer_pool_size = ${MARIADB_BUFFER_MB}M
-max_connections = ${MARIADB_MAX_CONNECTIONS}
-tmp_table_size = ${MARIADB_TMP_TABLE_MB}M
-max_heap_table_size = ${MARIADB_TMP_TABLE_MB}M
-thread_cache_size = 32
-table_open_cache = 2048
+bind-address = 127.0.0.1
 innodb_file_per_table = 1
-innodb_flush_method = O_DIRECT
 innodb_flush_log_at_trx_commit = 1
 character-set-server = utf8mb4
 collation-server = utf8mb4_unicode_ci
 slow_query_log = 1
 slow_query_log_file = /var/log/mysql/wp-shell-slow.log
 long_query_time = 2
+$preserved_tuning
 EOF
+    mariadbd --defaults-file="$temp_file" --verbose --help >/dev/null || {
+        rm -f -- "$temp_file"
+        die "MariaDB rejected the candidate configuration; no file was changed."
+    }
     if [[ -f "$config_file" ]] && cmp -s "$temp_file" "$config_file" && systemctl is-active --quiet mariadb; then
         rm -f "$temp_file"
         log_message INFO "MariaDB configuration is unchanged; no restart needed."
         return 0
     fi
     [[ -f "$config_file" ]] && cp -a "$config_file" "$backup_file"
-    install -o root -g root -m 0644 "$temp_file" "$config_file"
+    transaction_begin "$CURRENT_STEP"
+    transaction_mark_service mariadb
+    write_managed_file "$config_file" 0644 root root < "$temp_file"
     rm -f "$temp_file"
     if ! systemctl restart mariadb; then
         if [[ -f "$backup_file" ]]; then
@@ -1225,9 +1474,12 @@ EOF
 }
 
 load_or_create_redis_secret() {
+    local temp
     if [[ ! -s "$REDIS_SECRET_FILE" ]]; then
-        generate_password > "$REDIS_SECRET_FILE"
-        chmod 0600 "$REDIS_SECRET_FILE"
+        temp="$(mktemp "$CONFIG_DIR/.redis-secret.XXXXXX")"
+        generate_password > "$temp"
+        write_managed_file "$REDIS_SECRET_FILE" 0600 root root < "$temp"
+        rm -f -- "$temp"
     fi
     REDIS_PASSWORD="$(<"$REDIS_SECRET_FILE")"
     [[ "$REDIS_PASSWORD" =~ ^[a-f0-9]{48}$ ]] || die "The Redis secret file has an invalid format."
@@ -1238,7 +1490,7 @@ install_redis_secret_value() {
     [[ "$secret" =~ ^[a-f0-9]{48}$ ]] || die "Refusing to install an invalid Redis secret."
     temp_file="$(mktemp "$CONFIG_DIR/.redis-secret.XXXXXX")"
     printf '%s\n' "$secret" > "$temp_file"
-    install -o root -g root -m 0600 "$temp_file" "$REDIS_SECRET_FILE"
+    write_managed_file "$REDIS_SECRET_FILE" 0600 root root < "$temp_file"
     rm -f "$temp_file"
     REDIS_PASSWORD="$secret"
 }
@@ -1364,14 +1616,16 @@ configure_redis() {
     CURRENT_STEP="configure Redis"
     calculate_resource_budget
     load_or_create_redis_secret
-    local config_file override_dir override_file previous_config="" previous_override="" shared_memory
+    local config_file override_dir override_file previous_config="" previous_override="" shared_memory candidate validation_dir validation_status
     shared_memory="$(shared_redis_memory_budget)" || die "Dedicated Redis allocations exceed the global Redis budget."
     config_file="/etc/redis/wp-shell.conf"
     override_dir="/etc/systemd/system/redis-server.service.d"
     override_file="$override_dir/wp-shell.conf"
     [[ -f "$config_file" ]] && previous_config="$(mktemp /tmp/redis-config.XXXXXX)" && cp -a "$config_file" "$previous_config"
     [[ -f "$override_file" ]] && previous_override="$(mktemp /tmp/redis-override.XXXXXX)" && cp -a "$override_file" "$previous_override"
-    cat > "$config_file" <<EOF
+    candidate="$(mktemp /etc/redis/.wp-shell-candidate.XXXXXX)"
+    chmod 0600 "$candidate"
+    cat > "$candidate" <<EOF
 bind 127.0.0.1 -::1
 protected-mode yes
 port 6379
@@ -1392,10 +1646,26 @@ maxmemory-policy allkeys-lru
 save ""
 appendonly no
 EOF
-    chown root:redis "$config_file"
-    chmod 0640 "$config_file"
+    validation_dir="$(safe_temp_dir)"
+    chmod 0700 "$validation_dir"
+    validation_status=0
+    timeout 2s redis-server "$candidate" \
+        --port 0 --unixsocket "$validation_dir/redis.sock" --unixsocketperm 600 \
+        --supervised no --daemonize no --pidfile "$validation_dir/redis.pid" \
+        --logfile "" --dir "$validation_dir" --dbfilename candidate.rdb \
+        >/dev/null 2>&1 || validation_status=$?
+    rm -rf -- "$validation_dir"
+    if [[ "$validation_status" -ne 124 ]]; then
+        rm -f -- "$candidate"
+        die "Redis rejected the candidate configuration; no file was changed."
+    fi
     install -d -m 0755 "$override_dir"
-    cat > "$override_file" <<EOF
+    transaction_begin "$CURRENT_STEP"
+    transaction_mark_service redis
+    transaction_mark_service systemd
+    write_managed_file "$config_file" 0640 root redis < "$candidate"
+    rm -f -- "$candidate"
+    write_managed_file "$override_file" 0644 root root <<EOF
 [Service]
 ExecStart=
 ExecStart=/usr/bin/redis-server $config_file --supervised systemd --daemonize no
@@ -1459,6 +1729,8 @@ apply_site_redis_connection() {
 }
 
 isolate_site_redis() (
+    # This operation has its own application/database rollback boundary.
+    TRANSACTION_CONTEXT=no
     local index="$1" memory="${2:-64}" domain run_user redis_user pool unit config stage secret
     local old_memory remaining success=no wp_config redis_status
     domain="${SITE_DOMAINS[$index]}"
@@ -1506,7 +1778,7 @@ isolate_site_redis() (
     [[ "$(getent passwd "$redis_user" | cut -d: -f6)" == "/var/lib/$unit" ]] || die "Redis account name collision."
     secret="$(generate_password)"
     install -d -m 0755 /etc/wp-shell-redis
-    cat > "$config" <<EOF
+    write_managed_file "$config" 0640 root "$run_user" <<EOF
 port 0
 protected-mode yes
 unixsocket $(site_redis_socket "$domain")
@@ -1522,9 +1794,7 @@ maxmemory-policy allkeys-lru
 save ""
 appendonly no
 EOF
-    chown root:"$run_user" "$config"
-    chmod 0640 "$config"
-    cat > "/etc/systemd/system/$unit.service" <<EOF
+    write_managed_file "/etc/systemd/system/$unit.service" 0644 root root <<EOF
 [Unit]
 Description=Private Redis object cache for $domain
 After=local-fs.target
@@ -1547,7 +1817,8 @@ RestrictAddressFamilies=AF_UNIX
 WantedBy=multi-user.target
 EOF
     remaining=$((remaining-memory))
-    sed -E "s/^maxmemory[[:space:]].*/maxmemory ${remaining}mb/" "$stage/shared.conf" > /etc/redis/wp-shell.conf
+    sed -E "s/^maxmemory[[:space:]].*/maxmemory ${remaining}mb/" "$stage/shared.conf" > "$stage/shared-new.conf"
+    write_managed_file /etc/redis/wp-shell.conf 0640 root redis < "$stage/shared-new.conf"
     [[ "$(REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli CONFIG SET maxmemory "$((remaining*1048576))")" == OK ]] || die "Could not reserve dedicated Redis memory."
     systemctl daemon-reload
     systemctl enable --now "$unit.service"
@@ -1559,29 +1830,184 @@ EOF
     site_wp_cli "$domain" config set WP_REDIS_PATH "$(site_redis_socket "$domain")"
     site_wp_cli "$domain" config set WP_REDIS_DATABASE 0 --raw
     site_wp_config_set_redis_secret "$domain" "$secret"
-    chmod 0600 "$wp_config"
+    chown root:"$(id -gn "$(site_run_user "$domain")")" "$wp_config"
+    chmod 0640 "$wp_config"
     redis_status="$(site_wp_cli "$domain" redis status)" || die "WordPress could not inspect its private Redis instance."
     grep -Fq 'Status: Connected' <<< "$redis_status" || die "WordPress could not connect to its private Redis instance."
     success=yes
     log_message SUCCESS "$domain: dedicated Unix-socket Redis (${memory}MB), separate Redis UID, no TCP listener. Shared Redis now has ${remaining}MB; its cache may evict old entries."
 )
 
+validate_cloudflare_ranges() {
+    local file="$1" family="$2"
+    [[ -s "$file" && "$family" =~ ^(4|6)$ ]] || return 1
+    python3 - "$file" "$family" <<'PY'
+import ipaddress
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+family = int(sys.argv[2])
+lines = [line.strip() for line in path.read_text(encoding="ascii").splitlines() if line.strip()]
+if not lines:
+    raise SystemExit(1)
+for line in lines:
+    if any(ch.isspace() for ch in line):
+        raise SystemExit(1)
+    network = ipaddress.ip_network(line, strict=True)
+    if network.version != family:
+        raise SystemExit(1)
+PY
+}
+
+render_cloudflare_realip() {
+    local ipv4="$1" ipv6="$2" output="$3" range
+    validate_cloudflare_ranges "$ipv4" 4 || return 1
+    validate_cloudflare_ranges "$ipv6" 6 || return 1
+    {
+        printf '# Managed by wp-shell from Cloudflare official IP lists.\n'
+        while IFS= read -r range; do [[ -z "$range" ]] || printf 'set_real_ip_from %s;\n' "$range"; done < "$ipv4"
+        while IFS= read -r range; do [[ -z "$range" ]] || printf 'set_real_ip_from %s;\n' "$range"; done < "$ipv6"
+        printf 'real_ip_header CF-Connecting-IP;\nreal_ip_recursive on;\n'
+    } > "$output"
+}
+
+cloudflare_update() {
+    CURRENT_STEP="update Cloudflare trusted proxy ranges"
+    local stage ipv4 ipv6 candidate validation_config
+    require_command curl
+    require_command python3
+    stage="$(safe_temp_dir)"
+    register_temp_path "$stage"
+    ipv4="$stage/ips-v4"
+    ipv6="$stage/ips-v6"
+    candidate="$stage/wp-shell-cloudflare-realip.conf"
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --max-time 30 "$CLOUDFLARE_IPV4_URL" > "$ipv4"
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --max-time 30 "$CLOUDFLARE_IPV6_URL" > "$ipv6"
+    render_cloudflare_realip "$ipv4" "$ipv6" "$candidate" || \
+        die "Cloudflare IP data is empty or invalid; the old configuration was kept."
+    validation_config="$stage/nginx-fragment.conf"
+    cat > "$validation_config" <<EOF
+pid $stage/nginx.pid;
+error_log stderr emerg;
+events {}
+http { include $candidate; }
+EOF
+    nginx -t -q -p /etc/nginx/ -c "$validation_config" || \
+        die "Nginx rejected the Cloudflare candidate before installation; the old configuration was kept."
+    install -d -m 0755 /etc/nginx/conf.d
+    transaction_begin "$CURRENT_STEP"
+    transaction_mark_service nginx
+    write_managed_file /etc/nginx/conf.d/wp-shell-cloudflare-realip.conf 0644 root root < "$candidate"
+    if [[ "$DRY_RUN" == no ]]; then
+        nginx -t || die "Nginx rejected the Cloudflare real-IP configuration; the transaction will be rolled back."
+        systemctl reload nginx
+    fi
+    set_host_policy cloudflare enabled
+    rm -rf -- "$stage"
+    log_message SUCCESS "Cloudflare real-IP ranges were verified and applied. Only listed proxy networks can replace the client IP."
+}
+
+install_cloudflare_timer() {
+    CURRENT_STEP="install Cloudflare IP update timer"
+    install_self
+    write_managed_file /etc/systemd/system/wp-shell-cloudflare-ips.service 0644 root root <<EOF
+[Unit]
+Description=Refresh verified Cloudflare proxy IP ranges
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=$MANAGED_SCRIPT cloudflare update
+TimeoutStartSec=90s
+PrivateTmp=true
+NoNewPrivileges=true
+EOF
+    write_managed_file /etc/systemd/system/wp-shell-cloudflare-ips.timer 0644 root root <<'EOF'
+[Unit]
+Description=Weekly Cloudflare proxy IP refresh
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+    if [[ "$DRY_RUN" == no ]]; then
+        systemctl daemon-reload
+        systemctl enable --now wp-shell-cloudflare-ips.timer
+    fi
+}
+
+cloudflare_check_ip() {
+    local source_ip="${1:-}" claimed_ip="${2:-}" config=/etc/nginx/conf.d/wp-shell-cloudflare-realip.conf
+    [[ -n "$source_ip" && -n "$claimed_ip" ]] || die "Usage: wp-shell cloudflare check SOURCE_IP CF_CONNECTING_IP"
+    [[ -s "$config" ]] || die "Cloudflare real-IP configuration is not installed."
+    python3 - "$config" "$source_ip" "$claimed_ip" <<'PY'
+import ipaddress
+import re
+import sys
+
+source = ipaddress.ip_address(sys.argv[2])
+claimed = ipaddress.ip_address(sys.argv[3])
+networks = []
+for line in open(sys.argv[1], encoding="ascii"):
+    match = re.fullmatch(r"set_real_ip_from\s+([^;]+);\s*", line)
+    if match:
+        networks.append(ipaddress.ip_network(match.group(1), strict=True))
+trusted = any(source in network for network in networks)
+effective = claimed if trusted else source
+print(f"source={source} trusted={'yes' if trusted else 'no'} claimed={claimed} effective={effective}")
+PY
+}
+
+enable_cloudflare_login_limits() {
+    local i domain policy_file
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        [[ "${SITE_MODES[$i]}" == managed ]] || continue
+        domain="${SITE_DOMAINS[$i]}"
+        policy_file="$SITE_POLICY_DIR/$domain/login-limit"
+        [[ ! -e "$policy_file" && -f "/etc/nginx/sites-available/$domain" ]] || continue
+        site_login_limit "$domain" direct
+    done
+}
+
+cloudflare_command() {
+    case "${1:-status}" in
+        enable)
+            [[ "${2:-}" == --confirm ]] || die "Impact: trust verified Cloudflare proxy ranges for client IPs and install a weekly updater. Re-run with --confirm."
+            cloudflare_update
+            install_cloudflare_timer
+            enable_cloudflare_login_limits
+            ;;
+        update)
+            [[ "$(host_policy_value cloudflare disabled)" == enabled ]] || die "Cloudflare mode is disabled. Use: wp-shell cloudflare enable --confirm"
+            cloudflare_update
+            ;;
+        status)
+            printf 'Cloudflare mode: %s\n' "$(host_policy_value cloudflare disabled)"
+            printf 'Real-IP config: %s\n' "$(if [[ -s /etc/nginx/conf.d/wp-shell-cloudflare-realip.conf ]]; then printf installed; else printf absent; fi)"
+            printf 'Updater: %s\n' "$(systemctl is-active wp-shell-cloudflare-ips.timer 2>/dev/null || true)"
+            ;;
+        check) cloudflare_check_ip "${2:-}" "${3:-}" ;;
+        *) die "Usage: wp-shell cloudflare enable --confirm | update | status | check SOURCE_IP CF_CONNECTING_IP" ;;
+    esac
+}
+
 configure_fail2ban() {
     CURRENT_STEP="configure Fail2ban"
     local ssh_port
     ssh_port="$(detect_ssh_port)"
     install -d -m 0755 /etc/fail2ban/jail.d
-    cat > /etc/fail2ban/jail.d/wp-shell.local <<EOF
+    transaction_begin "$CURRENT_STEP"
+    transaction_mark_service fail2ban
+    write_managed_file /etc/fail2ban/jail.d/wp-shell.local 0644 root root <<EOF
 [sshd]
 enabled = true
 port = $ssh_port
 backend = systemd
-maxretry = 5
-findtime = 10m
-bantime = 1h
-
-[nginx-http-auth]
-enabled = true
 maxretry = 5
 findtime = 10m
 bantime = 1h
@@ -1592,7 +2018,8 @@ EOF
 }
 
 configure_log_rotation() {
-    cat > /etc/logrotate.d/wp-shell-sites <<'EOF'
+    CURRENT_STEP="configure log rotation"
+    write_managed_file /etc/logrotate.d/wp-shell-sites 0644 root root <<'EOF'
 /var/www/*/logs/*.log {
     daily
     rotate 14
@@ -1604,7 +2031,7 @@ configure_log_rotation() {
     create 0640 www-data adm
 }
 EOF
-    cat > /etc/logrotate.d/wp-shell-operations <<'EOF'
+    write_managed_file /etc/logrotate.d/wp-shell-operations 0644 root root <<'EOF'
 /var/log/wp-shell/*.log {
     daily
     maxage 30
@@ -1637,22 +2064,21 @@ configure_firewall() {
     ssh_port="$(detect_ssh_port)"
     ufw default deny incoming
     ufw default allow outgoing
-    ufw allow "${ssh_port}/tcp" comment 'SSH managed by wp-shell'
-    ufw allow 80/tcp comment 'HTTP managed by wp-shell'
-    ufw allow 443/tcp comment 'HTTPS managed by wp-shell'
+    ufw_rule_present "^${ssh_port}/tcp[[:space:]]+LIMIT" || ufw limit "${ssh_port}/tcp" comment 'SSH rate limit managed by wp-shell'
+    ufw_rule_present '^80/tcp[[:space:]]+ALLOW' || ufw allow 80/tcp comment 'HTTP managed by wp-shell'
+    ufw_rule_present '^443/tcp[[:space:]]+ALLOW' || ufw allow 443/tcp comment 'HTTPS managed by wp-shell'
     ufw --force enable
-    log_message SUCCESS "UFW allows SSH on port $ssh_port plus HTTP and HTTPS; existing rules were preserved."
+    log_message SUCCESS "UFW rate-limits SSH on port $ssh_port and allows HTTP/HTTPS; existing unrelated rules were preserved."
 }
 
 install_certbot_deploy_hook() {
     install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
-    cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx <<'EOF'
+    write_managed_file /etc/letsencrypt/renewal-hooks/deploy/reload-nginx 0755 root root <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 nginx -t
 systemctl reload nginx
 EOF
-    chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx
     systemctl enable --now certbot.timer 2>/dev/null || true
 }
 
@@ -1676,11 +2102,7 @@ save_database_config() {
     path="$(database_config_path "$domain")"
     temp_file="$(mktemp "$DATABASE_CONFIG_DIR/.database.XXXXXX")"
     printf 'database|%s|%s|%s\n' "$DB_NAME" "$DB_USER" "$(b64_encode "$DB_PASSWORD")" > "$temp_file"
-    if [[ $EUID -eq 0 ]]; then
-        install -o root -g root -m 0600 "$temp_file" "$path"
-    else
-        install -m 0600 "$temp_file" "$path"
-    fi
+    install_private_file "$temp_file" "$path"
     rm -f "$temp_file"
 }
 
@@ -1714,11 +2136,88 @@ nginx_zone_name() {
 }
 
 install_nginx_log_format() {
+    transaction_begin "$CURRENT_STEP"
+    transaction_mark_service nginx
     install -d -m 0755 /etc/nginx/conf.d
-    cat > /etc/nginx/conf.d/wp-shell-log-format.conf <<'EOF'
-# Managed by wp-shell. It intentionally excludes client IPs, cookies, and query strings.
-log_format wp_shell escape=json '{"ts":"$time_iso8601","status":$status,"bytes":$body_bytes_sent,"request_time":$request_time,"upstream_time":"$upstream_response_time","cache":"$upstream_cache_status","method":"$request_method","uri":"$uri"}';
+    if [[ -f /etc/nginx/conf.d/wp-shell-login-limit.conf ]] && \
+       grep -Fq 'Managed by wp-shell' /etc/nginx/conf.d/wp-shell-login-limit.conf; then
+        remove_managed_file /etc/nginx/conf.d/wp-shell-login-limit.conf
+    fi
+    write_managed_file /etc/nginx/conf.d/wp-shell-log-format.conf 0644 root root <<'EOF'
+# Managed by wp-shell. Cookies, query strings, referrers and user agents are excluded.
+# client_ip is Nginx's verified remote address; edge_ip keeps the direct peer for proxy audits.
+log_format wp_shell escape=json '{"ts":"$time_iso8601","client_ip":"$remote_addr","edge_ip":"$realip_remote_addr","status":$status,"bytes":$body_bytes_sent,"request_time":$request_time,"upstream_time":"$upstream_response_time","cache":"$upstream_cache_status","method":"$request_method","uri":"$uri"}';
 EOF
+
+    write_managed_file /etc/nginx/conf.d/wp-shell-global.conf 0644 root root <<'EOF'
+# Managed by wp-shell. Shared security and login-throttling primitives.
+server_tokens off;
+map "$request_method:$uri" $wp_shell_login_key {
+    default "";
+    ~*^POST:/wp-login\.php$ $binary_remote_addr;
+}
+limit_req_zone $wp_shell_login_key zone=wp_shell_login:10m rate=10r/m;
+EOF
+
+    install -d -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
+    write_managed_file /etc/nginx/sites-available/00-wp-shell-default 0644 root root <<'EOF'
+# Managed by wp-shell. Never serve a managed WordPress site for an unknown Host.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+}
+server {
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+EOF
+    if [[ "$DRY_RUN" == no ]]; then
+        transaction_begin "$CURRENT_STEP"
+        [[ "$TRANSACTION_ACTIVE" != yes ]] || transaction_backup_file /etc/nginx/sites-enabled/00-wp-shell-default
+        ln -sfn /etc/nginx/sites-available/00-wp-shell-default /etc/nginx/sites-enabled/00-wp-shell-default
+    else
+        printf 'PLAN link /etc/nginx/sites-enabled/00-wp-shell-default\n'
+    fi
+}
+
+disable_distribution_nginx_default() {
+    local enabled=/etc/nginx/sites-enabled/default target
+    [[ -e "$enabled" || -L "$enabled" ]] || return 0
+    target="$(readlink -f "$enabled" 2>/dev/null || true)"
+    if [[ -L "$enabled" && "$target" == /etc/nginx/sites-available/default ]] && \
+       grep -Eq 'Default server configuration|server_name[[:space:]]+_;' "$target"; then
+        remove_managed_file "$enabled"
+        log_message INFO "Disabled the Ubuntu distribution default Nginx site; its transaction backup is retained."
+    else
+        die "An unmanaged Nginx default site is enabled. Review it manually before wp-shell can enforce unknown-Host 444 responses: $enabled"
+    fi
+}
+
+validate_nginx_site_candidates() {
+    local site_candidate="$1" cache_candidate="${2:-}" stage validation_config
+    [[ -s "$site_candidate" && -s /etc/nginx/conf.d/wp-shell-log-format.conf && -s /etc/nginx/conf.d/wp-shell-global.conf ]] || return 1
+    stage="$(safe_temp_dir)"
+    validation_config="$stage/nginx.conf"
+    {
+        printf 'pid %s/nginx.pid;\n' "$stage"
+        printf 'error_log stderr emerg;\n'
+        printf 'events {}\nhttp {\n'
+        printf 'include /etc/nginx/mime.types;\n'
+        printf 'include /etc/nginx/conf.d/wp-shell-log-format.conf;\n'
+        printf 'include /etc/nginx/conf.d/wp-shell-global.conf;\n'
+        [[ -z "$cache_candidate" ]] || printf 'include %s;\n' "$cache_candidate"
+        printf 'include %s;\n}\n' "$site_candidate"
+    } > "$validation_config"
+    if nginx -t -q -p /etc/nginx/ -c "$validation_config"; then
+        rm -rf -- "$stage"
+        return 0
+    fi
+    rm -rf -- "$stage"
+    return 1
 }
 
 install_nginx_files() {
@@ -1726,6 +2225,10 @@ install_nginx_files() {
     local site_target cache_target site_backup="" cache_backup="" snapshot
     site_target="/etc/nginx/sites-available/$domain"
     cache_target="/etc/nginx/conf.d/wp-cache-$domain.conf"
+    validate_nginx_site_candidates "$site_temp" "$cache_temp" || \
+        die "Nginx rejected the generated site candidate before installation; no live site file was changed."
+    transaction_begin "$CURRENT_STEP"
+    transaction_mark_service nginx
     [[ -f "$site_target" ]] && site_backup="$(mktemp /tmp/nginx-site.XXXXXX)" && cp -a "$site_target" "$site_backup"
     [[ -f "$cache_target" ]] && cache_backup="$(mktemp /tmp/nginx-cache.XXXXXX)" && cp -a "$cache_target" "$cache_backup"
     if [[ -f "$site_target" ]]; then
@@ -1736,13 +2239,19 @@ install_nginx_files() {
         [[ ! -d "/etc/nginx/wp-shell-custom/$domain" ]] || cp -a "/etc/nginx/wp-shell-custom/$domain" "$snapshot/custom"
         log_message INFO "Previous Nginx configuration saved in $snapshot"
     fi
-    install -o root -g root -m 0644 "$site_temp" "$site_target"
+    write_managed_file "$site_target" 0644 root root < "$site_temp"
     if [[ -n "$cache_temp" ]]; then
-        install -o root -g root -m 0644 "$cache_temp" "$cache_target"
+        write_managed_file "$cache_target" 0644 root root < "$cache_temp"
     else
-        rm -f "$cache_target"
+        remove_managed_file "$cache_target"
     fi
-    ln -sfn "$site_target" "/etc/nginx/sites-enabled/$domain"
+    if [[ "$DRY_RUN" == no ]]; then
+        [[ "$TRANSACTION_ACTIVE" != yes ]] || transaction_backup_file "/etc/nginx/sites-enabled/$domain"
+        ln -sfn "$site_target" "/etc/nginx/sites-enabled/$domain"
+    else
+        printf 'PLAN link /etc/nginx/sites-enabled/%s -> %s\n' "$domain" "$site_target"
+        return 0
+    fi
     if ! nginx -t || ! systemctl reload nginx; then
         if [[ -n "$site_backup" ]]; then cp -a "$site_backup" "$site_target"; else rm -f "$site_target" "/etc/nginx/sites-enabled/$domain"; fi
         if [[ -n "$cache_backup" ]]; then cp -a "$cache_backup" "$cache_target"; else rm -f "$cache_target"; fi
@@ -1779,6 +2288,7 @@ server {
     }
 }
 EOF
+    install_nginx_log_format
     install_nginx_files "$domain" "$site_temp"
     rm -f "$site_temp"
 }
@@ -1807,14 +2317,28 @@ issue_ssl_certificate() {
 configure_https_site() {
     CURRENT_STEP="configure the HTTPS site"
     local index="$1" domain primary server_names zone site_temp cache_temp wp_path pool_socket
+    local hsts_header="" xmlrpc_location
     domain="${SITE_DOMAINS[$index]}"
     primary="${SITE_PRIMARY_DOMAINS[$index]}"
     wp_path="${SITE_PATHS[$index]}"
     pool_socket="$(site_pool_socket "$domain")"
     server_names="$(site_server_names "$index")"
     zone="$(nginx_zone_name "$domain")"
-    site_temp="$(mktemp /tmp/nginx-site.XXXXXX)"
-    cache_temp="$(mktemp /tmp/nginx-cache.XXXXXX)"
+    site_temp="$(mktemp "${TMPDIR:-/tmp}/nginx-site.XXXXXX")"
+    cache_temp="$(mktemp "${TMPDIR:-/tmp}/nginx-cache.XXXXXX")"
+    if [[ ! -f "$SITE_POLICY_DIR/$domain/hsts" && -f "/etc/nginx/sites-available/$domain" ]] && \
+       grep -Fq 'add_header Strict-Transport-Security "max-age=15552000" always;' "/etc/nginx/sites-available/$domain"; then
+        set_site_policy "$domain" hsts enabled
+        log_message INFO "$domain: adopted the existing managed HSTS setting; it was not silently removed during upgrade."
+    fi
+    if [[ "$(site_policy_value "$domain" hsts disabled)" == enabled ]]; then
+        hsts_header='    add_header Strict-Transport-Security "max-age=15552000" always;'
+    fi
+    if [[ "$(site_policy_value "$domain" xmlrpc disabled)" == enabled ]]; then
+        xmlrpc_location='# XML-RPC is explicitly enabled for this site.'
+    else
+        xmlrpc_location=$'    location = /xmlrpc.php {\n        deny all;\n    }'
+    fi
     install -d -m 0755 "/etc/nginx/wp-shell-custom/$domain"
     cat > "$cache_temp" <<EOF
 fastcgi_cache_path $(site_cache_dir "$domain") levels=1:2 keys_zone=${zone}:16m inactive=60m max_size=512m use_temp_path=off;
@@ -1850,10 +2374,11 @@ server {
     ssl_session_timeout 1d;
     ssl_session_tickets off;
 
-    add_header Strict-Transport-Security "max-age=15552000" always;
+$hsts_header
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(self)" always;
 
     if (\$host != $primary) { return 301 https://$primary\$request_uri; }
 
@@ -1870,19 +2395,21 @@ server {
     if (\$request_method !~ ^(GET|HEAD)$) { set \$skip_cache 1; }
     if (\$http_authorization != "") { set \$skip_cache 1; }
     if (\$query_string != "") { set \$skip_cache 1; }
-    if (\$request_uri ~* "(^|/)(wp-admin|wp-login\\.php|wp-cron\\.php|wp-json|xmlrpc\\.php|cart|checkout|my-account|wc-api|feed|sitemap)(/|\\?|$)") { set \$skip_cache 1; }
-    if (\$http_cookie ~* "wordpress_logged_in|comment_author|wp-postpass|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session_") { set \$skip_cache 1; }
+    if (\$request_uri ~* "(^|/)(wp-admin|wp-login\\.php|wp-cron\\.php|wp-json|xmlrpc\\.php|cart|checkout|my-account|wc-api|feed|(?:wp-)?sitemap[^/?]*|quote|request-a-quote)(/|\\?|$)") { set \$skip_cache 1; }
+    if (\$http_cookie ~* "wordpress_logged_in|comment_author|wp-postpass|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session_|woocommerce_recently_viewed|yith_ywraq|rfq") { set \$skip_cache 1; }
     if (-f /var/www/$domain/.wp-shell-maintenance) { return 503; }
 
     # Root-owned per-site overrides survive template refreshes. Put staging
     # exclusions/custom WooCommerce paths here; never edit the generated file.
     include /etc/nginx/wp-shell-custom/$domain/*.conf;
 
+$xmlrpc_location
+
     location / {
         try_files \$uri \$uri/ /index.php?\$args;
     }
 
-    location ~* /(?:uploads|files)/.*\.php$ {
+    location ~* /(?:uploads|cache|files)/.*\.(?:php[0-9]?|phtml|phar|cgi|pl|py|sh)$ {
         deny all;
     }
 
@@ -1898,11 +2425,11 @@ server {
         deny all;
     }
 
-    location ~* /(?:wp-config(?:-sample)?\.php|wp-settings\.php|wp-load\.php|readme\.html|license\.txt)$ {
+    location ~* /(?:wp-config(?:-sample)?\.php|wp-settings\.php|wp-load\.php|debug\.log|readme\.html|license\.txt)$ {
         deny all;
     }
 
-    location ~* /wp-content/(?:wpvividbackups|updraft|ai1wm-backups|backup-db)(?:/|$) {
+    location ~* /wp-content/(?:wpvividbackups|updraft|ai1wm-backups|backup-db|backups-dup-pro|dup-installer|duplicator|upgrade|upgrade-temp-backup)(?:/|$) {
         deny all;
     }
 
@@ -1910,7 +2437,7 @@ server {
         deny all;
     }
 
-    location ~ /\. {
+    location ~ (^|/)\.(?!well-known/) {
         deny all;
     }
 
@@ -1923,7 +2450,9 @@ server {
     }
 
     location ~ \.php$ {
-        include snippets/fastcgi-php.conf;
+        try_files \$uri =404;
+        include /etc/nginx/fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         fastcgi_pass unix:$pool_socket;
         fastcgi_hide_header Strict-Transport-Security;
         fastcgi_cache $zone;
@@ -1935,19 +2464,21 @@ server {
         fastcgi_cache_lock on;
         fastcgi_cache_bypass \$skip_cache;
         fastcgi_no_cache \$skip_cache;
-        add_header Strict-Transport-Security "max-age=15552000" always;
+$hsts_header
         add_header X-Frame-Options "SAMEORIGIN" always;
         add_header X-Content-Type-Options "nosniff" always;
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(self)" always;
         add_header X-FastCGI-Cache \$upstream_cache_status;
     }
 
-    location ~* \.(?:css|js|jpg|jpeg|gif|png|ico|webp|avif|svg|woff2?|ttf)$ {
+    location ~* \.(?:css|js|jpg|jpeg|gif|png|ico|webp|avif|svg|woff2?|ttf|eot)$ {
         expires 30d;
-        add_header Strict-Transport-Security "max-age=15552000" always;
+$hsts_header
         add_header X-Frame-Options "SAMEORIGIN" always;
         add_header X-Content-Type-Options "nosniff" always;
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(self)" always;
         # Same-URL media may be replaced. Do not promise immutability.
         access_log off;
         try_files \$uri =404;
@@ -1958,6 +2489,9 @@ EOF
     install_nginx_log_format
     install_nginx_files "$domain" "$site_temp" "$cache_temp"
     rm -f "$site_temp" "$cache_temp"
+    if [[ "$(host_policy_value cloudflare disabled)" == enabled && ! -e "$SITE_POLICY_DIR/$domain/login-limit" ]]; then
+        site_login_limit "$domain" direct
+    fi
 }
 
 create_site_directories() {
@@ -2005,23 +2539,87 @@ ensure_site_storage() {
 }
 
 site_wp_cli() {
-    local domain="$1" index wp_path site_home wp_cli_home run_user php_binary
+    local domain="$1" index wp_path site_home wp_cli_home run_user run_group php_binary status=0 config_write=no
     shift
     index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
     wp_path="${SITE_PATHS[$index]}"
     site_home="/var/www/$domain"
     wp_cli_home="$(site_wp_cli_home "$domain")"
     run_user="$(site_run_user "$domain")"
+    run_group="$(id -gn "$run_user")"
     php_binary="/usr/bin/php${SITE_PHP_VERSIONS[$index]}"
     [[ -x "$php_binary" ]] || die "Missing PHP CLI for ${SITE_PHP_VERSIONS[$index]}."
     install -d -o "$run_user" -g "$(id -gn "$run_user")" -m 0700 "$wp_cli_home" "$wp_cli_home/cache"
+    if [[ "${1:-}" == config && ("${2:-}" == set || "${2:-}" == delete || "${2:-}" == create) ]]; then config_write=yes; fi
     (
         cd "$wp_path"
         timeout "${WP_SHELL_WP_TIMEOUT:-600}s" sudo -u "$run_user" env \
             HOME="$site_home" \
             WP_CLI_CACHE_DIR="$wp_cli_home/cache" \
             "$php_binary" /usr/local/bin/wp --path="$wp_path" "$@"
+    ) || status=$?
+    if [[ "$config_write" == yes && -f "$wp_path/wp-config.php" && ! -L "$wp_path/wp-config.php" ]]; then
+        chown root:"$run_group" "$wp_path/wp-config.php"
+        chmod 0640 "$wp_path/wp-config.php"
+    fi
+    return "$status"
+}
+
+# Read-only WP-CLI queries must not create a per-site cache or repair its
+# ownership.  Keep packages and downloads disabled so audit/status paths do
+# not leave persistent state behind.  The invoked WordPress command must also
+# be observational (for example cron list or db query).
+site_wp_cli_readonly() {
+    local domain="$1" index wp_path site_home run_user php_binary status=0
+    shift
+    index="$(site_index_by_domain "$domain")" || return 1
+    wp_path="${SITE_PATHS[$index]}"
+    site_home="/var/www/$domain"
+    run_user="$(site_run_user "$domain")"
+    php_binary="/usr/bin/php${SITE_PHP_VERSIONS[$index]}"
+    [[ -x "$php_binary" && -d "$wp_path" && -f "$wp_path/wp-config.php" && \
+       ! -L "$wp_path" && ! -L "$wp_path/wp-config.php" ]] || return 1
+    (
+        cd "$wp_path"
+        timeout "${WP_SHELL_WP_TIMEOUT:-600}s" sudo -u "$run_user" env \
+            HOME="$site_home" \
+            WP_CLI_CACHE_DIR=/dev/null \
+            WP_CLI_PACKAGES_DIR=/dev/null \
+            WP_CLI_CONFIG_PATH=/dev/null \
+            WP_CLI_DISABLE_AUTO_CHECK_UPDATE=1 \
+            "$php_binary" /usr/local/bin/wp --no-color --skip-plugins --skip-themes \
+            --path="$wp_path" "$@"
+    ) || status=$?
+    return "$status"
+}
+
+site_wp_cli_at() {
+    local domain="$1" wp_path="$2" index site_home wp_cli_home run_user php_binary
+    shift 2
+    index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
+    site_home="/var/www/$domain"
+    wp_cli_home="$(site_wp_cli_home "$domain")"
+    run_user="$(site_run_user "$domain")"
+    php_binary="/usr/bin/php${SITE_PHP_VERSIONS[$index]}"
+    [[ -x "$php_binary" && -f "$wp_path/wp-config.php" && ! -L "$wp_path" && ! -L "$wp_path/wp-config.php" ]] || \
+        die "Unsafe or incomplete WordPress path: $wp_path"
+    (
+        cd "$wp_path"
+        timeout "${WP_SHELL_WP_TIMEOUT:-600}s" sudo -u "$run_user" env \
+            HOME="$site_home" WP_CLI_CACHE_DIR="$wp_cli_home/cache" \
+            "$php_binary" /usr/local/bin/wp --path="$wp_path" "$@"
     )
+}
+
+canonical_staging_path() {
+    local domain="$1" requested="$2" root canonical expected
+    [[ "$requested" == /* && "$requested" != *$'\n'* && "$requested" != *'/../'* && ! -L "$requested" ]] || return 1
+    root="$(readlink -f "$(site_wp_path "$domain")")" || return 1
+    canonical="$(readlink -f "$requested")" || return 1
+    [[ "$canonical" == "$root"/* && "$canonical" != "$root" && -f "$canonical/wp-config.php" && ! -L "$canonical/wp-config.php" ]] || return 1
+    expected="/var/www/$domain/"
+    [[ "$canonical" == "$expected"* || "$root" != "/var/www/$domain/public" ]] || return 1
+    printf '%s' "$canonical"
 }
 
 redact_wp_cli_output() {
@@ -2075,7 +2673,7 @@ site_wp_config_set_redis_secret() {
         return 1
     fi
     chown --reference="$wp_config" "$temp_file"
-    if [[ "$original_mode" == 600 ]]; then chmod 0600 "$temp_file"; else chmod "$(site_config_mode "$domain")" "$temp_file"; fi
+    chmod "$(site_config_mode "$domain")" "$temp_file"
     mv -f "$temp_file" "$wp_config"
     rm -f "$backup"
 }
@@ -2085,12 +2683,17 @@ site_credentials_file() {
 }
 
 set_site_permissions() {
-    local domain="$1" wp_path site_root run_user dir_mode=0755 file_mode=0644 config_mode=0640
+    local domain="$1" wp_path site_root run_user dir_mode=0755 file_mode=0644 config_mode=0640 canonical
     wp_path="$(site_wp_path "$domain")"
-    [[ ! -L "$wp_path/wp-config.php" ]] || die "Refusing to change permissions through a wp-config.php symlink."
+    canonical="$(readlink -f "$wp_path")" || die "Cannot resolve the WordPress path for $domain."
+    [[ "$canonical" == "$wp_path" && "$wp_path" != / && "$wp_path" != /var/www && ! -L "$wp_path" && ! -L "$wp_path/wp-config.php" ]] || \
+        die "Refusing to change permissions through an unsafe WordPress path or wp-config.php symlink."
+    if [[ "${SITE_MODES[$(site_index_by_domain "$domain")]}" == managed ]]; then
+        [[ "$wp_path" == "/var/www/$domain/public" ]] || die "Managed site permissions are confined to /var/www/$domain/public."
+    fi
     site_root="/var/www/$domain"
     run_user="$(site_run_user "$domain")"
-    if [[ "$run_user" != www-data ]]; then dir_mode=0750; file_mode=0640; config_mode=0600; fi
+    if [[ "$run_user" != www-data ]]; then dir_mode=0750; file_mode=0640; fi
     find "$wp_path" -xdev \
         \( -path "$site_root/backups" -o -path "$site_root/cache" -o \
            -path "$site_root/logs" -o -path "$site_root/.wp-cli" \) -prune -o \
@@ -2103,7 +2706,10 @@ set_site_permissions() {
         \( -path "$site_root/backups" -o -path "$site_root/cache" -o \
            -path "$site_root/logs" -o -path "$site_root/.wp-cli" \) -prune -o \
         -type f -exec chmod "$file_mode" {} +
-    [[ -f "$wp_path/wp-config.php" ]] && chmod "$config_mode" "$wp_path/wp-config.php"
+    if [[ -f "$wp_path/wp-config.php" ]]; then
+        chown root:"$(id -gn "$run_user")" "$wp_path/wp-config.php"
+        chmod "$config_mode" "$wp_path/wp-config.php"
+    fi
     chown -R "$run_user":www-data "$site_root/logs"
     chmod 0750 "/var/www/$domain/logs"
     ensure_site_storage "$domain"
@@ -2185,7 +2791,7 @@ repair_wordpress_core() {
 
 install_wordpress_site() {
     CURRENT_STEP="install WordPress"
-    local index="$1" domain primary wp_path admin_password credentials_file redis_password memory_limit initial_mode download_url
+    local index="$1" domain primary wp_path admin_password credentials_file redis_password memory_limit initial_mode download_url db_prefix
     local wordpress_installed_now="no"
     domain="${SITE_DOMAINS[$index]}"
     primary="${SITE_PRIMARY_DOMAINS[$index]}"
@@ -2204,15 +2810,20 @@ install_wordpress_site() {
         verify_wordpress_core_strict "$domain" "$WORDPRESS_LOCALE" || \
             die "The downloaded WordPress core failed strict checksum verification."
     fi
+    transaction_begin "$CURRENT_STEP"
+    [[ "$TRANSACTION_ACTIVE" != yes ]] || transaction_backup_file "$wp_path/wp-config.php"
     if [[ ! -f "$wp_path/wp-config.php" ]]; then
         load_database_config "$domain"
+        db_prefix="wp_$(printf '%s' "$domain" | sha256sum | cut -c1-8)_"
         site_wp_cli_prompt_secret "$domain" "$DB_PASSWORD" config create \
             --dbname="$DB_NAME" --dbuser="$DB_USER" \
-            --dbhost=localhost --dbprefix=wp_ --dbcharset=utf8mb4 --prompt=dbpass
+            --dbhost=localhost --dbprefix="$db_prefix" --dbcharset=utf8mb4 --prompt=dbpass
     fi
 
+    site_wp_cli "$domain" config set WP_DEBUG false --raw
     site_wp_cli "$domain" config set FORCE_SSL_ADMIN true --raw
     site_wp_cli "$domain" config set DISALLOW_FILE_EDIT true --raw
+    site_wp_cli "$domain" config set WP_ENVIRONMENT_TYPE production
     site_wp_cli "$domain" config set WP_CACHE true --raw
     site_wp_cli "$domain" config set WP_REDIS_HOST 127.0.0.1
     site_wp_cli "$domain" config set WP_REDIS_PORT 6379 --raw
@@ -2268,17 +2879,17 @@ install_wordpress_site() {
 
 install_self() {
     if [[ "$SCRIPT_PATH" != "$MANAGED_SCRIPT" ]] && ! cmp -s "$SCRIPT_PATH" "$MANAGED_SCRIPT" 2>/dev/null; then
-        install -o root -g root -m 0755 "$SCRIPT_PATH" "$MANAGED_SCRIPT"
+        write_managed_file "$MANAGED_SCRIPT" 0755 root root < "$SCRIPT_PATH"
     fi
-    ln -sfn "$MANAGED_SCRIPT" /usr/local/bin/wp-shell
-    ln -sfn "$MANAGED_SCRIPT" /usr/local/bin/wp-vps-manager
-    ln -sfn "$MANAGED_SCRIPT" /usr/local/sbin/wp-vps-manager
-    ln -sfn "$MANAGED_SCRIPT" /usr/local/sbin/wp-single-manager
+    write_managed_symlink /usr/local/bin/wp-shell "$MANAGED_SCRIPT"
+    write_managed_symlink /usr/local/bin/wp-vps-manager "$MANAGED_SCRIPT"
+    write_managed_symlink /usr/local/sbin/wp-vps-manager "$MANAGED_SCRIPT"
+    write_managed_symlink /usr/local/sbin/wp-single-manager "$MANAGED_SCRIPT"
     local i legacy_wrapper
     for ((i = 1; i <= SITE_COUNT; i++)); do
         legacy_wrapper="/usr/local/bin/manage-${SITE_DOMAINS[$i]}"
         if [[ -f "$legacy_wrapper" || -L "$legacy_wrapper" ]]; then
-            rm -f -- "$legacy_wrapper"
+            remove_managed_file "$legacy_wrapper"
             log_message INFO "Removed legacy site shortcut: $legacy_wrapper"
         fi
     done
@@ -2381,7 +2992,7 @@ prepare_stack() {
     configure_fail2ban
     configure_log_rotation
     install_certbot_deploy_hook
-    rm -f /etc/nginx/sites-enabled/default
+    disable_distribution_nginx_default
     systemctl enable --now nginx
     install_self
 }
@@ -2675,13 +3286,34 @@ site_policy_value() {
 }
 
 set_site_policy() {
-    local domain="$1" key="$2" value="$3" temp
+    local domain="$1" key="$2" value="$3" target
     validate_domain "$domain" && [[ "$key" =~ ^[a-z-]+$ && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
     install -d -m 0700 "$SITE_POLICY_DIR" "$SITE_POLICY_DIR/$domain"
-    temp="$(mktemp "$SITE_POLICY_DIR/$domain/.policy.XXXXXX")"
-    printf '%s\n' "$value" > "$temp"
-    chmod 0600 "$temp"
-    mv -T "$temp" "$SITE_POLICY_DIR/$domain/$key"
+    target="$SITE_POLICY_DIR/$domain/$key"
+    write_managed_file "$target" 0600 root root <<EOF
+$value
+EOF
+}
+
+host_policy_value() {
+    local key="$1" fallback="${2:-}" value
+    [[ "$key" =~ ^[a-z][a-z0-9-]*$ ]] || return 1
+    [[ -f "$HOST_POLICY_FILE" && ! -L "$HOST_POLICY_FILE" ]] || { printf '%s' "$fallback"; return 0; }
+    value="$(awk -F '|' -v key="$key" '$1==key {print substr($0,length($1)+2); found=1} END{exit !found}' "$HOST_POLICY_FILE" 2>/dev/null || true)"
+    printf '%s' "${value:-$fallback}"
+}
+
+set_host_policy() {
+    local key="$1" value="$2" temp
+    [[ "$key" =~ ^[a-z][a-z0-9-]*$ && "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *'|'* ]] || return 1
+    temp="$(mktemp "${TMPDIR:-/tmp}/wp-shell-host-policy.XXXXXXXX")"
+    if [[ -f "$HOST_POLICY_FILE" && ! -L "$HOST_POLICY_FILE" ]]; then
+        awk -F '|' -v key="$key" '$1!=key' "$HOST_POLICY_FILE" > "$temp"
+    fi
+    printf '%s|%s\n' "$key" "$value" >> "$temp"
+    sort -u -o "$temp" "$temp"
+    write_managed_file "$HOST_POLICY_FILE" 0600 root root < "$temp"
+    rm -f -- "$temp"
 }
 
 validate_encrypted_remote() {
@@ -2797,7 +3429,7 @@ backup_site() (
     domain="${SITE_DOMAINS[$index]}"
     wp_path="$(site_wp_path "$domain")"
     [[ -f "$wp_path/wp-config.php" ]] || { log_message ERROR "WordPress is not installed for $domain." >&2; exit 1; }
-    [[ "$BACKUP_RETENTION_DAYS" =~ ^[1-9][0-9]{0,3}$ ]] || exit 1
+    [[ "$BACKUP_RETENTION_DAYS" =~ ^(0|[1-9][0-9]{0,3})$ ]] || exit 1
     timestamp="$(date +%Y%m%d-%H%M%S)"
     ensure_site_storage "$domain" || exit 1
     site_backup_root="$(site_backup_dir "$domain")"
@@ -2856,7 +3488,10 @@ backup_site() (
     mv -T "$temp_dir" "$final_dir" || exit 1
     temp_dir=""
     upload_remote_backup "$domain" "$final_dir" || exit 1
-    find "$site_backup_root" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' -mtime "+$BACKUP_RETENTION_DAYS" -exec rm -rf -- {} + || exit 1
+    if ((BACKUP_RETENTION_DAYS > 0)); then
+        find "$site_backup_root" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' \
+            -mtime "+$BACKUP_RETENTION_DAYS" -exec rm -rf -- {} + || exit 1
+    fi
     log_message SUCCESS "Backup completed: $final_dir"
     printf '%s\n' "$final_dir"
     exit 0
@@ -2965,56 +3600,42 @@ run_site_cron() (
 )
 
 site_cron_action() {
-    local domain="$1" action="${2:-status}" unit prior
-    unit="wp-shell-cron-$(site_pool_id "$domain")"
+    local domain="$1" action="${2:-status}" prior cron_file run_user php_version wp_path site_root
+    cron_file="/etc/cron.d/wp-shell-$(site_pool_id "$domain")"
+    run_user="$(site_run_user "$domain")"
+    php_version="${SITE_PHP_VERSIONS[$(site_index_by_domain "$domain")]}"
+    wp_path="$(site_wp_path "$domain")"
+    site_root="/var/www/$domain"
     case "$action" in
         enable)
             install_self
+            site_wp_cli "$domain" core is-installed >/dev/null || die "WordPress preflight failed; system Cron was not installed."
             prior="$(site_wp_cli "$domain" config get DISABLE_WP_CRON 2>/dev/null || printf 'false')"
             [[ "$(site_policy_value "$domain" cron-mode)" == system ]] || set_site_policy "$domain" cron-prior "$prior"
-            cat > "/etc/systemd/system/$unit.service" <<EOF
-[Unit]
-Description=Run due WordPress events for $domain
-After=network.target mariadb.service
-[Service]
-Type=oneshot
-ExecStart=$MANAGED_SCRIPT cron-run $domain
-TimeoutStartSec=270s
-Nice=10
-IOSchedulingClass=idle
-PrivateTmp=true
+            install -d -o "$run_user" -g "$(id -gn "$run_user")" -m 0700 "$site_root/.wp-shell"
+            install -d -m 0755 /etc/cron.d
+            write_managed_file "$cron_file" 0644 root root <<EOF
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * $run_user flock -n $site_root/.wp-shell/cron.lock timeout 240s /usr/bin/php$php_version /usr/local/bin/wp --path=$wp_path cron event run --due-now >>$site_root/logs/wp-cron.log 2>&1
 EOF
-            cat > "/etc/systemd/system/$unit.timer" <<EOF
-[Unit]
-Description=WordPress schedule for $domain
-[Timer]
-OnBootSec=2m
-OnUnitInactiveSec=60s
-RandomizedDelaySec=15s
-[Install]
-WantedBy=timers.target
-EOF
-            systemctl daemon-reload
-            # A real successful run and active timer are required before disabling HTTP cron.
-            systemctl start "$unit.service" || die "Cron trial failed; request-driven WP-Cron was not changed."
-            systemctl enable --now "$unit.timer"
-            systemctl is-active --quiet "$unit.timer" || die "Cron timer is not active."
             site_wp_cli "$domain" config set DISABLE_WP_CRON true --raw
             chmod "$(site_config_mode "$domain")" "$(site_wp_path "$domain")/wp-config.php"
             set_site_policy "$domain" cron-mode system
-            log_message SUCCESS "$domain: verified system WP-Cron enabled. Do not also schedule it in crontab."
+            log_message SUCCESS "$domain: system WP-Cron scheduled every five minutes as $run_user. No due event was run as a test."
             ;;
         disable)
             prior="$(site_policy_value "$domain" cron-prior false)"
             [[ "$prior" == 1 || "$prior" == true ]] && prior=true || prior=false
             site_wp_cli "$domain" config set DISABLE_WP_CRON "$prior" --raw
             chmod "$(site_config_mode "$domain")" "$(site_wp_path "$domain")/wp-config.php"
-            systemctl disable --now "$unit.timer" 2>/dev/null || true
+            remove_managed_file "$cron_file"
+            systemctl disable --now "wp-shell-cron-$(site_pool_id "$domain").timer" 2>/dev/null || true
             set_site_policy "$domain" cron-mode request
-            log_message INFO "Restored the previous DISABLE_WP_CRON value ($prior); timer disabled."
+            log_message INFO "Restored the previous DISABLE_WP_CRON value ($prior); managed Cron removed."
             ;;
         status)
-            printf '%s: mode=%s timer=%s\n' "$domain" "$(site_policy_value "$domain" cron-mode request)" "$(systemctl is-active "$unit.timer" 2>/dev/null || true)"
+            printf '%s: mode=%s cron-file=%s\n' "$domain" "$(site_policy_value "$domain" cron-mode request)" "$(if [[ -s "$cron_file" ]]; then printf installed; else printf absent; fi)"
             [[ ! -f "$STATE_DIR/cron-$(site_pool_id "$domain").success" ]] || printf 'Last successful run (epoch): %s\n' "$(<"$STATE_DIR/cron-$(site_pool_id "$domain").success")"
             ;;
         *) die "Use: wp-shell site DOMAIN cron enable|disable|status" ;;
@@ -3022,12 +3643,14 @@ EOF
 }
 
 site_config_mode() {
-    if [[ "$(site_run_user "$1")" == www-data ]]; then printf '0640'; else printf '0600'; fi
+    printf '0640'
 }
 
 install_operations_timer() {
     install_self
-    cat > /etc/systemd/system/wp-shell-operations.service <<EOF
+    transaction_begin "install cache invalidation timer"
+    transaction_mark_service systemd
+    write_managed_file /etc/systemd/system/wp-shell-operations.service 0644 root root <<EOF
 [Unit]
 Description=Process WordPress page-cache invalidations
 [Service]
@@ -3037,7 +3660,7 @@ TimeoutStartSec=50s
 Nice=10
 IOSchedulingClass=idle
 EOF
-    cat > /etc/systemd/system/wp-shell-operations.timer <<'EOF'
+    write_managed_file /etc/systemd/system/wp-shell-operations.timer 0644 root root <<'EOF'
 [Unit]
 Description=Process page-cache changes every minute
 [Timer]
@@ -3077,11 +3700,12 @@ site_cache_auto() {
     run_user="$(site_run_user "$domain")"
     case "$action" in
         enable)
+            CURRENT_STEP="configure automatic page-cache invalidation"
             [[ "$wp_path" == "/var/www/$domain/public" ]] || die "Automatic invalidation requires the managed public-directory layout."
             if [[ -e "$plugin" ]] && ! grep -Fq 'Plugin Name: wp-shell Cache Signals' "$plugin"; then die "An unrelated MU plugin already uses $plugin."; fi
             install -d -o "$run_user" -g "$(id -gn "$run_user")" -m 0700 "/var/www/$domain/.wp-shell"
             install -d -o "$run_user" -g www-data -m 0750 "$wp_path/wp-content/mu-plugins"
-            cat > "$plugin" <<'PHP'
+            write_managed_file "$plugin" 0640 "$run_user" www-data <<'PHP'
 <?php
 /* Plugin Name: wp-shell Cache Signals */
 if (!defined('ABSPATH')) { exit; }
@@ -3098,8 +3722,6 @@ foreach (array('save_post', 'deleted_post', 'trashed_post', 'untrashed_post',
     add_action($event, 'wp_shell_signal_page_change', 100, 0);
 }
 PHP
-            chown "$run_user":www-data "$plugin"
-            chmod 0640 "$plugin"
             install_operations_timer
             systemctl is-active --quiet wp-shell-operations.timer || die "Cache invalidation timer failed to start."
             set_site_policy "$domain" cache-auto enabled
@@ -3108,7 +3730,7 @@ PHP
             log_message SUCCESS "$domain: page cache purged within about one minute after supported content changes. Custom plugin changes may still need manual clearing."
             ;;
         disable)
-            if [[ -f "$plugin" ]] && grep -Fq 'Plugin Name: wp-shell Cache Signals' "$plugin"; then rm -f -- "$plugin"; fi
+            if [[ -f "$plugin" ]] && grep -Fq 'Plugin Name: wp-shell Cache Signals' "$plugin"; then remove_managed_file "$plugin"; fi
             set_site_policy "$domain" cache-auto disabled
             ;;
         status) printf '%s: automatic page invalidation %s\n' "$domain" "$(site_policy_value "$domain" cache-auto disabled)" ;;
@@ -3118,6 +3740,7 @@ PHP
 
 site_cache_exclude() {
     local domain="$1" path="${2:-}" file temp
+    CURRENT_STEP="configure a page-cache exclusion"
     file="/etc/nginx/wp-shell-custom/$domain/20-cache-exclusions.conf"
     [[ "$path" =~ ^/[a-zA-Z0-9_/-]+/$ && "$path" != *..* ]] || die "Use an absolute URL path ending with /, for example /staging/ or /basket/."
     install -d -m 0755 "$(dirname "$file")"
@@ -3127,12 +3750,11 @@ site_cache_exclude() {
         # shellcheck disable=SC2016
         printf 'if ($request_uri ~* "^%s") { set $skip_cache 1; }\n' "$path" >> "$temp"
     fi
-    install -m 0644 "$temp" "$file.new"
-    [[ ! -f "$file" ]] || cp -a "$file" "$file.previous"
-    mv -T "$file.new" "$file"
+    transaction_begin "$CURRENT_STEP"
+    transaction_mark_service nginx
+    write_managed_file "$file" 0644 root root < "$temp"
     rm -f "$temp"
     if ! nginx -t; then
-        if [[ -f "$file.previous" ]]; then mv -f "$file.previous" "$file"; else rm -f "$file"; fi
         die "Invalid Nginx exclusion; previous file restored."
     fi
     systemctl reload nginx
@@ -3144,30 +3766,28 @@ site_login_limit() {
     file="/etc/nginx/wp-shell-custom/$domain/30-login-limit.conf"
     case "$action" in
         direct)
-            log_message WARNING "This mode assumes direct client connections. Do not use it behind a CDN/proxy until trusted real-IP handling is configured and verified."
-            install -d -m 0755 "$(dirname "$file")"
-            if [[ ! -f /etc/nginx/conf.d/wp-shell-login-limit.conf ]]; then
-                cat > /etc/nginx/conf.d/wp-shell-login-limit.conf <<'EOF'
-# Managed by wp-shell. Empty keys exclude all requests except login POSTs.
-map "$request_method:$uri" $wp_shell_login_key {
-    default "";
-    ~*^POST:/(?:[^/]+/)*wp-login\.php$ $binary_remote_addr;
-}
-limit_req_zone $wp_shell_login_key zone=wp_shell_login:10m rate=10r/m;
-EOF
+            if [[ "$(host_policy_value cloudflare disabled)" != enabled ]]; then
+                log_message WARNING "Direct-IP mode is safe only when clients reach Nginx directly. Enable verified Cloudflare real-IP handling first when using its proxy."
             fi
-            [[ ! -f "$file" ]] || cp -a "$file" "$file.previous"
-            printf 'limit_req zone=wp_shell_login burst=10 nodelay;\nlimit_req_status 429;\n' > "$file"
+            install -d -m 0755 "$(dirname "$file")"
+            transaction_begin "$CURRENT_STEP"
+            transaction_mark_service nginx
+            install_nginx_log_format
+            write_managed_file "$file" 0644 root root <<'EOF'
+limit_req zone=wp_shell_login burst=20 nodelay;
+limit_req_status 429;
+EOF
             if ! nginx -t; then
-                if [[ -f "$file.previous" ]]; then mv -f "$file.previous" "$file"; else rm -f "$file"; fi
                 die "Login rate-limit validation failed; previous site setting restored."
             fi
             systemctl reload nginx
             set_site_policy "$domain" login-limit direct
-            log_message SUCCESS "Login POST rate limit: 10/minute per client IP plus burst 10. Requires the current managed Nginx include."
+            log_message SUCCESS "Login POST rate limit: 10/minute per verified client IP plus burst 20."
             ;;
         off)
-            rm -f -- "$file"
+            transaction_begin "$CURRENT_STEP"
+            transaction_mark_service nginx
+            remove_managed_file "$file"
             nginx -t && systemctl reload nginx
             set_site_policy "$domain" login-limit disabled
             ;;
@@ -3176,8 +3796,106 @@ EOF
     esac
 }
 
+render_staging_nginx() {
+    local url_path="$1" pool_socket="$2" output="$3"
+    [[ "$url_path" =~ ^/[A-Za-z0-9._/-]+/$ && "$url_path" != *..* ]] || return 1
+    [[ "$pool_socket" == /run/php/*.sock ]] || return 1
+    cat > "$output" <<EOF
+# Managed by wp-shell for staging at $url_path.
+location ~* ^${url_path}(?:wp-content/)?(?:uploads|cache)/.*\.(?:php[0-9]?|phtml|phar|cgi|pl|py|sh)$ {
+    deny all;
+}
+location ~ ^${url_path}.*\.php$ {
+    try_files \$uri =404;
+    include /etc/nginx/fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    fastcgi_pass unix:$pool_socket;
+    fastcgi_no_cache 1;
+    fastcgi_cache_bypass 1;
+    add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
+}
+location $url_path {
+    try_files \$uri \$uri/ ${url_path}index.php?\$args;
+    add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
+}
+EOF
+}
+
+site_staging_action() {
+    local domain="$1" action="${2:-status}" requested_path="${3:-}" url_path="${4:-}" redis_prefix="${5:-off}" confirmation="${6:-}"
+    local staging_path root expected_path file pool_socket temp run_user
+    file="/etc/nginx/wp-shell-custom/$domain/10-staging.conf"
+    case "$action" in
+        configure)
+            [[ "$confirmation" == --confirm ]] || die "Impact: mark the selected nested WordPress as staging, disable its WP-Cron, enforce noindex, and configure an explicit Redis prefix or disable object cache. Re-run with --confirm."
+            [[ "$url_path" =~ ^/[A-Za-z0-9._/-]+/$ && "$url_path" != *..* && "$url_path" != '//' ]] || die "Staging URL path must begin and end with one slash, for example /preview/."
+            staging_path="$(canonical_staging_path "$domain" "$requested_path")" || die "Staging must be an existing non-symlinked WordPress directory below the registered Web Root."
+            root="$(readlink -f "$(site_wp_path "$domain")")"
+            expected_path="$(readlink -m "$root/${url_path#/}")"
+            [[ "$staging_path" == "${expected_path%/}" ]] || die "The staging filesystem path does not match its URL path below the registered Web Root."
+            if [[ "$redis_prefix" != off ]]; then
+                [[ "$redis_prefix" =~ ^[A-Za-z0-9._:-]{4,80}$ && "$redis_prefix" != "${domain}:" ]] || \
+                    die "Use a unique 4-80 character staging Redis prefix, or 'off'."
+            fi
+            transaction_begin "$CURRENT_STEP"
+            [[ "$TRANSACTION_ACTIVE" != yes ]] || transaction_backup_file "$staging_path/wp-config.php"
+            site_wp_cli_at "$domain" "$staging_path" config set WP_DEBUG false --raw
+            site_wp_cli_at "$domain" "$staging_path" config set DISALLOW_FILE_EDIT true --raw
+            site_wp_cli_at "$domain" "$staging_path" config set FORCE_SSL_ADMIN true --raw
+            site_wp_cli_at "$domain" "$staging_path" config set WP_ENVIRONMENT_TYPE staging
+            site_wp_cli_at "$domain" "$staging_path" config set DISABLE_WP_CRON true --raw
+            if [[ "$redis_prefix" == off ]]; then
+                site_wp_cli_at "$domain" "$staging_path" config set WP_REDIS_DISABLED true --raw
+            else
+                site_wp_cli_at "$domain" "$staging_path" config set WP_REDIS_DISABLED false --raw
+                site_wp_cli_at "$domain" "$staging_path" config set WP_REDIS_PREFIX "$redis_prefix"
+            fi
+            run_user="$(site_run_user "$domain")"
+            chown root:"$(id -gn "$run_user")" "$staging_path/wp-config.php"
+            chmod "$(site_config_mode "$domain")" "$staging_path/wp-config.php"
+            pool_socket="$(site_pool_socket "$domain")"
+            install -d -m 0755 "$(dirname "$file")"
+            temp="$(mktemp "${TMPDIR:-/tmp}/wp-shell-staging.XXXXXXXX")"
+            render_staging_nginx "$url_path" "$pool_socket" "$temp" || die "Could not render the staging Nginx policy."
+            transaction_begin "$CURRENT_STEP"
+            transaction_mark_service nginx
+            write_managed_file "$file" 0644 root root < "$temp"
+            rm -f -- "$temp"
+            nginx -t || die "Nginx rejected the staging route; configuration and WordPress changes require review."
+            systemctl reload nginx
+            set_site_policy "$domain" staging-path "$staging_path"
+            set_site_policy "$domain" staging-url "$url_path"
+            set_site_policy "$domain" staging-redis-prefix "$redis_prefix"
+            log_message SUCCESS "$domain staging is noindex, request-cached bypassed, and WP-Cron disabled. No task or email was run."
+            ;;
+        status)
+            printf '%s staging path: %s\n' "$domain" "$(site_policy_value "$domain" staging-path not-configured)"
+            printf 'URL: %s | Redis prefix: %s | Nginx: %s\n' \
+                "$(site_policy_value "$domain" staging-url n/a)" \
+                "$(site_policy_value "$domain" staging-redis-prefix off)" \
+                "$(if [[ -s "$file" ]]; then printf installed; else printf absent; fi)"
+            ;;
+        *) die "Use: wp-shell site DOMAIN staging configure ABS_PATH URL_PATH REDIS_PREFIX|off --confirm | status" ;;
+    esac
+}
+
+site_header_policy() {
+    local domain="$1" policy="$2" action="${3:-status}" value
+    [[ "$policy" == hsts || "$policy" == xmlrpc ]] || return 1
+    case "$action" in
+        enable) value=enabled ;;
+        disable) value=disabled ;;
+        status) printf '%s %s: %s\n' "$domain" "$policy" "$(site_policy_value "$domain" "$policy" disabled)"; return 0 ;;
+        *) die "Use $policy enable|disable|status." ;;
+    esac
+    set_site_policy "$domain" "$policy" "$value"
+    configure_https_site "$(site_index_by_domain "$domain")"
+    log_message SUCCESS "$domain $policy policy: $value"
+}
+
 site_action() {
     local selector="$1" domain action="${2:-status}" index wp_path
+    local arg1="${3:-}" arg2="${4:-}" arg3="${5:-}" arg4="${6:-}"
     domain="$(site_domain_from_selector "$selector")" || die "Unknown site ID or domain: $selector"
     index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
     wp_path="$(site_wp_path "$domain")"
@@ -3196,30 +3914,32 @@ site_action() {
             fi
             ;;
         core-repair) repair_wordpress_core "$index" ;;
-        isolate) isolate_site "$index" "${3:-}" ;;
-        redis-isolate) isolate_site_redis "$index" "${3:-64}" ;;
-        cron) site_cron_action "$domain" "${3:-status}" ;;
-        cache-auto) site_cache_auto "$domain" "${3:-status}" ;;
-        cache-exclude) site_cache_exclude "$domain" "${3:-}" ;;
-        login-limit) site_login_limit "$domain" "${3:-status}" ;;
+        isolate) isolate_site "$index" "$arg1" ;;
+        redis-isolate) isolate_site_redis "$index" "${arg1:-64}" ;;
+        cron) site_cron_action "$domain" "${arg1:-status}" ;;
+        cache-auto) site_cache_auto "$domain" "${arg1:-status}" ;;
+        cache-exclude) site_cache_exclude "$domain" "$arg1" ;;
+        login-limit) site_login_limit "$domain" "${arg1:-status}" ;;
+        staging) site_staging_action "$domain" "${arg1:-status}" "$arg2" "$arg3" "$arg4" "${7:-}" ;;
+        hsts|xmlrpc) site_header_policy "$domain" "$action" "${arg1:-status}" ;;
         nginx-apply)
             [[ "${SITE_MODES[$index]}" == managed ]] || die "Imported Nginx sites must be reviewed before adopting a managed template."
             configure_https_site "$index"
             clear_site_cache "$index" page
             ;;
         maintenance)
-            case "${3:-status}" in
+            case "${arg1:-status}" in
                 on) install -m 0600 /dev/null "/var/www/$domain/.wp-shell-maintenance" ;;
                 off) rm -f -- "/var/www/$domain/.wp-shell-maintenance" ;;
                 status) [[ ! -f "/var/www/$domain/.wp-shell-maintenance" ]] || printf 'Maintenance: ON\n' ;;
                 *) die "Use maintenance on|off|status." ;;
             esac
             ;;
-        cache-clear) clear_site_cache "$index" "${3:-page}"; log_message SUCCESS "$domain ${3:-page} cache was cleared." ;;
+        cache-clear) clear_site_cache "$index" "${arg1:-page}"; log_message SUCCESS "$domain ${arg1:-page} cache was cleared." ;;
         backup) backup_site "$index" ;;
         backups) list_backups "$index" ;;
-        restore) [[ -n "${3:-}" ]] || die "Usage: wp-shell restore $domain BACKUP_ID"; restore_site "$index" "$3" ;;
-        update) update_site "$index" ;;
+        restore) [[ -n "$arg1" ]] || die "Usage: wp-shell restore $domain BACKUP_ID"; restore_site "$index" "$arg1" ;;
+        update) [[ "$arg1" == --confirm-updates ]] || die "Impact: update WordPress core, every plugin and every theme after a backup. Re-run with --confirm-updates."; update_site "$index" ;;
         restart)
             php_fpm_service_action restart "${SITE_PHP_VERSIONS[$index]}"
             nginx -t && systemctl reload nginx
@@ -3629,7 +4349,9 @@ show_metrics_status() {
 install_metrics_timer() {
     CURRENT_STEP="install the metrics collector"
     init_metrics_database
-    cat > /etc/systemd/system/wp-shell-metrics.service <<EOF
+    transaction_begin "$CURRENT_STEP"
+    transaction_mark_service systemd
+    write_managed_file /etc/systemd/system/wp-shell-metrics.service 0644 root root <<EOF
 [Unit]
 Description=Collect local wp-shell metrics
 After=nginx.service mariadb.service redis-server.service
@@ -3643,7 +4365,7 @@ IOSchedulingClass=idle
 ProtectHome=true
 PrivateTmp=true
 EOF
-    cat > /etc/systemd/system/wp-shell-metrics.timer <<'EOF'
+    write_managed_file /etc/systemd/system/wp-shell-metrics.timer 0644 root root <<'EOF'
 [Unit]
 Description=Collect wp-shell metrics every minute
 
@@ -4218,7 +4940,9 @@ apply_tuning() {
 
 install_backup_timer() {
     CURRENT_STEP="install the automatic backup timer"
-    cat > /etc/systemd/system/wp-shell-backup.service <<EOF
+    transaction_begin "$CURRENT_STEP"
+    transaction_mark_service systemd
+    write_managed_file /etc/systemd/system/wp-shell-backup.service 0644 root root <<EOF
 [Unit]
 Description=Back up all WordPress sites managed by wp-shell
 After=mariadb.service
@@ -4230,7 +4954,7 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 EOF
-    cat > /etc/systemd/system/wp-shell-backup.timer <<'EOF'
+    write_managed_file /etc/systemd/system/wp-shell-backup.timer 0644 root root <<'EOF'
 [Unit]
 Description=Daily wp-shell backup
 
@@ -4369,7 +5093,7 @@ system_audit() {
         value="$(apt-config dump | grep -E 'APT::Periodic::Unattended-Upgrade|Unattended-Upgrade::(Allowed-Origins|Origins-Pattern|Automatic-Reboot)' || true)"
         printf '\nUnattended upgrade policy (timers alone do not prove package/origin coverage):\n%s\n' "$value"
         host_audit_line WARN PPA-updates 'Verify PHP PPA coverage with unattended-upgrade --dry-run --debug; third-party origins are not implicitly trusted.'
-    else host_audit_line WARN Security-updates 'unattended-upgrades is not installed. Opt in: wp-shell system updates enable'; fi
+    else host_audit_line WARN Security-updates 'unattended-upgrades is not installed. Opt in: wp-shell system updates enable --confirm'; fi
     if [[ -e /var/run/reboot-required ]]; then host_audit_line WARN Reboot 'A reboot is required; schedule it after checking backups.'
     else host_audit_line PASS Reboot 'No reboot-required marker.'; fi
     if command -v aa-status >/dev/null 2>&1; then
@@ -4397,9 +5121,10 @@ system_audit() {
 }
 
 enable_security_updates() {
+    [[ "${1:-}" == --confirm ]] || die "Impact: install unattended-upgrades and enable daily security package installation without automatic reboot. Re-run with --confirm."
     apt-get update
     apt_install unattended-upgrades
-    cat > /etc/apt/apt.conf.d/52wp-shell-updates <<'EOF'
+    write_managed_file /etc/apt/apt.conf.d/52wp-shell-updates 0644 root root <<'EOF'
 // Managed opt-in. Preserve Ubuntu/vendor origin lists. Never reboot unattended.
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -4409,13 +5134,318 @@ EOF
     log_message SUCCESS "Daily unattended upgrades enabled without automatic reboots. Existing allowed origins are preserved; review PHP PPA coverage with a dry run."
 }
 
+authorized_admin_key_file() {
+    local candidate user
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
+        candidate="$(getent passwd "$SUDO_USER" | cut -d: -f6)/.ssh/authorized_keys"
+        if [[ -f "$candidate" && ! -L "$candidate" ]] && grep -Eq '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$candidate"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    fi
+    while IFS=: read -r user _uid _gid _comment home _shell; do
+        [[ "$user" != root ]] || continue
+        id -nG "$user" 2>/dev/null | grep -Eq '(^| )(sudo|admin)( |$)' || continue
+        candidate="$home/.ssh/authorized_keys"
+        if [[ -f "$candidate" && ! -L "$candidate" ]] && grep -Eq '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$candidate"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done < /etc/passwd
+    return 1
+}
+
+apply_ssh_hardening() {
+    CURRENT_STEP="apply SSH hardening"
+    local confirmation="${1:-}" key_file
+    [[ "$confirmation" == --confirm-lockout-risk ]] || die "Impact: disable root/password/keyboard-interactive SSH logins after validating an admin public key. Re-run with --confirm-lockout-risk from an active SSH session."
+    [[ -n "${SSH_CONNECTION:-}" ]] || die "Refusing SSH hardening without an active SSH connection. Use the provider console for first access."
+    key_file="$(authorized_admin_key_file)" || die "No usable public key was found for a non-root sudo administrator. SSH was not changed."
+    install -d -m 0755 /etc/ssh/sshd_config.d
+    transaction_begin "$CURRENT_STEP"
+    transaction_mark_service sshd
+    write_managed_file /etc/ssh/sshd_config.d/99-wp-shell-hardening.conf 0644 root root <<'EOF'
+# Managed by wp-shell. Keep site-specific Match blocks in a separate file.
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+X11Forwarding no
+MaxAuthTries 3
+LoginGraceTime 30
+EOF
+    if [[ "$DRY_RUN" == no ]]; then
+        sshd -t || die "sshd rejected the hardening drop-in; the transaction will be rolled back."
+        systemctl reload ssh 2>/dev/null || systemctl reload sshd
+    fi
+    log_message SUCCESS "SSH hardening applied after verifying $key_file. The current established connection was not terminated."
+}
+
+ufw_rule_present() {
+    local expression="$1"
+    ufw status 2>/dev/null | grep -Eq "$expression"
+}
+
+apply_firewall_policy() {
+    CURRENT_STEP="apply UFW policy"
+    local confirmation="${1:-}" ssh_port
+    [[ "$confirmation" == --confirm ]] || die "Impact: set default-deny inbound and add rate-limited SSH plus HTTP/HTTPS rules. Existing unrelated rules are reported but not deleted. Re-run with --confirm."
+    ssh_port="$(detect_ssh_port)"
+    [[ "$ssh_port" =~ ^[0-9]+$ && "$ssh_port" -ge 1 && "$ssh_port" -le 65535 ]] || die "Could not determine a valid SSH port."
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        [[ "${SSH_CONNECTION##* }" == "$ssh_port" ]] || die "The active SSH destination port differs from sshd's effective port; UFW was not changed."
+    fi
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw_rule_present "^${ssh_port}/tcp[[:space:]]+LIMIT" || ufw limit "${ssh_port}/tcp" comment 'SSH rate limit managed by wp-shell'
+    ufw_rule_present '^80/tcp[[:space:]]+ALLOW' || ufw allow 80/tcp comment 'HTTP managed by wp-shell'
+    ufw_rule_present '^443/tcp[[:space:]]+ALLOW' || ufw allow 443/tcp comment 'HTTPS managed by wp-shell'
+    ufw --force enable
+    log_message SUCCESS "UFW default-deny is active with SSH $ssh_port rate limiting and ports 80/443. Existing unrelated rules were preserved for lockout safety; review 'ufw status numbered'."
+}
+
+configure_aide() {
+    CURRENT_STEP="configure AIDE weekly audit"
+    local confirmation="${1:-}" aide_timer
+    [[ "$confirmation" == --confirm ]] || die "Impact: install AIDE configuration and one low-priority weekly integrity check; no initial database or check is run. Re-run with --confirm."
+    apt-get update
+    apt_install aide
+    install -d -m 0755 /etc/aide/aide.conf.d /etc/cron.d
+    write_managed_file /etc/aide/aide.conf.d/99_wp_shell 0644 root root <<'EOF'
+# Managed by wp-shell. Mutable WordPress data is intentionally excluded.
+!/var/www/.*/public/wp-content/uploads
+!/var/www/.*/public/wp-content/cache
+!/var/www/.*/cache
+!/var/www/.*/backups
+!/var/www/.*/public/.*/wp-content/uploads
+!/var/www/.*/public/.*/wp-content/cache
+EOF
+    write_managed_file /etc/cron.d/wp-shell-aide 0644 root root <<'EOF'
+SHELL=/bin/sh
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+17 3 * * 0 root timeout 30m nice -n 19 ionice -c3 aide --check >>/var/log/wp-shell/aide-check.log 2>&1
+EOF
+    for aide_timer in wp-shell-aide.timer aidecheck.timer dailyaidecheck.timer; do
+        if systemctl list-unit-files "$aide_timer" >/dev/null 2>&1; then systemctl disable --now "$aide_timer"; fi
+    done
+    log_message SUCCESS "AIDE weekly cron installed. Initialize its database manually after reviewing exclusions; no check was started."
+}
+
+configure_external_mail() {
+    CURRENT_STEP="restrict Postfix to loopback"
+    local confirmation="${1:-}" stage
+    [[ "$confirmation" == --confirm-external-mail ]] || die "Impact: make local Postfix listen only on loopback because WordPress uses a confirmed external provider such as Amazon SES. No mail is sent. Re-run with --confirm-external-mail."
+    command -v postconf >/dev/null 2>&1 || die "Postfix is not installed; nothing was changed."
+    stage="$(safe_temp_dir)"
+    register_temp_path "$stage"
+    cp -a /etc/postfix/. "$stage/"
+    postconf -c "$stage" -e 'inet_interfaces = loopback-only'
+    postfix -c "$stage" check
+    transaction_begin "$CURRENT_STEP"
+    transaction_mark_service postfix
+    write_managed_file /etc/postfix/main.cf 0644 root root < "$stage/main.cf"
+    postfix check
+    systemctl reload postfix
+    set_host_policy external-mail confirmed
+    rm -rf -- "$stage"
+    log_message SUCCESS "Postfix now listens on loopback only. No test message was sent."
+}
+
 system_command() {
     case "${1:-audit}" in
         audit) system_audit ;;
-        updates) [[ "${2:-}" == enable ]] || die "Usage: wp-shell system updates enable"; enable_security_updates ;;
+        updates) [[ "${2:-}" == enable ]] || die "Usage: wp-shell system updates enable --confirm"; enable_security_updates "${3:-}" ;;
         logs) [[ "${2:-}" == install ]] || die "Usage: wp-shell system logs install"; configure_log_rotation ;;
         wp-cli) [[ "${2:-}" == verify ]] || die "Usage: wp-shell system wp-cli verify"; install_wp_cli --verify ;;
-        *) die "Usage: wp-shell system audit | system updates enable" ;;
+        ssh) [[ "${2:-}" == apply ]] || die "Usage: wp-shell system ssh apply --confirm-lockout-risk"; apply_ssh_hardening "${3:-}" ;;
+        firewall) [[ "${2:-}" == apply ]] || die "Usage: wp-shell system firewall apply --confirm"; apply_firewall_policy "${3:-}" ;;
+        aide) [[ "${2:-}" == apply ]] || die "Usage: wp-shell system aide apply --confirm"; configure_aide "${3:-}" ;;
+        mail) [[ "${2:-}" == external ]] || die "Usage: wp-shell system mail external --confirm-external-mail"; configure_external_mail "${3:-}" ;;
+        *) die "Usage: wp-shell system audit|updates|logs|wp-cli|ssh|firewall|aide|mail" ;;
+    esac
+}
+
+validate_managed_stack() {
+    local version
+    command -v nginx >/dev/null 2>&1 && nginx -t
+    while IFS= read -r version; do
+        [[ -n "$version" && -x "/usr/sbin/php-fpm$version" ]] || continue
+        "php-fpm$version" -t
+    done < <(unique_php_versions)
+    command -v sshd >/dev/null 2>&1 && sshd -t
+}
+
+wordpress_queue_status() {
+    local domain="$1" due="unknown" prefix table pending="unknown" failed="unknown"
+    due="$(site_wp_cli_readonly "$domain" cron event list --due-now --format=count 2>/dev/null || printf unknown)"
+    prefix="$(site_wp_cli_readonly "$domain" db prefix 2>/dev/null || true)"
+    if [[ "$prefix" =~ ^[A-Za-z0-9_]{1,48}$ ]]; then
+        table="${prefix}actionscheduler_actions"
+        if site_wp_cli_readonly "$domain" db query "SHOW TABLES LIKE '$table';" --skip-column-names 2>/dev/null | grep -Fxq "$table"; then
+            pending="$(site_wp_cli_readonly "$domain" db query "SELECT COUNT(*) FROM $table WHERE status='pending';" --skip-column-names 2>/dev/null || printf unknown)"
+            failed="$(site_wp_cli_readonly "$domain" db query "SELECT COUNT(*) FROM $table WHERE status='failed';" --skip-column-names 2>/dev/null || printf unknown)"
+        else
+            pending=not-installed
+            failed=not-installed
+        fi
+    fi
+    printf '  Queues: wp-cron-due=%s action-scheduler-pending=%s failed=%s\n' "$due" "$pending" "$failed"
+}
+
+backup_public_probe() {
+    local index="$1" domain primary code
+    domain="${SITE_DOMAINS[$index]}"
+    primary="${SITE_PRIMARY_DOMAINS[$index]}"
+    [[ -s "/etc/letsencrypt/live/$domain/fullchain.pem" ]] || { printf 'not-tested(no-certificate)'; return; }
+    code="$(curl --noproxy '*' --silent --insecure --output /dev/null --max-time 5 --write-out '%{http_code}' \
+        --resolve "$primary:443:127.0.0.1" "https://$primary/backups/wp-shell-audit.zip" 2>/dev/null || printf 000)"
+    case "$code" in 403|404) printf 'blocked(%s)' "$code" ;; *) printf 'review(%s)' "$code" ;; esac
+}
+
+control_plane_status() {
+    local version
+    printf 'wp-shell %s control-plane status\n' "$WP_SHELL_VERSION"
+    printf 'Environment: mode=%s PHP=%s sites=%s Cloudflare=%s\n' \
+        "${ENVIRONMENT_MODE:-unconfigured}" "$DEFAULT_PHP_VERSION" "$SITE_COUNT" "$(host_policy_value cloudflare disabled)"
+    printf 'Services: nginx=%s mariadb=%s redis=%s fail2ban=%s\n' \
+        "$(service_state nginx)" "$(service_state mariadb)" "$(service_state redis-server)" "$(service_state fail2ban)"
+    while IFS= read -r version; do
+        [[ -n "$version" ]] || continue
+        printf 'PHP %s FPM: %s\n' "$version" "$(service_state "php${version}-fpm")"
+    done < <(unique_php_versions)
+    printf 'Timers: metrics=%s backup=%s certificate=%s Cloudflare=%s\n' \
+        "$(service_state wp-shell-metrics.timer)" "$(service_state wp-shell-backup.timer)" \
+        "$(service_state certbot.timer)" "$(service_state wp-shell-cloudflare-ips.timer)"
+    printf 'Failed units: '
+    systemctl --failed --no-legend --plain 2>/dev/null | awk 'END{print NR+0}'
+    printf 'Last transaction: %s\n' "$(if [[ -s "$LAST_TRANSACTION_FILE" ]]; then head -n1 "$LAST_TRANSACTION_FILE"; else printf none; fi)"
+}
+
+control_plane_audit() {
+    local i domain wp_config mode owner group redis_info db_threads db_max severe_log_count=0 log_file php_pressure
+    printf 'wp-shell audit (read-only; no task, email, form, update, deletion or service reload)\n\n'
+    if validate_managed_stack >/dev/null 2>&1; then host_audit_line PASS Config-syntax 'Nginx, installed PHP-FPM and sshd candidates validate.'
+    else host_audit_line WARN Config-syntax 'At least one Nginx/PHP-FPM/sshd validation failed.'; fi
+    system_audit
+    printf '\nRuntime capacity\n'
+    free -m
+    swapon --show 2>/dev/null || true
+    df -h / /var/www
+    if [[ -s "$REDIS_SECRET_FILE" ]]; then
+        redis_info="$(REDISCLI_AUTH="$(<"$REDIS_SECRET_FILE")" timeout 4s redis-cli --no-auth-warning INFO memory stats 2>/dev/null || true)"
+        printf 'Redis used/max/evicted: %s / %s / %s\n' \
+            "$(awk -F: '$1=="used_memory_human"{gsub(/\r/,"",$2);print $2}' <<< "$redis_info")" \
+            "$(awk -F: '$1=="maxmemory_human"{gsub(/\r/,"",$2);print $2}' <<< "$redis_info")" \
+            "$(awk -F: '$1=="evicted_keys"{gsub(/\r/,"",$2);print $2}' <<< "$redis_info")"
+    fi
+    db_threads="$(mariadb -NBe "SHOW GLOBAL STATUS LIKE 'Threads_connected';" 2>/dev/null | awk '{print $2}' || true)"
+    db_max="$(mariadb -NBe "SELECT @@max_connections;" 2>/dev/null || true)"
+    printf 'MariaDB connections: %s/%s\n' "${db_threads:-unknown}" "${db_max:-unknown}"
+    printf '\nWordPress sites\n'
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        wp_config="$(site_wp_path "$domain")/wp-config.php"
+        if [[ -f "$wp_config" ]]; then
+            read -r mode owner group < <(stat -c '%a %U %G' "$wp_config")
+        else
+            mode=missing; owner=unknown; group=unknown
+        fi
+        printf '%s: wp-config=%s:%s:%s TLS=%s backup-public=%s\n' "$domain" "$mode" "$owner" "$group" \
+            "$(site_tls_expiry "$domain")" "$(backup_public_probe "$i")"
+        if [[ -s "$METRICS_DB" ]]; then
+            php_pressure="$(sqlite3 -separator / "$METRICS_DB" "SELECT php_active,php_max_children,php_queue FROM site_samples WHERE domain='$domain' ORDER BY ts DESC LIMIT 1;" 2>/dev/null || true)"
+            printf '  PHP active/max/queue: %s\n' "${php_pressure:-unknown}"
+        fi
+        wordpress_queue_status "$domain"
+        printf '  Policies: HSTS=%s XML-RPC=%s login-limit=%s staging=%s\n' \
+            "$(site_policy_value "$domain" hsts disabled)" "$(site_policy_value "$domain" xmlrpc disabled)" \
+            "$(site_policy_value "$domain" login-limit disabled)" "$(site_policy_value "$domain" staging-path none)"
+    done
+    printf '\nRecent severe log tail (up to 2,000 lines per file; counts only)\n'
+    for log_file in /var/log/nginx/error.log /var/log/mysql/error.log /var/log/redis/redis-server.log /var/www/*/logs/php-error.log; do
+        [[ -f "$log_file" ]] || continue
+        severe_log_count="$(tail -n 2000 "$log_file" 2>/dev/null | grep -Eci 'fatal|panic|emerg|crit|out of memory|allowed memory size|server reached pm.max_children' || true)"
+        printf '%s: %s\n' "$log_file" "$severe_log_count"
+    done
+    printf '\nCloudflare Web attacks: use Nginx verified-IP rate limiting and, when needed, a separately managed application firewall or Cloudflare WAF. Standard nftables Fail2ban jails cannot ban the real visitor through Cloudflare. API blocking remains disabled unless a separate token is explicitly supplied.\n'
+}
+
+control_plane_plan() {
+    local i domain version
+    printf 'wp-shell apply plan (no changes)\n'
+    printf '  Host: Nginx global/default-host/log format, PHP baseline, loopback Redis/MariaDB, SSH-only Fail2ban, logrotate and certificate hook.\n'
+    printf '  Excluded: SSH hardening, UFW reconciliation, AIDE install, Cloudflare enablement, plugin/theme updates, due tasks, email tests, backup deletion and reboot.\n'
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        [[ "${SITE_MODES[$i]}" == managed ]] || continue
+        printf '  Site %s: Nginx security/cache template, production constants and bounded permissions.\n' "$domain"
+    done
+    while IFS= read -r version; do [[ -z "$version" ]] || printf '  Validate/reload PHP %s FPM if its managed fingerprint changes.\n' "$version"; done < <(unique_php_versions)
+    printf '  Every changed file receives a timestamp/transaction backup; candidates are atomically installed and syntax-validated.\n'
+}
+
+apply_wordpress_baseline() {
+    local i domain wp_config
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        [[ "${SITE_MODES[$i]}" == managed ]] || continue
+        domain="${SITE_DOMAINS[$i]}"
+        wp_config="$(site_wp_path "$domain")/wp-config.php"
+        [[ -f "$wp_config" && ! -L "$wp_config" ]] || continue
+        transaction_begin "$CURRENT_STEP"
+        [[ "$TRANSACTION_ACTIVE" != yes ]] || transaction_backup_file "$wp_config"
+        site_wp_cli "$domain" config set WP_DEBUG false --raw
+        site_wp_cli "$domain" config set DISALLOW_FILE_EDIT true --raw
+        site_wp_cli "$domain" config set FORCE_SSL_ADMIN true --raw
+        site_wp_cli "$domain" config set WP_ENVIRONMENT_TYPE production
+        if [[ "$(site_policy_value "$domain" cron-mode request)" == system ]]; then
+            site_wp_cli "$domain" config set DISABLE_WP_CRON true --raw
+        fi
+        chmod "$(site_config_mode "$domain")" "$wp_config"
+    done
+}
+
+apply_control_plane() {
+    local confirmation="${1:-}" i
+    [[ "$confirmation" == --confirm ]] || { control_plane_plan; die "Impact: rewrite managed service/site configuration and gracefully reload affected services. Re-run with: wp-shell apply --confirm"; }
+    CURRENT_STEP="apply audited baseline"
+    control_plane_plan
+    configure_mariadb
+    configure_redis
+    configure_php
+    configure_fail2ban
+    configure_log_rotation
+    install_certbot_deploy_hook
+    install_nginx_log_format
+    disable_distribution_nginx_default
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        [[ "${SITE_MODES[$i]}" == managed && -s "/etc/letsencrypt/live/${SITE_DOMAINS[$i]}/fullchain.pem" ]] || continue
+        configure_https_site "$i"
+    done
+    apply_wordpress_baseline
+    validate_managed_stack
+    systemctl reload nginx
+    log_message SUCCESS "Audited baseline applied. SSH/UFW/AIDE/Cloudflare remain separate explicit operations."
+}
+
+rollback_command() {
+    local transaction_id="${1:-}" confirmation="${2:-}" path
+    if [[ -z "$transaction_id" || "$transaction_id" == --confirm ]]; then
+        [[ -s "$LAST_TRANSACTION_FILE" ]] || die "No last transaction is recorded."
+        confirmation="${1:-}"
+        transaction_id="$(head -n1 "$LAST_TRANSACTION_FILE")"
+    fi
+    [[ "$transaction_id" =~ ^[0-9]{8}T[0-9]{6}Z-[a-z0-9-]+\.[A-Za-z0-9]+$ ]] || die "Invalid transaction ID."
+    [[ "$confirmation" == --confirm ]] || die "Impact: restore every file recorded before transaction $transaction_id and reload affected services. Re-run with --confirm."
+    path="$TRANSACTION_DIR/$transaction_id"
+    [[ -d "$path" && ! -L "$path" ]] || die "Transaction not found: $transaction_id"
+    transaction_rollback_internal "$path" manual
+    validate_managed_stack
+}
+
+dry_run_command() {
+    DRY_RUN=yes
+    case "${1:-apply}" in
+        apply) control_plane_plan ;;
+        *) die "Usage: wp-shell dry-run apply" ;;
     esac
 }
 
@@ -4443,8 +5473,8 @@ security_scan() {
         if [[ -f "$wp_config" ]]; then
             perms="$(stat -c '%a' "$wp_config")"
             [[ "$perms" == "640" || "$perms" == "600" ]] || { log_message WARNING "$wp_config has permissions $perms."; failed=$((failed + 1)); }
-            if [[ "$(site_run_user "$domain")" != www-data && "$perms" != 600 ]]; then
-                log_message WARNING "$domain uses a dedicated PHP user; wp-config.php must be 600 to exclude legacy www-data sites."
+            if [[ "$(stat -c '%U' "$wp_config")" != root || "$(stat -c '%G' "$wp_config")" != "$(id -gn "$(site_run_user "$domain")")" ]]; then
+                log_message WARNING "$domain wp-config.php must be root-owned and readable only by its PHP group."
                 failed=$((failed + 1))
             fi
             for constant in FORCE_SSL_ADMIN DISALLOW_FILE_EDIT WP_CACHE; do
@@ -4454,6 +5484,10 @@ security_scan() {
                     failed=$((failed + 1))
                 }
             done
+            value="$(site_wp_cli "$domain" config get WP_DEBUG 2>/dev/null || true)"
+            [[ "$value" == 0 || "$value" == false ]] || { log_message WARNING "$domain must have WP_DEBUG disabled."; failed=$((failed + 1)); }
+            value="$(site_wp_cli "$domain" config get WP_ENVIRONMENT_TYPE 2>/dev/null || true)"
+            [[ "$value" == production ]] || { log_message WARNING "$domain main site environment type is not production."; failed=$((failed + 1)); }
             if ! site_wp_cli "$domain" redis status 2>/dev/null | grep -Fq 'Status: Connected'; then
                 log_message WARNING "$domain is not connected to Redis Object Cache."
                 failed=$((failed + 1))
@@ -4467,8 +5501,8 @@ security_scan() {
             failed=$((failed + 1))
         fi
         [[ -s "/etc/letsencrypt/live/$domain/fullchain.pem" ]] || { log_message ERROR "$domain has no certificate."; failed=$((failed + 1)); }
-        if [[ "$(site_policy_value "$domain" cron-mode)" == system ]] && ! systemctl is-active --quiet "wp-shell-cron-$(site_pool_id "$domain").timer"; then
-            log_message ERROR "$domain has managed WP-Cron enabled but its timer is inactive."
+        if [[ "$(site_policy_value "$domain" cron-mode)" == system ]] && [[ ! -s "/etc/cron.d/wp-shell-$(site_pool_id "$domain")" ]]; then
+            log_message ERROR "$domain has managed WP-Cron enabled but its Cron file is missing."
             failed=$((failed + 1))
         fi
         if [[ "$(site_policy_value "$domain" cache-auto)" == enabled ]]; then
@@ -4482,12 +5516,14 @@ security_scan() {
             --resolve "$primary:443:127.0.0.1" "https://$primary/wp-login.php" 2>/dev/null | tr -d '\r' || true)"
         public_headers="$(curl --silent --show-error --output /dev/null --dump-header - --max-time 5 \
             "https://$primary/wp-login.php" 2>/dev/null | tr -d '\r' || true)"
-        if ! headers_have_managed_hsts "$origin_headers"; then
-            log_message WARNING "$domain origin does not return the managed HSTS policy."
-            failed=$((failed + 1))
-        elif ! headers_have_managed_hsts "$public_headers"; then
-            log_message WARNING "$domain public endpoint overrides or removes the managed HSTS policy; check its CDN or reverse proxy."
-            failed=$((failed + 1))
+        if [[ "$(site_policy_value "$domain" hsts disabled)" == enabled ]]; then
+            if ! headers_have_managed_hsts "$origin_headers"; then
+                log_message WARNING "$domain origin does not return its explicitly enabled HSTS policy."
+                failed=$((failed + 1))
+            elif ! headers_have_managed_hsts "$public_headers"; then
+                log_message WARNING "$domain public endpoint overrides or removes HSTS; check Cloudflare or another reverse proxy."
+                failed=$((failed + 1))
+            fi
         fi
         credentials_file="$(site_credentials_file "$domain")"
         if [[ -e "$credentials_file" && "$(stat -c '%a' "$credentials_file")" != "600" ]]; then
@@ -4710,7 +5746,7 @@ management_menu() {
     printf '\nwp-shell v%s\n' "$WP_SHELL_VERSION"
     printf 'Environment: installed | Mode: %s | PHP: %s | Sites: %s\n\n' \
         "$ENVIRONMENT_MODE" "$DEFAULT_PHP_VERSION" "$SITE_COUNT"
-    printf '1) Dashboard\n2) Add a new website\n3) Website list\n4) Website status\n5) Deploy or repair a website\n6) Back up one website\n7) Back up all websites\n8) Restore a website\n9) Import existing websites\n10) Traffic and resource report\n11) Analyze resource usage\n12) Apply safe tuning recommendations\n13) Reapply service resource budget\n14) Security scan\n15) Repair backup and metrics timers\n16) OPcache settings\n17) Host security and pressure audit\n18) Advanced operations help\n0) Exit\n'
+    printf '1) Dashboard\n2) Add a new website\n3) Website list\n4) Website status\n5) Deploy or repair a website\n6) Back up one website\n7) Back up all websites\n8) Restore a website\n9) Import existing websites\n10) Traffic and resource report\n11) Analyze resource usage\n12) Apply safe tuning recommendations\n13) Apply audited configuration baseline\n14) Security scan\n15) Repair backup and metrics timers\n16) OPcache settings\n17) Host security and pressure audit\n18) Advanced operations help\n0) Exit\n'
     local choice domain backup_id range
     read -r -p "Select [0-18]: " choice
     case "$choice" in
@@ -4764,7 +5800,11 @@ management_menu() {
             analyze_metrics "${range:-7d}"
             ;;
         12) apply_tuning ;;
-        13) configure_mariadb; configure_redis; configure_php ;;
+        13)
+            control_plane_plan
+            collect_yes_no "Apply this transactional baseline" no || { log_message INFO "No changes were applied."; return; }
+            apply_control_plane --confirm
+            ;;
         14) security_scan ;;
         15) install_self; install_backup_timer; install_metrics_timer ;;
         16) opcache_menu ;;
@@ -4793,6 +5833,11 @@ Usage:
   sudo wp-shell                                 Open the context-aware main menu
   sudo wp-shell install                         Install or repair the server environment
   sudo wp-shell dashboard                       Open the compact SSH dashboard
+  sudo wp-shell audit                           Run the expanded read-only host/site audit
+  sudo wp-shell status                          Show compact control-plane and service status
+  sudo wp-shell dry-run apply                   Show the baseline plan without changing files
+  sudo wp-shell apply --confirm                 Apply the transactional audited baseline
+  sudo wp-shell rollback [ID] --confirm         Restore a committed transaction if files are unchanged
   sudo wp-shell report [1h|6h|24h|7d|14d|30d]   Print a non-interactive metrics report
   sudo wp-shell analyze [range]                  Analyze collected resource evidence
   sudo wp-shell tune --apply [--yes]             Apply safe PHP-FPM recommendations
@@ -4811,18 +5856,27 @@ Usage:
   sudo wp-shell metrics install                  Install the one-minute collector
   sudo wp-shell backup-all                       Back up all sites
   sudo wp-shell restore DOMAIN|ID BACKUP_ID      Restore one backup
-  sudo wp-shell optimize                         Reapply the resource budget
+  sudo wp-shell optimize --confirm               Compatibility alias for the audited baseline apply
   sudo wp-shell rotate-redis-secret              Rotate Redis auth and redact matching logs
+  sudo wp-shell cloudflare enable --confirm      Trust verified official Cloudflare proxy ranges
+  sudo wp-shell cloudflare check SOURCE CLAIMED  Test trusted vs forged CF-Connecting-IP handling
   sudo wp-shell security-scan                    Validate services, TLS, and permissions
   sudo wp-shell system audit                     Read-only host security/pressure review
-  sudo wp-shell system updates enable            Opt in to unattended security updates
+  sudo wp-shell system updates enable --confirm  Opt in to unattended security updates
   sudo wp-shell system logs install              Install operation/site log rotation
   sudo wp-shell system wp-cli verify             Verify and reinstall signed WP-CLI
+  sudo wp-shell system ssh apply --confirm-lockout-risk
+  sudo wp-shell system firewall apply --confirm
+  sudo wp-shell system aide apply --confirm
+  sudo wp-shell system mail external --confirm-external-mail
   sudo wp-shell site DOMAIN nginx-apply           Refresh managed Nginx; preserve custom includes
   sudo wp-shell site DOMAIN cache-clear [page|object|opcache|all]
   sudo wp-shell site DOMAIN cache-auto enable|disable|status
   sudo wp-shell site DOMAIN cache-exclude /staging/
   sudo wp-shell site DOMAIN cron enable|disable|status
+  sudo wp-shell site DOMAIN staging configure ABS_PATH URL_PATH PREFIX|off --confirm
+  sudo wp-shell site DOMAIN hsts enable|disable|status
+  sudo wp-shell site DOMAIN xmlrpc enable|disable|status
   sudo wp-shell site DOMAIN isolate [--yes]       Migrate a legacy site to its own PHP UID
   sudo wp-shell site DOMAIN redis-isolate [MB]    Opt in to a private Redis socket/instance
   sudo wp-shell site DOMAIN login-limit direct|off|status
@@ -4832,9 +5886,10 @@ Usage:
   sudo wp-shell site DOMAIN maintenance on|off|status
 
 Site actions: status, info, summary, core-verify, core-repair, cache-clear,
-backup, backups, restore, update, restart
+backup, backups, restore, update --confirm-updates, restart
 All dashboard text and stored operational metadata are ASCII/English. Access metrics
-exclude client IPs, cookies, and query strings. Raw samples are retained for 30 days.
+exclude cookies and query strings. Verified client/edge IPs remain in rotated Nginx logs
+for security auditing but are not copied into the metrics database. Raw metrics are retained for 30 days.
 EOF
 }
 
@@ -4851,19 +5906,20 @@ deploy_domain() {
 
 site_command() {
     local subcommand="${1:-list}"
+    (($# == 0)) || shift
     case "$subcommand" in
         add) add_site_command ;;
         list) list_sites ;;
         status)
-            if [[ -n "${2:-}" ]]; then
-                site_action "$2" status
+            if [[ -n "${1:-}" ]]; then
+                site_action "$1" status
             else
                 status_all_sites
             fi
             ;;
-        deploy) [[ -n "${2:-}" ]] || die "Usage: wp-shell site deploy DOMAIN|ID"; deploy_domain "$2" ;;
+        deploy) [[ -n "${1:-}" ]] || die "Usage: wp-shell site deploy DOMAIN|ID"; deploy_domain "$1" ;;
         import) import_existing_sites; install_self ;;
-        *) site_action "$subcommand" "${2:-status}" "${3:-}" ;;
+        *) site_action "$subcommand" "$@" ;;
     esac
 }
 
@@ -4897,11 +5953,15 @@ execute_command() {
             install_or_repair_environment
             ;;
         dashboard) dashboard ;;
+        audit) control_plane_audit ;;
+        apply) apply_control_plane "${2:-}" ;;
+        rollback) rollback_command "${2:-}" "${3:-}" ;;
+        dry-run) dry_run_command "${2:-apply}" ;;
         report) metrics_report "${2:-24h}" ;;
         analyze) analyze_metrics "${2:-7d}" ;;
         tune) [[ "${2:-}" == "--apply" ]] || die "Usage: wp-shell tune --apply [--yes] [--range RANGE]"; shift 2; apply_tuning "$@" ;;
         opcache) shift; opcache_command "$@" ;;
-        site) site_command "${2:-list}" "${3:-}" "${4:-}" ;;
+        site) shift; site_command "$@" ;;
         metrics)
             case "${2:-status}" in
                 collect) collect_metrics ;;
@@ -4913,15 +5973,16 @@ execute_command() {
             esac
             ;;
         list) list_sites ;;
-        status) status_all_sites ;;
+        status) control_plane_status ;;
         add-site) add_site_command ;;
         deploy) [[ -n "${2:-}" ]] || die "A site ID or domain is required."; deploy_domain "$2" ;;
         import) import_existing_sites; install_self ;;
         backup-all) backup_all_sites ;;
         backup) shift; backup_command "$@" ;;
         restore) [[ -n "${2:-}" && -n "${3:-}" ]] || die "Usage: restore DOMAIN|ID BACKUP_ID"; site_action "$2" restore "$3" ;;
-        optimize) configure_mariadb; configure_redis; configure_php ;;
+        optimize) [[ "${2:-}" == --confirm ]] || die "'optimize' now applies the audited baseline. Review 'wp-shell dry-run apply', then use 'wp-shell optimize --confirm'."; apply_control_plane --confirm ;;
         rotate-redis-secret) rotate_redis_secret ;;
+        cloudflare) shift; cloudflare_command "$@" ;;
         security-scan) security_scan ;;
         system) shift; system_command "$@" ;;
         cron-run) [[ -n "${2:-}" ]] || die "A managed domain is required."; run_site_cron "$2" ;;
@@ -4947,6 +6008,16 @@ main() {
     check_platform
     require_command base64
     case "${1:-}" in
+        audit|status|dry-run)
+            # These control-plane commands are contractually read-only.  In
+            # particular, do not create state directories, migrate legacy
+            # files, or synthesize an environment configuration here.
+            load_sites_config
+            load_environment_config
+            load_tuning_config
+            load_opcache_config
+            execute_command "$@"
+            ;;
         dashboard|report|analyze|metrics|cron-run|ops)
             init_paths
             migrate_legacy_configs
@@ -4958,12 +6029,14 @@ main() {
             ;;
         *)
             init_runtime
+            TRANSACTION_CONTEXT=yes
             migrate_legacy_configs
             load_sites_config
             ensure_environment_config
             load_tuning_config
             load_opcache_config
             execute_command "$@"
+            transaction_commit
             ;;
     esac
 }
