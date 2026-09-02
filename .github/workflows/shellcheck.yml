@@ -28,6 +28,7 @@ jobs:
           bash tests/menu-routing.sh
           bash tests/opcache-config.sh
           bash tests/php-memory-budget.sh
+          bash tests/restore-transaction.sh
           bash tests/mariadb-legacy.sh
           bash tests/imported-site-reliability.sh
           bash tests/reliability-regression.sh
@@ -54,6 +55,8 @@ jobs:
           /mnt/tests/menu-routing.sh
           /mnt/tests/opcache-config.sh
           /mnt/tests/php-memory-budget.sh
+          /mnt/tests/restore-transaction.sh
+          /mnt/tests/restore-transaction-integration.sh
           /mnt/tests/mariadb-legacy.sh
           /mnt/tests/mariadb-legacy-integration.sh
           /mnt/tests/imported-site-reliability.sh
@@ -85,6 +88,7 @@ jobs:
           'apt-get update >/dev/null &&
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mariadb-server redis-server php8.3-fpm php8.3-cli openssl sqlite3 jq libfcgi-bin sudo acl curl gnupg ca-certificates rsync python3 >/dev/null &&
           bash /mnt/tests/service-config-integration.sh &&
+          bash /mnt/tests/restore-transaction-integration.sh &&
           bash /mnt/tests/operations-integration.sh'
 
       - name: Imported site reliability integration test
