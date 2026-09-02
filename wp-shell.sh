@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 10.0.2
+# Version 10.0.3
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="10.0.2"
+readonly WP_SHELL_VERSION="10.0.3"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -2504,7 +2504,7 @@ detect_ssh_port() {
         port="${SSH_CONNECTION##* }"
     fi
     if [[ ! "$port" =~ ^[0-9]+$ ]] && command -v sshd >/dev/null 2>&1; then
-        port="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
+        port="$(sshd -T 2>/dev/null | awk '$1 == "port" && first == "" {first=$2} END {if (first != "") print first}')"
     fi
     [[ "$port" =~ ^[0-9]+$ ]] || port=22
     printf '%s' "$port"
@@ -3015,11 +3015,31 @@ ensure_site_storage() {
     migrate_legacy_backups "$LEGACY_SINGLE_BACKUP_ROOT/$domain" "$backup_dir"
 }
 
-site_wp_cli() {
-    local domain="$1" index wp_path site_home wp_cli_home run_user run_group php_binary status=0 config_write=no
+site_wp_config_path_is_safe() {
+    local wp_path="$1" wp_config canonical_path canonical_config
+    wp_config="$wp_path/wp-config.php"
+    [[ "$wp_path" == /* && "$wp_path" != / && -d "$wp_path" && ! -L "$wp_path" ]] || return 1
+    canonical_path="$(readlink -f -- "$wp_path")" || return 1
+    [[ "$canonical_path" == "$wp_path" && -f "$wp_config" && ! -L "$wp_config" ]] || return 1
+    canonical_config="$(readlink -f -- "$wp_config")" || return 1
+    [[ "$canonical_config" == "$wp_config" ]]
+}
+
+site_wp_path_accepts_new_config() {
+    local wp_path="$1" wp_config canonical_path
+    wp_config="$wp_path/wp-config.php"
+    [[ "$wp_path" == /* && "$wp_path" != / && -d "$wp_path" && ! -L "$wp_path" ]] || return 1
+    canonical_path="$(readlink -f -- "$wp_path")" || return 1
+    [[ "$canonical_path" == "$wp_path" && ! -e "$wp_config" && ! -L "$wp_config" ]]
+}
+
+site_wp_cli() (
+    local domain="$1" index wp_path wp_config site_home wp_cli_home run_user run_group php_binary
+    local status=0 config_write=no config_operation="" config_existed=no restore_status=0
     shift
     index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
     wp_path="${SITE_PATHS[$index]}"
+    wp_config="$wp_path/wp-config.php"
     site_home="/var/www/$domain"
     wp_cli_home="$(site_wp_cli_home "$domain")"
     run_user="$(site_run_user "$domain")"
@@ -3027,20 +3047,66 @@ site_wp_cli() {
     php_binary="/usr/bin/php${SITE_PHP_VERSIONS[$index]}"
     [[ -x "$php_binary" ]] || die "Missing PHP CLI for ${SITE_PHP_VERSIONS[$index]}."
     install -d -o "$run_user" -g "$(id -gn "$run_user")" -m 0700 "$wp_cli_home" "$wp_cli_home/cache"
-    if [[ "${1:-}" == config && ("${2:-}" == set || "${2:-}" == delete || "${2:-}" == create) ]]; then config_write=yes; fi
-    (
-        cd "$wp_path"
-        timeout "${WP_SHELL_WP_TIMEOUT:-600}s" sudo -u "$run_user" env \
-            HOME="$site_home" \
-            WP_CLI_CACHE_DIR="$wp_cli_home/cache" \
-            "$php_binary" /usr/local/bin/wp --path="$wp_path" "$@"
-    ) || status=$?
-    if [[ "$config_write" == yes && -f "$wp_path/wp-config.php" && ! -L "$wp_path/wp-config.php" ]]; then
-        chown root:"$run_group" "$wp_path/wp-config.php"
-        chmod 0640 "$wp_path/wp-config.php"
+
+    if [[ "${1:-}" == config && ("${2:-}" == set || "${2:-}" == delete || "${2:-}" == create) ]]; then
+        config_write=yes
+        config_operation="${2:-}"
     fi
-    return "$status"
-}
+
+    # Invoked indirectly by the EXIT trap below.
+    # shellcheck disable=SC2317,SC2329
+    restore_site_wp_config() {
+        local command_status=$?
+        trap - EXIT HUP INT TERM
+        if [[ "$config_write" == yes && (-e "$wp_config" || -L "$wp_config") ]]; then
+            if ! site_wp_config_path_is_safe "$wp_path"; then
+                log_message ERROR "Refusing to harden an unsafe wp-config.php path for $domain." >&2
+                restore_status=1
+            else
+                chown root:"$run_group" -- "$wp_config" || restore_status=1
+                chmod 0640 -- "$wp_config" || restore_status=1
+                if [[ "$(stat -c '%a %U %G' -- "$wp_config" 2>/dev/null || true)" != "640 root $run_group" ]]; then
+                    restore_status=1
+                fi
+            fi
+        elif [[ "$config_write" == yes && "$config_existed" == yes ]]; then
+            log_message ERROR "wp-config.php disappeared while WP-CLI was running for $domain." >&2
+            restore_status=1
+        fi
+        if ((restore_status != 0)); then
+            log_message ERROR "Could not restore secure wp-config.php ownership and mode for $domain." >&2
+            exit 1
+        fi
+        exit "$command_status"
+    }
+
+    if [[ "$config_write" == yes ]]; then
+        trap restore_site_wp_config EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        if [[ -e "$wp_config" || -L "$wp_config" ]]; then
+            config_existed=yes
+            site_wp_config_path_is_safe "$wp_path" || \
+                die "Refusing a WP-CLI config write through an unsafe WordPress path or wp-config.php symlink."
+            chown root:"$run_group" -- "$wp_config"
+            chmod 0660 -- "$wp_config"
+            [[ "$(stat -c '%a %U %G' -- "$wp_config")" == "660 root $run_group" ]] || \
+                die "Could not open the restricted wp-config.php write window for $domain."
+        else
+            [[ "$config_operation" == create ]] || die "Missing wp-config.php for $domain."
+            site_wp_path_accepts_new_config "$wp_path" || \
+                die "Refusing to create wp-config.php through an unsafe WordPress path."
+        fi
+    fi
+
+    cd "$wp_path"
+    timeout "${WP_SHELL_WP_TIMEOUT:-600}s" sudo -u "$run_user" env \
+        HOME="$site_home" \
+        WP_CLI_CACHE_DIR="$wp_cli_home/cache" \
+        "$php_binary" /usr/local/bin/wp --path="$wp_path" "$@" || status=$?
+    exit "$status"
+)
 
 # Read-only WP-CLI queries must not create a per-site cache or repair its
 # ownership.  Keep packages and downloads disabled so audit/status paths do
@@ -3346,6 +3412,8 @@ install_wordpress_site() {
     if [[ "${SITE_WOOCOMMERCE[$index]}" == "yes" ]]; then
         site_wp_cli "$domain" plugin install woocommerce --activate
     fi
+    site_wp_cli "$domain" core is-installed >/dev/null || \
+        die "WordPress did not pass the final installation check for $domain."
     set_site_permissions "$domain"
 }
 
@@ -3368,9 +3436,8 @@ install_self() {
 }
 
 deploy_site() {
-    local index="$1" domain initial_mode
+    local index="$1" domain
     domain="${SITE_DOMAINS[$index]}"
-    initial_mode="${SITE_MODES[$index]}"
     log_message INFO "Deploying $domain with PHP ${SITE_PHP_VERSIONS[$index]}."
     create_site_directories "$domain" "${SITE_PATHS[$index]}"
     if [[ ! -f "${SITE_PATHS[$index]}/wp-config.php" ]]; then
@@ -3381,9 +3448,6 @@ deploy_site() {
     fi
     issue_ssl_certificate "$index"
     configure_https_site "$index"
-    if [[ "$initial_mode" == "imported" ]]; then
-        set_site_permissions "$domain"
-    fi
     install_wordpress_site "$index"
     clear_site_cache "$index"
     SITE_MODES[index]="managed"
@@ -4794,7 +4858,12 @@ tls_days_remaining() {
 
 backup_age_hours() {
     local directory="$1" latest now
-    latest="$(find "$directory" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' -printf '%T@\n' 2>/dev/null | sort -nr | head -n1 | cut -d. -f1)"
+    [[ -d "$directory" && ! -L "$directory" ]] || { printf '%s' '-1'; return; }
+    if ! latest="$(find "$directory" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' -printf '%T@\n' 2>/dev/null |
+        awk 'BEGIN {latest=-1} $1 + 0 > latest {latest=int($1)} END {if (latest >= 0) print latest}')"; then
+        printf '%s' '-1'
+        return
+    fi
     [[ "$latest" =~ ^[0-9]+$ ]] || { printf '%s' '-1'; return; }
     now="$(date +%s)"
     awk -v n="$now" -v t="$latest" 'BEGIN{printf "%.1f",(n-t)/3600}'
@@ -5578,6 +5647,57 @@ status_all_sites() {
     done
 }
 
+detect_site_php_version_from_nginx() {
+    local domain="$1" wp_path="$2" config version
+    local -a configs=()
+    [[ -d /etc/nginx/sites-enabled ]] || return 1
+    mapfile -d '' -t configs < <(
+        find /etc/nginx/sites-enabled -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null
+    )
+    for config in "${configs[@]}"; do
+        [[ -f "$config" ]] || continue
+        if ! awk -v expected_root="$wp_path" -v expected_domain="$domain" '
+            {
+                line=$0
+                sub(/[[:space:]]*#.*/, "", line)
+                $0=line
+                if ($1 == "root") {
+                    value=$2
+                    sub(/;$/, "", value)
+                    if (value == expected_root) matched=1
+                } else if ($1 == "server_name") {
+                    for (i=2; i<=NF; i++) {
+                        value=$i
+                        sub(/;$/, "", value)
+                        if (value == expected_domain || value == "www." expected_domain) matched=1
+                    }
+                }
+            }
+            END {exit !matched}
+        ' "$config"; then
+            continue
+        fi
+        version="$(awk '
+            {
+                line=$0
+                while (match(line, /php[0-9]+[.][0-9]+-fpm/)) {
+                    value=substr(line, RSTART, RLENGTH)
+                    sub(/^php/, "", value)
+                    sub(/-fpm$/, "", value)
+                    if (first == "") first=value
+                    line=substr(line, RSTART + RLENGTH)
+                }
+            }
+            END {if (first != "") print first}
+        ' "$config")"
+        if validate_php_version "$version"; then
+            printf '%s' "$version"
+            return 0
+        fi
+    done
+    return 1
+}
+
 import_existing_sites() {
     CURRENT_STEP="detect existing WordPress sites"
     if ! command -v wp >/dev/null 2>&1; then
@@ -5606,8 +5726,12 @@ import_existing_sites() {
         domain="${host#www.}"
         validate_domain "$domain" || continue
         site_index_by_domain "$domain" >/dev/null 2>&1 && continue
-        php_version="$(grep -RhoE 'php[0-9]+\.[0-9]+-fpm' /etc/nginx/sites-enabled 2>/dev/null | head -n 1 | sed -E 's/php([0-9]+\.[0-9]+)-fpm/\1/' || true)"
-        validate_php_version "$php_version" || php_version="8.3"
+        php_version="$(detect_site_php_version_from_nginx "$domain" "$wp_path" || true)"
+        if ! validate_php_version "$php_version"; then
+            validate_php_version "$DEFAULT_PHP_VERSION" || \
+                die "The configured default PHP version is invalid: $DEFAULT_PHP_VERSION"
+            php_version="$DEFAULT_PHP_VERSION"
+        fi
         next_index=$((SITE_COUNT + 1))
         redis_db="$(first_available_redis_database)" || die "No Redis database is available; at most 16 sites can be imported."
         www=no
@@ -5637,6 +5761,24 @@ headers_have_managed_hsts() {
     local headers="$1"
     grep -Eqi '^strict-transport-security:[[:space:]]*max-age=15552000([;[:space:]]|$)' <<< "$headers" &&
         ! grep -Eqi '^strict-transport-security:[[:space:]]*max-age=0([;[:space:]]|$)' <<< "$headers"
+}
+
+wp_debug_value_is_false() {
+    case "${1-}" in
+        ""|0|false) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Return 0 only when WP-CLI successfully read a semantically false value.
+# Return 1 for a successfully read enabled/invalid value and 2 when the
+# security probe itself failed, so an empty failure cannot be treated as safe.
+wp_debug_probe() {
+    local domain="$1" value
+    if ! value="$(site_wp_cli "$domain" config get WP_DEBUG 2>/dev/null)"; then
+        return 2
+    fi
+    wp_debug_value_is_false "$value"
 }
 
 host_audit_line() {
@@ -6039,7 +6181,7 @@ dry_run_command() {
 
 security_scan() {
     local failed=0 i domain primary wp_config perms version constant value credentials_file
-    local origin_headers public_headers redis_secret
+    local origin_headers public_headers redis_secret wp_debug_status
     for service in nginx mariadb redis-server fail2ban; do
         if ! systemctl is-active --quiet "$service"; then
             log_message ERROR "$service is not running."
@@ -6072,8 +6214,17 @@ security_scan() {
                     failed=$((failed + 1))
                 }
             done
-            value="$(site_wp_cli "$domain" config get WP_DEBUG 2>/dev/null || true)"
-            [[ "$value" == 0 || "$value" == false ]] || { log_message WARNING "$domain must have WP_DEBUG disabled."; failed=$((failed + 1)); }
+            if wp_debug_probe "$domain"; then
+                :
+            else
+                wp_debug_status=$?
+                if ((wp_debug_status == 2)); then
+                    log_message WARNING "$domain WP_DEBUG could not be verified because the WP-CLI probe failed."
+                else
+                    log_message WARNING "$domain has an enabled or invalid WP_DEBUG value."
+                fi
+                failed=$((failed + 1))
+            fi
             value="$(site_wp_cli "$domain" config get WP_ENVIRONMENT_TYPE 2>/dev/null || true)"
             [[ "$value" == production ]] || { log_message WARNING "$domain main site environment type is not production."; failed=$((failed + 1)); }
             if [[ "$(site_policy_value "$domain" object-cache disabled)" == enabled ]] && \

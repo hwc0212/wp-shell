@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v10.0.2
+- 当前版本：`wp-shell.sh` v10.0.3
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -88,6 +88,12 @@ sudo wp-shell apply --confirm
 迁移会从识别出的旧版 `50-wordpress.cnf` 中移除 `innodb_buffer_pool_size`、`max_connections`、`tmp_table_size`、`max_heap_table_size` 四项；对当前 wp-shell 管理的 `60-wp-shell.cnf` 则逐项使用同一低内存风险策略，只移除该定义本身已被判定为危险的行，安全的已有调优值和无关内容保持原样。迁移不会用另一组百分比覆盖旧值，不删除配置文件，也不会因为另一个旧文件存在风险而清空安全的受管调优。候选片段和完整配置都必须通过 MariaDB 解析，事务会保存文件原始内容、权限和所有者。只有配置的实际生效值发生变化才重启 MariaDB；重启、健康检查或 runtime 对照失败时自动恢复精确旧文件并尝试恢复服务。
 
 未知管理员文件永远不会被迁移命令自动删除或改写。如果危险值仍由这类文件提供，迁移会失败并回滚，必须由管理员结合业务负载和监控证据人工处理。
+
+### 导入已有站点的配置写入安全（v10.0.3）
+
+导入站点仍然使用原网站的非 root 运行账户执行 WP-CLI。部署或修复时，脚本不会在 WordPress 配置更新之前先对整棵目录执行最终权限收紧。每条 `wp config set/delete/create` 命令都有独立、短暂的写入窗口：脚本先确认登记的 WordPress 绝对路径和 `wp-config.php` 都不是符号链接，再把现有配置临时设为 `0660 root:站点私有组`；命令成功、失败或被中断后都恢复为 `0640 root:站点私有组`。最终 `core is-installed` 检查通过后才统一收紧站点权限。
+
+如果站点没有可识别的 Nginx PHP socket，导入会使用环境配置中的 `DEFAULT_PHP_VERSION`，不会再静默写死 PHP 8.3。符号链接、消失的配置文件或无法恢复的所有权/权限会使操作明确失败，不会继续把站点标记为已完成。安全扫描只有在 WP-CLI 成功读取 `WP_DEBUG` 后才解释空值、`0` 或 `false`；命令失败会报告“无法验证”，不会把空输出误判为安全状态。
 
 ### 内部模块边界与单文件兼容性
 
@@ -1299,7 +1305,7 @@ sudo install -o root -g root -m 0755 wp-shell.sh.new /usr/local/sbin/wp-shell &&
 sudo wp-shell --version
 ```
 
-只更新脚本不需要重新运行 `install` 或 `site deploy`。这不会自动改动现有网站、PHP 用户、OPcache 手工参数或 SSH 登录方式。v10 功能的应用和验收见下方“十八、v10.0.2 升级后的操作”。
+只更新脚本不需要重新运行 `install` 或 `site deploy`。这不会自动改动现有网站、PHP 用户、OPcache 手工参数或 SSH 登录方式。v10 功能的应用和验收见下方“十八、v10.0.3 升级后的操作”。
 
 ### 2. 从 v9.4.2 或 v9.4.3 升级后的必要安全操作
 
@@ -1552,6 +1558,7 @@ bash tests/dashboard-smoke.sh
 bash tests/menu-routing.sh
 bash tests/opcache-config.sh
 bash tests/mariadb-legacy.sh
+bash tests/imported-site-reliability.sh
 bash tests/reliability-regression.sh
 bash tests/control-plane.sh
 bash tests/cloudflare-policy.sh
@@ -1566,7 +1573,7 @@ shellcheck -x wp-shell.sh wp-vps-manager.sh deploy-single-wordpress.sh tests/*.s
 
 GitHub Actions 还会在 Ubuntu 24.04 容器中使用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 验证生成的配置，并在 Ubuntu 22.04/24.04 容器中分别验证 MariaDB 旧配置的实际解析、显式迁移和幂等性。OPcache 测试覆盖手工参数接管、持久值重用、共享预算去重、无效参数/低内存拒绝、配置及重载失败回滚、INI 加载冲突，以及通过真实 FPM socket 读取运行时状态。
 
-v10.0.2 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签名和恢复演练测试，并覆盖配置事务、失败回滚、MariaDB 旧值检测/只读审计/精确回滚、Cloudflare CIDR、staging noindex、未知 Host、敏感路径、不存在 PHP 404，以及页面缓存、对象缓存、XML-RPC、响应头和 Cloudflare 登录策略不会在未选择时自动启用。`nginx-integration.sh`、`service-config-integration.sh`、`operations-integration.sh` 和 `mariadb-legacy-integration.sh` 会修改系统配置，只能按 CI 的方式在可丢弃容器中以 root 运行，不能在生产 VPS 上执行。
+v10.0.3 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签名和恢复演练测试，并覆盖配置事务、失败回滚、MariaDB 旧值检测/只读审计/精确回滚、导入站点非 root 连续配置写入及失败后权限恢复、Cloudflare CIDR、staging noindex、未知 Host、敏感路径、不存在 PHP 404，以及页面缓存、对象缓存、XML-RPC、响应头和 Cloudflare 登录策略不会在未选择时自动启用。`nginx-integration.sh`、`service-config-integration.sh`、`operations-integration.sh`、`mariadb-legacy-integration.sh` 和 `imported-site-integration.sh` 会修改系统配置，只能按 CI 的方式在可丢弃容器中以 root 运行，不能在生产 VPS 上执行。
 
 ## 十七、当前边界
 
@@ -1584,7 +1591,7 @@ v10.0.2 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签�
 
 异地备份已提供显式选择的 rclone crypt 上传与下载校验；其余未列入命令帮助的能力不视为已实现。脚本也不会自动关闭 SSH 密码登录、修改内核/sysctl、创建 swap、关闭或配置第三方安全插件，或把 Redis DB 编号当作安全隔离。
 
-## 十八、v10.0.2 升级后的操作
+## 十八、v10.0.3 升级后的操作
 
 ### 1. 先验证脚本和现有站点，不要重新部署全部环境
 
