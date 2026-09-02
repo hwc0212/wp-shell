@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 10.0.1
+# Version 10.0.2
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="10.0.1"
+readonly WP_SHELL_VERSION="10.0.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -24,6 +24,8 @@ readonly SITE_POLICY_DIR="$CONFIG_DIR/site-policy"
 readonly TRANSACTION_DIR="$CONFIG_DIR/transactions"
 readonly LAST_TRANSACTION_FILE="$CONFIG_DIR/last-transaction"
 readonly HOST_POLICY_FILE="$CONFIG_DIR/host-policy.v1"
+readonly MARIADB_CONFIG_ROOT="${WP_SHELL_MARIADB_CONFIG_ROOT:-/etc/mysql}"
+readonly MARIADB_MANAGED_CONFIG_FILE="$MARIADB_CONFIG_ROOT/mariadb.conf.d/60-wp-shell.cnf"
 readonly CLOUDFLARE_IPV4_URL="https://www.cloudflare.com/ips-v4"
 readonly CLOUDFLARE_IPV6_URL="https://www.cloudflare.com/ips-v6"
 readonly LEGACY_VPS_CONFIG_DIR="${WP_SHELL_LEGACY_VPS_CONFIG_DIR:-/etc/wp-vps-manager}"
@@ -1422,16 +1424,426 @@ php_config_fingerprint() {
         sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1
 }
 
+mariadb_config_root_is_safe() {
+    [[ "$MARIADB_CONFIG_ROOT" == /* && "$MARIADB_CONFIG_ROOT" != *$'\n'* && "$MARIADB_CONFIG_ROOT" != *'/../'* && "$MARIADB_CONFIG_ROOT" != */.. ]] || return 1
+    [[ "$MARIADB_CONFIG_ROOT" == /etc/mysql ]] ||
+        [[ "${WP_SHELL_TEST_ROOT_WRITES:-no}" == yes && "$MARIADB_CONFIG_ROOT" == /tmp/* ]]
+}
+
+mariadb_audit_variables() {
+    printf '%s\n' \
+        innodb_buffer_pool_size max_connections tmp_table_size max_heap_table_size \
+        sort_buffer_size join_buffer_size read_buffer_size read_rnd_buffer_size thread_stack
+}
+
+mariadb_audit_status_names() {
+    printf '%s\n' \
+        max_used_connections threads_connected threads_running \
+        created_tmp_tables created_tmp_disk_tables
+}
+
+mariadb_config_files() {
+    local file directory
+    mariadb_config_root_is_safe || return 1
+    {
+        file="$MARIADB_CONFIG_ROOT/my.cnf"
+        [[ -r "$file" ]] && printf '%s\n' "$file"
+        for directory in "$MARIADB_CONFIG_ROOT/conf.d" "$MARIADB_CONFIG_ROOT/mariadb.conf.d"; do
+            [[ -d "$directory" ]] || continue
+            find -L "$directory" -maxdepth 1 -type f -name '*.cnf' -print 2>/dev/null | sort
+        done
+    } | awk '!seen[$0]++'
+}
+
+mariadb_definition_class() {
+    local file="$1"
+    case "$file" in
+        "$MARIADB_CONFIG_ROOT"/conf.d/50-wordpress.cnf|"$MARIADB_CONFIG_ROOT"/mariadb.conf.d/50-wordpress.cnf)
+            printf 'legacy-wp-shell'
+            ;;
+        "$MARIADB_MANAGED_CONFIG_FILE") printf 'wp-shell-managed' ;;
+        *) printf 'administrator-or-distribution' ;;
+    esac
+}
+
+mariadb_config_definitions() {
+    local file class
+    while IFS= read -r file; do
+        [[ -r "$file" ]] || continue
+        class="$(mariadb_definition_class "$file")"
+        awk -v source_file="$file" -v source_class="$class" '
+            function trim(value) {
+                sub(/^[[:space:]]+/, "", value)
+                sub(/[[:space:]]+$/, "", value)
+                return value
+            }
+            /^[[:space:]]*\[/ {
+                section=tolower($0)
+                gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", section)
+                active=(section ~ /^(mysqld|server|mariadb|mariadbd|client-server)([-.][0-9]+([.][0-9]+)*)?$/)
+                next
+            }
+            active {
+                line=$0
+                sub(/^[[:space:]]+/, "", line)
+                if (line ~ /^[#;]/ || index(line, "=") == 0) next
+                key=tolower(substr(line, 1, index(line, "=")-1))
+                key=trim(key)
+                gsub(/-/, "_", key)
+                sub(/^loose_/, "", key)
+                if (key !~ /^(innodb_buffer_pool_size|max_connections|tmp_table_size|max_heap_table_size|sort_buffer_size|join_buffer_size|read_buffer_size|read_rnd_buffer_size|thread_stack)$/) next
+                value=substr(line, index(line, "=")+1)
+                sub(/[[:space:]]*[#;].*$/, "", value)
+                value=trim(value)
+                print key "|" value "|" source_file "|" NR "|" source_class
+            }
+        ' "$file"
+    done < <(mariadb_config_files)
+}
+
+mariadb_normalize_value() {
+    local variable="$1" raw="$2" upper multiplier=1 number
+    raw="${raw#\"}"; raw="${raw%\"}"
+    raw="${raw#\'}"; raw="${raw%\'}"
+    upper="${raw^^}"
+    case "$variable" in
+        innodb_buffer_pool_size|tmp_table_size|max_heap_table_size|sort_buffer_size|join_buffer_size|read_buffer_size|read_rnd_buffer_size|thread_stack)
+            if [[ "$upper" =~ ^([0-9]+)([KMGT])?B?$ ]]; then
+                number="${BASH_REMATCH[1]}"
+                case "${BASH_REMATCH[2]:-}" in
+                    K) multiplier=1024 ;;
+                    M) multiplier=$((1024 * 1024)) ;;
+                    G) multiplier=$((1024 * 1024 * 1024)) ;;
+                    T) multiplier=$((1024 * 1024 * 1024 * 1024)) ;;
+                esac
+                printf '%s' "$((number * multiplier))"
+                return 0
+            fi
+            ;;
+        max_connections)
+            [[ "$upper" =~ ^[0-9]+$ ]] && { printf '%s' "$upper"; return 0; }
+            ;;
+    esac
+    return 1
+}
+
+mariadb_snapshot_value() {
+    local snapshot="$1" variable="$2"
+    awk -F'|' -v wanted="$variable" '$1==wanted {print $2; exit}' <<< "$snapshot"
+}
+
+mariadb_config_effective_snapshot() {
+    local defaults_file="$MARIADB_CONFIG_ROOT/my.cnf" output snapshot count
+    mariadb_config_root_is_safe || return 1
+    [[ -r "$defaults_file" ]] || return 1
+    output="$(mariadbd --defaults-file="$defaults_file" --verbose --help 2>/dev/null)" || return 1
+    snapshot="$(awk '
+        {
+            key=tolower($1)
+            gsub(/-/, "_", key)
+            if (key ~ /^(innodb_buffer_pool_size|max_connections|tmp_table_size|max_heap_table_size|sort_buffer_size|join_buffer_size|read_buffer_size|read_rnd_buffer_size|thread_stack)$/) {
+                print key "|" $2
+            }
+        }
+    ' <<< "$output")"
+    count="$(wc -l <<< "$snapshot")"
+    ((count == 9)) || return 1
+    printf '%s\n' "$snapshot"
+}
+
+mariadb_runtime_snapshot() {
+    local output snapshot variable_count status_count
+    output="$(timeout 5s mariadb --protocol=socket --connect-timeout=3 --batch --skip-column-names --execute="
+SHOW GLOBAL VARIABLES WHERE Variable_name IN ('innodb_buffer_pool_size','max_connections','tmp_table_size','max_heap_table_size','sort_buffer_size','join_buffer_size','read_buffer_size','read_rnd_buffer_size','thread_stack');
+SHOW GLOBAL STATUS WHERE Variable_name IN ('Max_used_connections','Threads_connected','Threads_running','Created_tmp_tables','Created_tmp_disk_tables');
+" 2>/dev/null)" || return 1
+    snapshot="$(awk -F'\t' 'NF >= 2 {key=tolower($1); gsub(/-/, "_", key); print key "|" $2}' <<< "$output")"
+    variable_count="$(while IFS= read -r variable; do grep -c "^${variable}|" <<< "$snapshot"; done < <(mariadb_audit_variables) | awk '{sum+=$1} END{print sum+0}')"
+    status_count="$(while IFS= read -r variable; do grep -c "^${variable}|" <<< "$snapshot"; done < <(mariadb_audit_status_names) | awk '{sum+=$1} END{print sum+0}')"
+    ((variable_count == 9 && status_count == 5)) || return 1
+    printf '%s\n' "$snapshot"
+}
+
+mariadb_likely_source() {
+    local variable="$1" effective="$2" definitions="$3" key raw file line _class normalized likely="server default/runtime"
+    while IFS='|' read -r key raw file line _class; do
+        [[ "$key" == "$variable" ]] || continue
+        normalized="$(mariadb_normalize_value "$variable" "$raw" 2>/dev/null || true)"
+        [[ -n "$normalized" && "$normalized" == "$effective" ]] && likely="$file:$line"
+    done <<< "$definitions"
+    printf '%s' "$likely"
+}
+
+mariadb_display_value() {
+    local variable="$1" value="$2"
+    case "$variable" in
+        innodb_buffer_pool_size|tmp_table_size|max_heap_table_size|sort_buffer_size|join_buffer_size|read_buffer_size|read_rnd_buffer_size|thread_stack)
+            [[ "$value" =~ ^[0-9]+$ ]] && printf '%s bytes (%s MiB)' "$value" "$((value / 1024 / 1024))" || printf '%s' "$value"
+            ;;
+        *) printf '%s' "$value" ;;
+    esac
+}
+
+mariadb_safe_definition_value() {
+    local variable="$1" raw="$2"
+    if mariadb_normalize_value "$variable" "$raw" >/dev/null 2>&1; then
+        printf '%s' "$raw"
+    else
+        printf '<unparsed>'
+    fi
+}
+
+mariadb_high_risk_reasons() {
+    local snapshot="$1" total_mb total_bytes pool max_connections tmp heap sort join read read_rnd stack tmp_cap per_connection exposure value
+    total_mb="$(memory_mb)"
+    [[ "$total_mb" =~ ^[0-9]+$ && "$total_mb" -gt 0 ]] || return 0
+    total_bytes=$((total_mb * 1024 * 1024))
+    pool="$(mariadb_snapshot_value "$snapshot" innodb_buffer_pool_size)"
+    max_connections="$(mariadb_snapshot_value "$snapshot" max_connections)"
+    tmp="$(mariadb_snapshot_value "$snapshot" tmp_table_size)"
+    heap="$(mariadb_snapshot_value "$snapshot" max_heap_table_size)"
+    sort="$(mariadb_snapshot_value "$snapshot" sort_buffer_size)"
+    join="$(mariadb_snapshot_value "$snapshot" join_buffer_size)"
+    read="$(mariadb_snapshot_value "$snapshot" read_buffer_size)"
+    read_rnd="$(mariadb_snapshot_value "$snapshot" read_rnd_buffer_size)"
+    stack="$(mariadb_snapshot_value "$snapshot" thread_stack)"
+    for value in "$pool" "$max_connections" "$tmp" "$heap" "$sort" "$join" "$read" "$read_rnd" "$stack"; do
+        [[ "$value" =~ ^[0-9]+$ ]] || return 0
+    done
+    ((tmp < heap)) && tmp_cap="$tmp" || tmp_cap="$heap"
+    per_connection=$((tmp_cap + sort + join + read + read_rnd + stack))
+    exposure=$((pool + max_connections * per_connection))
+    if ((total_mb <= 4096 && pool * 2 >= total_bytes)); then
+        printf 'InnoDB buffer pool is at least 50%% of physical RAM on a %sMiB host.\n' "$total_mb"
+    fi
+    if ((total_mb <= 4096 && max_connections >= 250 && tmp_cap >= 64 * 1024 * 1024)); then
+        printf 'max_connections=%s combines with a per-connection temporary-table ceiling of at least 64MiB on a low-memory host.\n' "$max_connections"
+    fi
+    if ((total_mb <= 8192 && exposure > total_bytes * 4)); then
+        printf 'The conservative connection-memory exposure indicator exceeds four times physical RAM; it is a risk signal, not a usage prediction.\n'
+    fi
+}
+
+mariadb_unsafe_migratable_reasons() {
+    local definitions="$1" total_mb total_bytes key raw file line class normalized
+    total_mb="$(memory_mb)"
+    [[ "$total_mb" =~ ^[0-9]+$ && "$total_mb" -le 4096 ]] || return 0
+    total_bytes=$((total_mb * 1024 * 1024))
+    while IFS='|' read -r key raw file line class; do
+        [[ "$class" == legacy-wp-shell || "$class" == wp-shell-managed ]] || continue
+        normalized="$(mariadb_normalize_value "$key" "$raw" 2>/dev/null || true)"
+        [[ -n "$normalized" ]] || continue
+        case "$key" in
+            innodb_buffer_pool_size)
+                ((normalized * 2 >= total_bytes)) && printf '%s:%s defines %s=%s (at least 50%% of physical RAM).\n' "$file" "$line" "$key" "$raw"
+                ;;
+            max_connections)
+                ((normalized >= 250)) && printf '%s:%s defines %s=%s on a low-memory host.\n' "$file" "$line" "$key" "$raw"
+                ;;
+            tmp_table_size|max_heap_table_size)
+                ((normalized >= 64 * 1024 * 1024)) && printf '%s:%s defines %s=%s on a low-memory host.\n' "$file" "$line" "$key" "$raw"
+                ;;
+        esac
+    done <<< "$definitions"
+}
+
+mariadb_apply_block_reason() {
+    local definitions config_snapshot high_risk unsafe_legacy
+    definitions="$(mariadb_config_definitions 2>/dev/null || true)"
+    config_snapshot="$(mariadb_config_effective_snapshot 2>/dev/null || true)"
+    [[ -n "$config_snapshot" ]] || { printf 'MariaDB effective configuration could not be determined; refusing a baseline apply that could restart the service.'; return 0; }
+    unsafe_legacy="$(mariadb_unsafe_migratable_reasons "$definitions")"
+    if [[ -n "$unsafe_legacy" ]]; then
+        printf 'Unsafe legacy/wp-shell MariaDB definitions require explicit review:\n%s\nRun: wp-shell mariadb audit, then wp-shell mariadb migrate-legacy --confirm' "$unsafe_legacy"
+        return 0
+    fi
+    high_risk="$(mariadb_high_risk_reasons "$config_snapshot")"
+    if [[ -n "$high_risk" ]]; then
+        printf 'MariaDB effective configuration has high-risk low-memory indicators:\n%s\nReview administrator-owned MariaDB files manually before apply.' "$high_risk"
+    fi
+}
+
+mariadb_assert_apply_safe() {
+    local reason
+    reason="$(mariadb_apply_block_reason)"
+    [[ -z "$reason" ]] || die "$reason"
+}
+
+mariadb_validate_fragment() {
+    local candidate="$1"
+    mariadbd --defaults-file="$candidate" --verbose --help >/dev/null 2>&1
+}
+
+mariadb_validate_installed_config() {
+    mariadb_config_root_is_safe && [[ -r "$MARIADB_CONFIG_ROOT/my.cnf" ]] &&
+        mariadbd --defaults-file="$MARIADB_CONFIG_ROOT/my.cnf" --verbose --help >/dev/null 2>&1
+}
+
+mariadb_health_check() {
+    systemctl is-active --quiet mariadb &&
+        timeout 10s mariadb --protocol=socket --connect-timeout=5 --batch --skip-column-names --execute='SELECT 1;' 2>/dev/null | grep -Fxq 1
+}
+
+mariadb_snapshots_match() {
+    local configured="$1" runtime="$2" variable configured_value runtime_value
+    while IFS= read -r variable; do
+        configured_value="$(mariadb_snapshot_value "$configured" "$variable")"
+        runtime_value="$(mariadb_snapshot_value "$runtime" "$variable")"
+        [[ -n "$configured_value" && "$configured_value" == "$runtime_value" ]] || return 1
+    done < <(mariadb_audit_variables)
+}
+
+mariadb_render_legacy_candidate() {
+    local source="$1" destination="$2"
+    awk '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        /^[[:space:]]*\[/ {
+            section=tolower($0)
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", section)
+            active=(section ~ /^(mysqld|server|mariadb|mariadbd|client-server)([-.][0-9]+([.][0-9]+)*)?$/)
+        }
+        active {
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            if (line !~ /^[#;]/ && index(line, "=") > 0) {
+                key=tolower(substr(line, 1, index(line, "=")-1))
+                key=trim(key)
+                gsub(/-/, "_", key)
+                sub(/^loose_/, "", key)
+                if (key ~ /^(innodb_buffer_pool_size|max_connections|tmp_table_size|max_heap_table_size)$/) {
+                    print "# wp-shell migration removed legacy " key "; the exact prior file is in the transaction backup."
+                    next
+                }
+            }
+        }
+        {print}
+    ' "$source" > "$destination"
+}
+
+mariadb_migration_files() {
+    printf '%s\n' \
+        "$MARIADB_CONFIG_ROOT/conf.d/50-wordpress.cnf" \
+        "$MARIADB_CONFIG_ROOT/mariadb.conf.d/50-wordpress.cnf" \
+        "$MARIADB_MANAGED_CONFIG_FILE"
+}
+
+mariadb_audit() {
+    local runtime_snapshot="" config_snapshot="" definitions variable runtime_value configured_value likely key raw file line class risk
+    mariadb_config_root_is_safe || die "Unsafe MariaDB configuration root: $MARIADB_CONFIG_ROOT"
+    runtime_snapshot="$(mariadb_runtime_snapshot 2>/dev/null || true)"
+    config_snapshot="$(mariadb_config_effective_snapshot 2>/dev/null || true)"
+    definitions="$(mariadb_config_definitions 2>/dev/null || true)"
+    printf 'MariaDB effective configuration audit (read-only)\n'
+    printf 'Physical RAM: %s MiB. Swap is not counted as MariaDB capacity.\n' "$(memory_mb)"
+    printf '\n%-31s %-24s %-24s %s\n' Variable Runtime 'Configured next start' 'Likely definition'
+    while IFS= read -r variable; do
+        runtime_value="$(mariadb_snapshot_value "$runtime_snapshot" "$variable")"
+        configured_value="$(mariadb_snapshot_value "$config_snapshot" "$variable")"
+        likely="$(mariadb_likely_source "$variable" "${configured_value:-unknown}" "$definitions")"
+        printf '%-31s %-24s %-24s %s\n' "$variable" \
+            "$(mariadb_display_value "$variable" "${runtime_value:-UNKNOWN}")" \
+            "$(mariadb_display_value "$variable" "${configured_value:-UNKNOWN}")" "$likely"
+    done < <(mariadb_audit_variables)
+    printf '\nLive status counters\n'
+    while IFS= read -r variable; do
+        runtime_value="$(mariadb_snapshot_value "$runtime_snapshot" "$variable")"
+        printf '  %-31s %s\n' "$variable" "${runtime_value:-UNKNOWN}"
+    done < <(mariadb_audit_status_names)
+    printf '\nRelevant definitions under %s\n' "$MARIADB_CONFIG_ROOT"
+    if [[ -n "$definitions" ]]; then
+        while IFS='|' read -r key raw file line class; do
+            printf '  %-31s %-12s %s:%s [%s]\n' "$key" "$(mariadb_safe_definition_value "$key" "$raw")" "$file" "$line" "$class"
+        done <<< "$definitions"
+    else
+        printf '  No explicit definitions found; distribution/server defaults may be effective.\n'
+    fi
+    risk="$(mariadb_high_risk_reasons "${config_snapshot:-$runtime_snapshot}")"
+    if [[ -n "$risk" ]]; then
+        printf '\nHIGH-RISK indicators (admission is blocked; these are conservative indicators, not a memory-use proof):\n%s' "$risk"
+    else
+        printf '\nNo high-risk low-memory combination was identified by the conservative admission checks.\n'
+    fi
+    risk="$(mariadb_unsafe_migratable_reasons "$definitions")"
+    if [[ -n "$risk" ]]; then
+        printf '\nUnsafe legacy/wp-shell definitions detected:\n%s\n' "$risk"
+        printf 'Explicit migration: wp-shell mariadb migrate-legacy --confirm\n'
+    fi
+}
+
+mariadb_migrate_legacy() {
+    local confirmation="${1:-}" before_config after_config runtime risk target candidate mode owner group changed=no restart_required=no
+    local stage index=0
+    local -a targets=() candidates=() modes=() owners=() groups=()
+    mariadb_audit
+    [[ "$confirmation" == --confirm ]] || die "Impact: remove only four legacy memory directives from recognized wp-shell MariaDB files, preserve all other content, and restart MariaDB only if effective values change. Re-run with --confirm."
+    CURRENT_STEP="migrate legacy MariaDB memory configuration"
+    before_config="$(mariadb_config_effective_snapshot)" || die "Cannot determine the current effective MariaDB configuration. No files were changed."
+    stage="$(safe_temp_dir)"
+    register_temp_path "$stage"
+    while IFS= read -r target; do
+        [[ -e "$target" || -L "$target" ]] || continue
+        [[ -f "$target" && ! -L "$target" ]] || die "Refusing to migrate a non-regular or symlinked MariaDB file: $target"
+        index=$((index + 1))
+        candidate="$stage/candidate-$index.cnf"
+        mariadb_render_legacy_candidate "$target" "$candidate"
+        cmp -s "$candidate" "$target" && continue
+        mariadb_validate_fragment "$candidate" || die "MariaDB rejected the rendered candidate for $target. No files were changed."
+        targets+=("$target")
+        candidates+=("$candidate")
+        modes+=("$(stat -c '%a' "$target")")
+        owners+=("$(stat -c '%U' "$target")")
+        groups+=("$(stat -c '%G' "$target")")
+    done < <(mariadb_migration_files)
+    if ((${#targets[@]} == 0)); then
+        rm -rf -- "$stage"
+        log_message INFO "No recognized legacy MariaDB memory directives require migration."
+        return 0
+    fi
+    transaction_begin "$CURRENT_STEP"
+    for ((index=0; index<${#targets[@]}; index++)); do
+        write_managed_file "${targets[$index]}" "${modes[$index]}" "${owners[$index]}" "${groups[$index]}" < "${candidates[$index]}"
+        changed=yes
+    done
+    mariadb_validate_installed_config || die "MariaDB rejected the complete migrated configuration; exact prior files were restored."
+    after_config="$(mariadb_config_effective_snapshot)" || die "Cannot determine the migrated effective MariaDB configuration; exact prior files were restored."
+    risk="$(mariadb_high_risk_reasons "$after_config")"
+    [[ -z "$risk" ]] || die "Migration left high-risk effective values, likely in administrator-owned configuration. Exact prior files were restored. Review manually:\n$risk"
+    if ! mariadb_snapshots_match "$before_config" "$after_config"; then restart_required=yes; fi
+    if [[ "$restart_required" == yes ]]; then
+        transaction_mark_service mariadb
+        systemctl restart mariadb || die "MariaDB restart failed; exact prior files were restored and recovery was attempted."
+        mariadb_health_check || die "MariaDB failed its post-restart health check; exact prior files were restored and recovery was attempted."
+        runtime="$(mariadb_runtime_snapshot)" || die "MariaDB runtime values could not be read after restart; exact prior files were restored and recovery was attempted."
+        mariadb_snapshots_match "$after_config" "$runtime" || die "MariaDB runtime values do not match the validated migrated configuration; exact prior files were restored."
+    fi
+    rm -rf -- "$stage"
+    [[ "$changed" == yes ]] && log_message SUCCESS "Legacy MariaDB memory directives were migrated transactionally. Administrator-owned files and unrelated settings were preserved."
+    [[ "$restart_required" == yes ]] || log_message INFO "Effective MariaDB values did not change; no restart was required."
+}
+
+mariadb_command() {
+    case "${1:-audit}" in
+        audit) (($# <= 1)) || die "Usage: wp-shell mariadb audit"; mariadb_audit ;;
+        migrate-legacy) (($# == 2)) || die "Usage: wp-shell mariadb migrate-legacy --confirm"; mariadb_migrate_legacy "$2" ;;
+        *) die "Usage: wp-shell mariadb audit | migrate-legacy --confirm" ;;
+    esac
+}
+
 configure_mariadb() {
     CURRENT_STEP="configure MariaDB"
-    local config_file backup_file temp_file preserved_tuning=""
-    config_file="/etc/mysql/mariadb.conf.d/60-wp-shell.cnf"
-    backup_file="$config_file.previous"
-    temp_file="$(mktemp /etc/mysql/mariadb.conf.d/.wp-shell.XXXXXX)"
+    local config_file temp_file preserved_tuning="" after_config runtime risk
+    mariadb_assert_apply_safe
+    config_file="$MARIADB_MANAGED_CONFIG_FILE"
+    [[ -d "$(dirname "$config_file")" && ! -L "$(dirname "$config_file")" ]] || die "MariaDB configuration directory is missing or unsafe: $(dirname "$config_file")"
+    temp_file="$(mktemp "$(dirname "$config_file")/.wp-shell.XXXXXX")"
     if [[ -f "$config_file" && ! -L "$config_file" ]]; then
         preserved_tuning="$(awk '
             /^[[:space:]]*(innodb_buffer_pool_size|max_connections|tmp_table_size|max_heap_table_size)[[:space:]]*=/ {
-                if ($0 ~ /^[[:space:]]*[a-z_]+[[:space:]]*=[[:space:]]*[0-9]+[Mm]?([[:space:]]*)$/) print
+                if ($0 ~ /^[[:space:]]*[a-z_]+[[:space:]]*=[[:space:]]*[0-9]+[KkMmGg]?[Bb]?([[:space:]]*)$/) print
             }' "$config_file")"
     fi
     cat > "$temp_file" <<EOF
@@ -1446,7 +1858,7 @@ slow_query_log_file = /var/log/mysql/wp-shell-slow.log
 long_query_time = 2
 $preserved_tuning
 EOF
-    mariadbd --defaults-file="$temp_file" --verbose --help >/dev/null || {
+    mariadb_validate_fragment "$temp_file" || {
         rm -f -- "$temp_file"
         die "MariaDB rejected the candidate configuration; no file was changed."
     }
@@ -1455,21 +1867,19 @@ EOF
         log_message INFO "MariaDB configuration is unchanged; no restart needed."
         return 0
     fi
-    [[ -f "$config_file" ]] && cp -a "$config_file" "$backup_file"
+    mariadb_config_effective_snapshot >/dev/null || { rm -f -- "$temp_file"; die "Cannot determine the current effective MariaDB configuration. No files were changed."; }
     transaction_begin "$CURRENT_STEP"
-    transaction_mark_service mariadb
     write_managed_file "$config_file" 0644 root root < "$temp_file"
     rm -f "$temp_file"
-    if ! systemctl restart mariadb; then
-        if [[ -f "$backup_file" ]]; then
-            mv -f "$backup_file" "$config_file"
-        else
-            rm -f "$config_file"
-        fi
-        systemctl restart mariadb || true
-        die "MariaDB could not start with the new configuration; the previous configuration was restored."
-    fi
-    rm -f "$backup_file"
+    mariadb_validate_installed_config || die "MariaDB rejected the complete configuration; the previous file was restored."
+    after_config="$(mariadb_config_effective_snapshot)" || die "Cannot determine the candidate effective MariaDB configuration; the previous file was restored."
+    risk="$(mariadb_high_risk_reasons "$after_config")"
+    [[ -z "$risk" ]] || die "The candidate leaves high-risk MariaDB values; the previous file was restored:\n$risk"
+    transaction_mark_service mariadb
+    systemctl restart mariadb || die "MariaDB could not restart with the new configuration; the previous configuration was restored and recovery was attempted."
+    mariadb_health_check || die "MariaDB failed its post-restart health check; the previous configuration was restored and recovery was attempted."
+    runtime="$(mariadb_runtime_snapshot)" || die "MariaDB runtime values could not be read after restart; the previous configuration was restored."
+    mariadb_snapshots_match "$after_config" "$runtime" || die "MariaDB runtime values do not match the validated configuration; the previous configuration was restored."
     systemctl enable mariadb
 }
 
@@ -5462,7 +5872,7 @@ control_plane_status() {
 }
 
 control_plane_audit() {
-    local i domain wp_config mode owner group redis_info db_threads db_max severe_log_count=0 log_file php_pressure
+    local i domain wp_config mode owner group redis_info severe_log_count=0 log_file php_pressure
     printf 'wp-shell audit (read-only; no task, email, form, update, deletion or service reload)\n\n'
     if validate_managed_stack >/dev/null 2>&1; then host_audit_line PASS Config-syntax 'Nginx, installed PHP-FPM and sshd candidates validate.'
     else host_audit_line WARN Config-syntax 'At least one Nginx/PHP-FPM/sshd validation failed.'; fi
@@ -5478,9 +5888,8 @@ control_plane_audit() {
             "$(awk -F: '$1=="maxmemory_human"{gsub(/\r/,"",$2);print $2}' <<< "$redis_info")" \
             "$(awk -F: '$1=="evicted_keys"{gsub(/\r/,"",$2);print $2}' <<< "$redis_info")"
     fi
-    db_threads="$(mariadb -NBe "SHOW GLOBAL STATUS LIKE 'Threads_connected';" 2>/dev/null | awk '{print $2}' || true)"
-    db_max="$(mariadb -NBe "SELECT @@max_connections;" 2>/dev/null || true)"
-    printf 'MariaDB connections: %s/%s\n' "${db_threads:-unknown}" "${db_max:-unknown}"
+    printf '\n'
+    mariadb_audit
     printf '\nWordPress sites\n'
     for ((i=1; i<=SITE_COUNT; i++)); do
         domain="${SITE_DOMAINS[$i]}"
@@ -5513,7 +5922,7 @@ control_plane_audit() {
 }
 
 control_plane_plan() {
-    local i domain version
+    local i domain version mariadb_block
     printf 'wp-shell apply plan (no changes)\n'
     printf '  Host: Nginx global/default-host/log format, PHP baseline, loopback Redis/MariaDB, SSH-only Fail2ban, logrotate and certificate hook.\n'
     printf '  Excluded: SSH hardening, UFW reconciliation, AIDE install, Cloudflare enablement, plugin/theme updates, due tasks, email tests, backup deletion and reboot.\n'
@@ -5524,6 +5933,10 @@ control_plane_plan() {
     done
     while IFS= read -r version; do [[ -z "$version" ]] || printf '  Validate/reload PHP %s FPM if its managed fingerprint changes.\n' "$version"; done < <(unique_php_versions)
     printf '  Every changed file receives a timestamp/transaction backup; candidates are atomically installed and syntax-validated.\n'
+    mariadb_block="$(mariadb_apply_block_reason)"
+    if [[ -n "$mariadb_block" ]]; then
+        printf '  BLOCKED: %s\n' "$mariadb_block"
+    fi
 }
 
 apply_wordpress_baseline() {
@@ -5988,6 +6401,8 @@ Usage:
   sudo wp-shell tune --apply [--yes]             Apply safe PHP-FPM recommendations
   sudo wp-shell opcache status [PHP_VERSION]     Inspect configuration and live FPM OPcache
   sudo wp-shell opcache set PHP_VERSION MB STRINGS_MB  Save and apply OPcache settings
+  sudo wp-shell mariadb audit                    Inspect runtime/effective values and all relevant definitions
+  sudo wp-shell mariadb migrate-legacy --confirm  Transactionally remove recognized legacy memory directives
   sudo wp-shell site add                         Add and deploy a site
   sudo wp-shell site list                        List managed and imported sites
   sudo wp-shell site status [DOMAIN|ID]          Show site status
@@ -6110,6 +6525,7 @@ execute_command() {
         analyze) analyze_metrics "${2:-7d}" ;;
         tune) [[ "${2:-}" == "--apply" ]] || die "Usage: wp-shell tune --apply [--yes] [--range RANGE]"; shift 2; apply_tuning "$@" ;;
         opcache) shift; opcache_command "$@" ;;
+        mariadb) shift; mariadb_command "$@" ;;
         site) shift; site_command "$@" ;;
         metrics)
             case "${2:-status}" in
@@ -6166,6 +6582,27 @@ main() {
             load_tuning_config
             load_opcache_config
             execute_command "$@"
+            ;;
+        mariadb)
+            if [[ "${2:-audit}" == audit ]]; then
+                # MariaDB audit is contractually read-only and must not create
+                # wp-shell state or migrate unrelated legacy configuration.
+                load_sites_config
+                load_environment_config
+                load_tuning_config
+                load_opcache_config
+                execute_command "$@"
+            else
+                init_runtime
+                TRANSACTION_CONTEXT=yes
+                migrate_legacy_configs
+                load_sites_config
+                ensure_environment_config
+                load_tuning_config
+                load_opcache_config
+                execute_command "$@"
+                transaction_commit
+            fi
             ;;
         dashboard|report|analyze|metrics|cron-run|ops)
             init_paths

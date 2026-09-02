@@ -27,6 +27,7 @@ jobs:
           bash tests/dashboard-smoke.sh
           bash tests/menu-routing.sh
           bash tests/opcache-config.sh
+          bash tests/mariadb-legacy.sh
           bash tests/reliability-regression.sh
           bash tests/control-plane.sh
           bash tests/cloudflare-policy.sh
@@ -50,6 +51,8 @@ jobs:
           /mnt/tests/dashboard-smoke.sh
           /mnt/tests/menu-routing.sh
           /mnt/tests/opcache-config.sh
+          /mnt/tests/mariadb-legacy.sh
+          /mnt/tests/mariadb-legacy-integration.sh
           /mnt/tests/reliability-regression.sh
           /mnt/tests/control-plane.sh
           /mnt/tests/cloudflare-policy.sh
@@ -78,3 +81,24 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mariadb-server redis-server php8.3-fpm php8.3-cli openssl sqlite3 jq libfcgi-bin sudo acl curl gnupg ca-certificates rsync python3 >/dev/null &&
           bash /mnt/tests/service-config-integration.sh &&
           bash /mnt/tests/operations-integration.sh'
+
+  mariadb-legacy:
+    name: MariaDB legacy migration / Ubuntu ${{ matrix.ubuntu }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['22.04', '24.04']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Effective configuration and migration integration
+        run: >-
+          docker run --rm
+          -v "$PWD:/mnt:ro"
+          ubuntu:${{ matrix.ubuntu }}
+          bash -c
+          'apt-get update >/dev/null &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends mariadb-server ca-certificates >/dev/null &&
+          bash /mnt/tests/mariadb-legacy-integration.sh'

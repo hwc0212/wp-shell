@@ -124,6 +124,27 @@ for readonly_command in audit status dry-run; do
     [[ ! -e "$readonly_sentinel" ]]
 done
 
+# The dedicated MariaDB audit has the same read-only routing guarantee, while
+# migrate-legacy intentionally uses the locked transaction path.
+bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    ensure_root() { :; }
+    check_platform() { :; }
+    require_command() { :; }
+    init_paths() { touch "$2"; }
+    init_runtime() { touch "$2"; }
+    migrate_legacy_configs() { touch "$2"; }
+    ensure_environment_config() { touch "$2"; }
+    load_sites_config() { :; }
+    load_environment_config() { :; }
+    load_tuning_config() { :; }
+    load_opcache_config() { :; }
+    execute_command() { :; }
+    main mariadb audit
+' _ "$repo_root/wp-shell.sh" "$readonly_sentinel"
+[[ ! -e "$readonly_sentinel" ]]
+
 # Queue inspection must use the observational WP-CLI wrapper.  A regression
 # back to site_wp_cli would create/cache files during `wp-shell audit`.
 readonly_wpcli_calls="$test_root/read-only-wpcli-calls"
