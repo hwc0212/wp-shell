@@ -68,11 +68,36 @@ INSERT INTO sample_health SELECT ts,'','system',1 FROM system_samples;
 INSERT INTO sample_health SELECT ts,domain,'php',1 FROM site_samples;
 SQL
 read_pool_limit() { printf '4'; }
-PHP_TOTAL_BUDGET_MB=1200
+TEST_EFFECTIVE_DEFAULT_LIMIT=2
+declare -A TEST_EFFECTIVE_SITE_LIMITS=(
+    [bad.example.com]=4
+    [good.example.com]=4
+)
+read_effective_default_pool_limit() { printf '%s' "$TEST_EFFECTIVE_DEFAULT_LIMIT"; }
+read_effective_site_pool_limit() { printf '%s' "${TEST_EFFECTIVE_SITE_LIMITS[$1]}"; }
+read_managed_site_pool_limit() { printf '4'; }
+mariadb_apply_block_reason() { :; }
+# Two current site pools plus an effective default of two consume exactly ten
+# workers (1250MB). A site increase must not borrow capacity by assuming the
+# future configure_php default of one worker.
+PHP_TOTAL_BUDGET_MB=1250
+build_tuning_recommendations "$test_root/tune"
+[[ ! -s "$test_root/tune" ]]
+[[ -z "$PHP_TUNING_VETO_REASONS" ]]
+# With the effective default actually at one, nine workers consume 1125MB and
+# exactly one increase fits.
+TEST_EFFECTIVE_DEFAULT_LIMIT=1
 build_tuning_recommendations "$test_root/tune"
 [[ "$(wc -l < "$test_root/tune")" -eq 1 ]]
 grep -q 'bad.example.com|4|5|' "$test_root/tune"
-# Both proposed increases combined would require 1250MB: never allow that.
+# A later external site-pool override blocks automatic tuning even when the
+# managed file still contains the expected limit.
+TEST_EFFECTIVE_SITE_LIMITS[bad.example.com]=5
+build_tuning_recommendations "$test_root/tune"
+[[ ! -s "$test_root/tune" ]]
+grep -Fq 'managed pool limit is 4 but php-fpm reports effective limit 5' <<< "$PHP_TUNING_VETO_REASONS"
+TEST_EFFECTIVE_SITE_LIMITS[bad.example.com]=4
+# Both proposed increases combined would require 1375MB: never allow that.
 sqlite3 "$METRICS_DB" 'UPDATE system_samples SET cpu_pct=100;'
 build_tuning_recommendations "$test_root/tune"
 [[ ! -s "$test_root/tune" ]]

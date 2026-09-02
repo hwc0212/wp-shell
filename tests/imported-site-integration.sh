@@ -12,6 +12,7 @@ wp_path="/var/www/$domain/public"
 site_user="wp_import_fixture"
 events_file="/tmp/wp-shell-import-events"
 fail_marker="/tmp/wp-shell-import-fail"
+control_events="$test_root/control-events"
 
 cleanup_import_test() {
     rm -rf -- "/var/www/$domain" "$test_root"
@@ -120,19 +121,75 @@ WP_CLI
 ENVIRONMENT_MODE=multi
 DEFAULT_PHP_VERSION=8.2
 ENVIRONMENT_UFW=no
+TEST_RAM_MB=1024
+memory_mb() { printf '%s' "$TEST_RAM_MB"; }
+
+# Record every persistent wp-shell write and service configuration entry point.
+# The 1GB admission failure below must happen before any of them is reached.
+eval "$(declare -f write_managed_file | sed '1s/^write_managed_file/original_write_managed_file/')"
+write_managed_file() {
+    printf 'write|%s\n' "$1" >> "$control_events"
+    original_write_managed_file "$@"
+}
+eval "$(declare -f set_site_policy | sed '1s/^set_site_policy/original_set_site_policy/')"
+set_site_policy() {
+    printf 'policy|%s|%s\n' "$1" "$2" >> "$control_events"
+    original_set_site_policy "$@"
+}
+configure_php() { printf 'service|php\n' >> "$control_events"; }
+configure_mariadb() { printf 'service|mariadb\n' >> "$control_events"; }
+configure_redis() { printf 'service|redis\n' >> "$control_events"; }
+php_fpm_service_action() { printf 'service|php-fpm|%s\n' "$*" >> "$control_events"; }
+systemctl() { printf 'service|systemctl|%s\n' "$*" >> "$control_events"; }
+
+# A discovered imported site plus the default PHP pool cannot fit the 1GB
+# profile. Discovery must remain in memory only: no sites.v3, policy, pool,
+# reload, MariaDB or Redis change is permitted on this path.
+printf 'version|3\n' > "$SITES_CONFIG_FILE"
+chmod 0600 "$SITES_CONFIG_FILE"
+sites_before="$(sha256sum "$SITES_CONFIG_FILE")"
+: > "$control_events"
+if (import_existing_sites) > "$test_root/import-capacity-failure.log" 2>&1; then
+    printf 'An imported site bypassed the 1GB PHP capacity admission.\n' >&2
+    exit 1
+fi
+grep -Fq 'PHP-FPM capacity admission failed before live changes.' "$test_root/import-capacity-failure.log"
+[[ "$(sha256sum "$SITES_CONFIG_FILE")" == "$sites_before" ]]
+[[ ! -e "$SITE_POLICY_DIR/$domain" ]]
+[[ ! -s "$control_events" ]]
+
+# The same discovered site fits the 2GB profile.  Because the only Nginx
+# vhost belongs to another root and PHP 8.3, import must use DEFAULT_PHP_VERSION
+# 8.2, persist the site and user policy only after admission, and make the
+# second run a true no-op.
+TEST_RAM_MB=2048
+: > "$control_events"
 import_existing_sites
 [[ "$SITE_COUNT" -eq 1 ]]
 [[ "${SITE_DOMAINS[1]}" == "$domain" ]]
 [[ "${SITE_PHP_VERSIONS[1]}" == 8.2 ]]
 [[ "${SITE_MODES[1]}" == imported ]]
 [[ "$(site_run_user "$domain")" == "$site_user" ]]
+[[ "$(grep -Fc "write|$SITES_CONFIG_FILE" "$control_events")" -eq 1 ]]
+[[ "$(grep -Fc "policy|$domain|user" "$control_events")" -eq 1 ]]
+if grep -Fq 'service|' "$control_events"; then
+    printf 'Import changed a service after otherwise successful admission.\n' >&2
+    exit 1
+fi
+successful_sites="$(sha256sum "$SITES_CONFIG_FILE")"
+successful_policy="$(sha256sum "$SITE_POLICY_DIR/$domain/user")"
+: > "$control_events"
+import_existing_sites
+[[ "$SITE_COUNT" -eq 1 ]]
+[[ "$(sha256sum "$SITES_CONFIG_FILE")" == "$successful_sites" ]]
+[[ "$(sha256sum "$SITE_POLICY_DIR/$domain/user")" == "$successful_policy" ]]
+[[ ! -s "$control_events" ]]
 
 # Keep this integration focused on the imported WordPress lifecycle.  The
 # Nginx and certificate implementations have separate service integrations.
 configure_acme_site() { printf 'deploy|acme\n' >> "$events_file"; }
 issue_ssl_certificate() { printf 'deploy|certificate\n' >> "$events_file"; }
 configure_https_site() { printf 'deploy|https\n' >> "$events_file"; }
-memory_mb() { printf '2048'; }
 eval "$(declare -f set_site_permissions | sed '1s/^set_site_permissions/original_set_site_permissions/')"
 set_site_permissions() {
     printf 'deploy|permissions\n' >> "$events_file"

@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v10.0.3
+- 当前版本：`wp-shell.sh` v10.0.4
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -94,6 +94,30 @@ sudo wp-shell apply --confirm
 导入站点仍然使用原网站的非 root 运行账户执行 WP-CLI。部署或修复时，脚本不会在 WordPress 配置更新之前先对整棵目录执行最终权限收紧。每条 `wp config set/delete/create` 命令都有独立、短暂的写入窗口：脚本先确认登记的 WordPress 绝对路径和 `wp-config.php` 都不是符号链接，再把现有配置临时设为 `0660 root:站点私有组`；命令成功、失败或被中断后都恢复为 `0640 root:站点私有组`。最终 `core is-installed` 检查通过后才统一收紧站点权限。
 
 如果站点没有可识别的 Nginx PHP socket，导入会使用环境配置中的 `DEFAULT_PHP_VERSION`，不会再静默写死 PHP 8.3。符号链接、消失的配置文件或无法恢复的所有权/权限会使操作明确失败，不会继续把站点标记为已完成。安全扫描只有在 WP-CLI 成功读取 `WP_DEBUG` 后才解释空值、`0` 或 `false`；命令失败会报告“无法验证”，不会把空输出误判为安全状态。
+
+### PHP-FPM 整机硬预算（v10.0.4）
+
+`PHP_TOTAL_BUDGET_MB` 现在是写入 PHP-FPM pool 前的整机硬准入约束，而不是尽量遵守的建议值。脚本把每个受管站点的 `pm.max_children`，以及每个启用 PHP 版本保留的一个最小 `www` pool worker 一起计入：
+
+```text
+aggregate workers × worker memory estimate <= PHP_TOTAL_BUDGET_MB
+```
+
+脚本不再为了保证每站点至少两个 worker 而扩大总 slots，也不把 Swap 算成可常驻的 PHP 容量。低流量站点必要时会使用 `pm=ondemand`、`pm.max_children=1`。如果连每站点一个 worker、各 PHP 版本的默认 pool 和显式 tuning override 都无法容纳，`apply`、环境安装、添加/导入站点和直接 PHP 配置会在写入 pool 或重载服务之前失败。错误信息会列出物理 RAM、Swap、PHP 硬预算、worker 估算证据、安全/请求 worker 数、站点及 WooCommerce 权重，并建议减少站点、降低 override、增加 RAM 或迁移站点。
+
+初次或指标不足时，每个 worker 使用保守的 96MB 基线。只有某个站点至少有 1,000 个有效 PHP PSS 样本、跨度不少于 24 小时且最新样本不超过 180 秒，脚本才使用每进程 PSS 的 95 分位并增加 25% 安全余量；多站点取最高的合格估算，且不会低于 96MB。实测证据只能让估算保持或变得更保守，不能绕过整机硬预算。
+
+只读检查：
+
+```bash
+sudo wp-shell audit
+sudo wp-shell dry-run apply
+sudo wp-shell analyze 7d
+```
+
+`audit` 和 `analyze` 会区分当前 pool 总量与安全建议总量。当前总量不是从目标文件名推断，而是读取 `php-fpmVERSION -tt` 输出的最终合并配置，包括每个启用 PHP 版本实际生效的 `[www] pm.max_children` 和各站点 pool。无法取得这项证据时会显示 `UNKNOWN`，并禁止自动扩容，不会假定 default pool 已经是 1。已有配置超预算时仍继续采集指标，便于诊断，但不会继续自动扩容。手工 tuning override 会作为整机组合验证；两个单独合法但合计超预算的值会被整体拒绝，不会被静默截断。
+
+受管 default pool 使用排序晚于发行版 `www.conf` 的 `/etc/php/VERSION/fpm/pool.d/zz-wp-shell.conf`。从 v10.0.3 升级并确认应用时，脚本会在同一事务中迁移自己能精确识别的旧 `99-wp-shell.conf`，保留管理员文件，并在重载前验证最终 `[www]` 确实为 `pm=ondemand`、`pm.max_children=1`。每个受管站点 pool 也必须在 PHP-FPM 最终合并配置中精确得到计划的 `pm.max_children`。如果更晚的管理员配置覆盖 default 或站点目标，应用会失败并恢复旧文件，不会编辑管理员／发行版配置或假装硬预算已经生效。
 
 ### 内部模块边界与单文件兼容性
 
@@ -1088,7 +1112,7 @@ sudo wp-shell tune --apply
 DOMAIN  CURRENT  PROPOSED  REASON
 ```
 
-确认并重新校验建议后，才会写入受影响的进程池配置，并重载相关 PHP-FPM 服务；配置检查或重载失败会回滚。
+确认并重新校验建议后，才会写入受影响的进程池配置，并重载相关 PHP-FPM 服务。写入候选值后会用 PHP-FPM 最终合并配置验证每个目标 pool 的有效 `pm.max_children`；语法、语义或重载失败都会恢复原 pool 和 `tuning.v1`，不会把被外部配置覆盖的候选值报告为成功。
 
 无人值守确认：
 
@@ -1107,11 +1131,15 @@ sudo wp-shell tune --apply --yes
 - 增加进程数要求所选观察窗口内 CPU 峰值低于 85%，可用内存最低占比至少 25%。这是偏保守的门槛，短暂 CPU 峰值也可能阻止自动扩容。
 - 需要至少 10 次、且占有效样本至少 1% 的排队或活动进程达到配置上限的证据；一次历史累计饱和事件不再触发扩容。
 - 按实测 PSS/进程数加 25% 余量估算单进程消耗，最低按 96MB；所有建议合计不得超过共享 OPcache 扣除后的 PHP 工作进程预算。
-- 从实际进程池文件读取当前上限；`analyze 7d` 与 `tune --apply --range 7d` 使用相同时间范围。
+- 调优只改变站点 pool，不运行完整 `configure_php`，因此 prospective budget 使用 `php-fpmVERSION -tt` 读取的当前有效 default/站点 pool 作为基线；只把目标站点当前有效值替换成建议值，不假定 default pool 会同时降为 1。
+- 当前受管站点文件中的上限必须与 PHP-FPM 最终有效上限一致；若更晚的管理员配置改变了结果，自动调优会停止并要求先解决 override，不修改管理员文件。
+- Swap 只作为风险信号，不增加 worker 容量。
+- 观察窗口出现 OOM 增量、持续/增长的 Swap、明显内存 PSI、严重 IO PSI/IO wait、危险或无法确认的 MariaDB 有效配置、或当前 PHP 总量已经超预算时，禁止自动扩容。
+- 从 PHP-FPM 最终合并配置读取当前有效上限，并与受管 pool 文件交叉验证；`analyze 7d` 与 `tune --apply --range 7d` 使用相同时间范围。
 - 应用调优与部署/配置操作共用互斥锁；分析报表使用独立建议文件，不会覆盖等待确认的调优计划。
 - 降低额度需要接近 14 天的持续低峰值使用。
 - 单次调整约为 20%。
-- 每站点限制在 2 至 50 个 PHP 子进程。
+- 每站点限制在 1 至 50 个 PHP 子进程；`1` 是资源紧张主机的兼容下限，不代表所有生产负载都适合该容量。
 
 自动覆盖值保存在：
 
@@ -1169,6 +1197,8 @@ sudo wp-shell site status
 
 这不是所有网站的统一最佳值。`memory_consumption` 是总共享缓存容量，字符串空间包含在其中，预算不再额外加一次字符串容量。脚本限制单版本总容量为 64–2048MB、字符串为 4–512MB 且不超过总容量一半；各受管 PHP 版本的总 OPcache 目标不能超过服务器内存的 25%。扩容还要求当前可用内存覆盖增加量，并保留至少 256MB 或总内存 10%（取较大值）的余量。这些保护不等于承诺高峰时绝不会内存不足。
 
+OPcache 增大还会先在内存中暂存候选值，重新计算 PHP worker 硬预算，并用 `php-fpmVERSION -tt` 读取当前有效 default/站点 pool。若现有 worker 暴露量放不进缩小后的候选预算，或者有效 pool 无法验证，命令会在写状态文件、写 INI 或重载 FPM 前拒绝。它不会顺带缩减站点 pool；应先明确降低并重新应用 worker 配额。OPcache 减小会释放预算，因此即使主机原已超配，只要操作不使状态更差，也可作为恢复操作执行。
+
 此命令只做以下操作：
 
 1. 备份旧的 OPcache 状态文件和受管 INI，保存在 `/etc/wp-shell/opcache-backups/时间戳.随机值/`，目录只有 root 可读。
@@ -1217,11 +1247,13 @@ sudo systemctl daemon-reload
 - MariaDB：资源报告仍保留保守预算估算，但该数字不是实际配置；`mariadb audit` 才显示 runtime、下次启动值和定义来源。新安装只设置 loopback、字符集和慢查询日志；没有监控证据时不把估算值写成 Buffer Pool。风险门槛内的已有受管内存值会保留，危险旧值会阻断普通应用。
 - Redis：通常约总内存的 5%，限制为 32MB 至 512MB；约 2GB VPS 的默认起点为 96MB，可通过受验证参数覆盖。
 - OPcache：每个不同的受管 PHP 版本预留一份共享容量，沿用已保存或已有的手工值；未配置时为 128MB（其中字符串空间 16MB）。
-- PHP-FPM：扣除共享 OPcache 后使用受限制的剩余预算；分析输出分别列出共享缓存和 worker 预算。
-- PHP 进程：按约 96MB/进程估算；约 2GB RAM、至少 1GB Swap、单个 ondemand pool 时可从 8 个进程上限起步，否则使用更保守预算。
-- WooCommerce：初始 pool 权重是普通网站的两倍。
+- PHP-FPM：扣除系统/page cache、临时 PHP/备份任务、MariaDB 规划量、Redis、Nginx cache zone 和共享 OPcache 后形成硬 worker 预算；任何成功分配都必须满足总 worker 估算不超过该预算。
+- PHP 进程：指标不足时按 96MB/进程；有至少 1,000 个有效样本、24 小时跨度和新鲜数据时，使用每进程 PSS 的 95 分位加 25% 余量，并在多站点间采用最高合格值。
+- 非 FPM 峰值：系统预留中明确保留临时 PHP/备份空间，用于 WP-CLI、WP-Cron、WooCommerce Action Scheduler、插件更新、图片处理和备份等短时任务。这是规划余量，不是这些任务内存的精确上限。
+- WooCommerce：初始 pool 权重是普通网站的两倍，但只影响有限 slots 的分配顺序，绝不扩大整机 worker 预算。
 - FastCGI keys zone：每个网站 16MB。
-- 每个网站至少 2 个 PHP 子进程，默认上限 50。
+- 每个启用 PHP 版本的默认 `www` pool 也按一个 worker 计入；每个网站最低 1、默认上限 50。无法安全提供每站点一个 worker 时直接拒绝配置。
+- Swap 是 OOM 前的应急缓冲和风险信号，不参与常驻 worker 容量计算；“有更多 Swap”不会让 2GB 主机获得更多 PHP workers。
 
 这些值是安全起点，不是所有网站的最终最佳值。主题、插件、流量结构、缓存命中率和 WooCommerce 请求比例都会改变实际内存需求。
 
@@ -1229,7 +1261,7 @@ sudo systemctl daemon-reload
 
 主题或插件明确要求不同 PHP 限制时，不要修改脚本生成的 `99-wp-shell.ini`。可为对应 PHP 版本创建排序更晚的本机兼容文件，例如 `/etc/php/8.3/fpm/conf.d/zz-wp-shell-compat.ini`，只写插件文档明确要求的项目；wp-shell 会保留该文件，并在每次重载前运行 FPM 配置测试。不同 PHP 版本分别维护，避免把一个网站的特殊要求误当成所有版本和站点的通用默认值。
 
-若剩余内存不足最低 PHP worker 额度，脚本会提示预算紧张；最低额度不是内核级内存限制。不要依赖它替代真实 PSS、可用内存和峰值观测。`opcache set` 仅核算并调整缓存，不会主动重新分配已有 worker。
+若剩余内存不足最低 PHP worker 额度，脚本会在任何 pool 写入或 PHP 重载前停止。1GB 仍是平台安装检查的最低门槛，但现代 WordPress、数据库、Redis、OPcache、默认 PHP pool 与站点 pool 的组合通常可能无法通过硬准入；这时应增加 RAM 或减少服务/站点，而不是依赖 Swap。该预算仍不是内核级 cgroup 限制，不能替代真实 PSS、可用内存和峰值观测。`opcache set` 不会主动重新分配已有 worker；增大缓存前必须证明现有有效 pool 仍能容纳在新的硬预算内。
 
 ## 十一、站点目录结构
 
@@ -1274,6 +1306,7 @@ sudo systemctl daemon-reload
 /etc/cron.d/wp-shell-POOL_ID              每五分钟、以站点用户运行的可选 WP-Cron
 /etc/wp-shell-redis/                     可选独立 Redis 实例配置
 /etc/php/VERSION/fpm/conf.d/zz-wp-shell-opcache.ini
+/etc/php/VERSION/fpm/pool.d/zz-wp-shell.conf
 /etc/nginx/conf.d/wp-shell-log-format.conf
 /usr/local/sbin/wp-shell                  安装后的主程序
 /usr/local/bin/wp-shell                   全局命令链接
@@ -1305,7 +1338,7 @@ sudo install -o root -g root -m 0755 wp-shell.sh.new /usr/local/sbin/wp-shell &&
 sudo wp-shell --version
 ```
 
-只更新脚本不需要重新运行 `install` 或 `site deploy`。这不会自动改动现有网站、PHP 用户、OPcache 手工参数或 SSH 登录方式。v10 功能的应用和验收见下方“十八、v10.0.3 升级后的操作”。
+只更新脚本不需要重新运行 `install` 或 `site deploy`。这不会自动改动现有网站、PHP 用户、OPcache 手工参数或 SSH 登录方式。v10 功能的应用和验收见下方“十八、v10.0.4 升级后的操作”。
 
 ### 2. 从 v9.4.2 或 v9.4.3 升级后的必要安全操作
 
@@ -1557,6 +1590,7 @@ bash tests/wordpress-core.sh
 bash tests/dashboard-smoke.sh
 bash tests/menu-routing.sh
 bash tests/opcache-config.sh
+bash tests/php-memory-budget.sh
 bash tests/mariadb-legacy.sh
 bash tests/imported-site-reliability.sh
 bash tests/reliability-regression.sh
@@ -1573,7 +1607,7 @@ shellcheck -x wp-shell.sh wp-vps-manager.sh deploy-single-wordpress.sh tests/*.s
 
 GitHub Actions 还会在 Ubuntu 24.04 容器中使用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 验证生成的配置，并在 Ubuntu 22.04/24.04 容器中分别验证 MariaDB 旧配置的实际解析、显式迁移和幂等性。OPcache 测试覆盖手工参数接管、持久值重用、共享预算去重、无效参数/低内存拒绝、配置及重载失败回滚、INI 加载冲突，以及通过真实 FPM socket 读取运行时状态。
 
-v10.0.3 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签名和恢复演练测试，并覆盖配置事务、失败回滚、MariaDB 旧值检测/只读审计/精确回滚、导入站点非 root 连续配置写入及失败后权限恢复、Cloudflare CIDR、staging noindex、未知 Host、敏感路径、不存在 PHP 404，以及页面缓存、对象缓存、XML-RPC、响应头和 Cloudflare 登录策略不会在未选择时自动启用。`nginx-integration.sh`、`service-config-integration.sh`、`operations-integration.sh`、`mariadb-legacy-integration.sh` 和 `imported-site-integration.sh` 会修改系统配置，只能按 CI 的方式在可丢弃容器中以 root 运行，不能在生产 VPS 上执行。
+v10.0.4 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签名和恢复演练测试，并覆盖配置事务、失败回滚、MariaDB 旧值检测/只读审计/精确回滚、导入站点非 root 连续配置写入及失败后权限恢复、Cloudflare CIDR、staging noindex、未知 Host、敏感路径、不存在 PHP 404，以及页面缓存、对象缓存、XML-RPC、响应头和 Cloudflare 登录策略不会在未选择时自动启用。新增 PHP 硬预算矩阵覆盖 1/2/4/8/16GB、单站点/多站点、普通/WooCommerce/混合站点、零/低/较大 Swap、多 PHP 版本、旧站点数量、全局 override、PSS 证据、压力否决、幂等和失败前无写入，并通过导入联合测试确认容量不足时不持久化站点或 policy、容量足够时仅按目标站点或默认 PHP 完成一次幂等导入。`nginx-integration.sh`、`service-config-integration.sh`、`operations-integration.sh`、`mariadb-legacy-integration.sh` 和 `imported-site-integration.sh` 会修改系统配置，只能按 CI 的方式在可丢弃容器中以 root 运行，不能在生产 VPS 上执行。
 
 ## 十七、当前边界
 
@@ -1591,7 +1625,7 @@ v10.0.3 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签�
 
 异地备份已提供显式选择的 rclone crypt 上传与下载校验；其余未列入命令帮助的能力不视为已实现。脚本也不会自动关闭 SSH 密码登录、修改内核/sysctl、创建 swap、关闭或配置第三方安全插件，或把 Redis DB 编号当作安全隔离。
 
-## 十八、v10.0.3 升级后的操作
+## 十八、v10.0.4 升级后的操作
 
 ### 1. 先验证脚本和现有站点，不要重新部署全部环境
 
@@ -1607,9 +1641,15 @@ sudo wp-shell metrics collect
 sudo wp-shell metrics status
 sudo wp-shell system audit
 sudo wp-shell mariadb audit
+sudo wp-shell audit
+sudo wp-shell dry-run apply
 ```
 
 如果 MariaDB 审计报告 `Unsafe legacy/wp-shell definitions detected`，先不要执行普通 `apply`。确认已具备外部备份和 SSH 维护窗口后，运行 `sudo wp-shell mariadb migrate-legacy --confirm`，再重复审计；没有该警告时不需要为了版本号主动重启 MariaDB。
+
+升级到 v10.0.4 后先查看 `audit` 中的 `PHP-FPM hard capacity admission`。`SAFE` 表示按当前物理 RAM、站点、PHP 版本、OPcache 和 worker 证据可以生成不超过硬预算的配置；`OVERCOMMITTED` 表示实际 pool 总量高于预算；`BLOCKED` 表示站点最低需求或已有 tuning override 已经无法容纳。只读审计不会改 pool 或重载 PHP。
+
+现有 pool 超预算但没有强制 override 时，确认计划后运行 `sudo wp-shell apply --confirm` 会把 wp-shell 管理的 limits 重新分配到硬预算内。显式 override 不会被静默缩小；请先审查 `/etc/wp-shell/tuning.v1`，明确降低对应值后再运行审计与 apply。不要通过增加 Swap、删除 OPcache 余量或提高 PHP 预算来绕过准入。低流量站点变为一个 ondemand worker 是允许的兼容结果；高峰负载不能接受该容量时，应减少同机站点或增加物理 RAM。
 
 采样历史保留。新采样才带有探测有效性标记，因此升级后暂时没有自动扩容建议是正常保护，不是采集故障。看板中的 `PHP ?`、`Logs ?` 或共享服务的 `?` 表示探测不可用或日志覆盖不完整，不能解释为零负载。目录大小最多每 15 分钟刷新一次，单次扫描限时；失败时保留上次值或显示未知。访问日志每次最多处理 5MiB，超限会标记覆盖不完整。
 
