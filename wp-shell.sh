@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 10.0.3
+# Version 10.0.4
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="10.0.3"
+readonly WP_SHELL_VERSION="10.0.4"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -63,6 +63,7 @@ declare -a SITE_TITLES=()
 declare -a SITE_PATHS=()
 declare -a SITE_MODES=()
 declare -a SITE_PHP_MAX_CHILDREN=()
+declare -a SITE_EFFECTIVE_PHP_MAX_CHILDREN=()
 declare -A PHP_CHILD_OVERRIDES=()
 declare -A OPCACHE_MEMORY_OVERRIDES=()
 declare -A OPCACHE_STRINGS_OVERRIDES=()
@@ -76,6 +77,22 @@ MARIADB_BUFFER_MB=256
 REDIS_MAX_MEMORY_MB=64
 PHP_TOTAL_BUDGET_MB=256
 OPCACHE_TOTAL_BUDGET_MB=128
+HOST_SYSTEM_RESERVE_MB=0
+PHP_TRANSIENT_RESERVE_MB=0
+PHP_WORKER_ESTIMATE_MB=96
+PHP_WORKER_EVIDENCE="baseline"
+PHP_DEFAULT_POOL_WORKERS=1
+PHP_SAFE_AGGREGATE_WORKERS=0
+PHP_REQUESTED_AGGREGATE_WORKERS=0
+PHP_ESTIMATED_ALLOCATION_MB=0
+PHP_NORMAL_SITE_COUNT=0
+PHP_WOO_SITE_COUNT=0
+PHP_CAPACITY_ERROR=""
+PHP_CURRENT_AGGREGATE_WORKERS=0
+PHP_CURRENT_DEFAULT_POOL_WORKERS=0
+PHP_CURRENT_CAPACITY_ERROR=""
+PHP_CURRENT_DEFAULT_POOL_SUMMARY=""
+PHP_TUNING_VETO_REASONS=""
 NEW_SITE_CREDENTIAL_DOMAIN=""
 NEW_SITE_ADMIN_PASSWORD=""
 DRY_RUN="no"
@@ -629,7 +646,7 @@ load_tuning_config() {
         [[ -n "$record" ]] || continue
         [[ "$record" == "php" ]] || die "Unknown tuning record: $record"
         validate_domain "$domain" || die "Invalid domain in tuning configuration: $domain"
-        if [[ ! "$value" =~ ^[0-9]+$ ]] || ((value < 2 || value > 50)); then
+        if [[ ! "$value" =~ ^[0-9]+$ ]] || ((value < 1 || value > 50)); then
             die "Invalid PHP child limit for $domain"
         fi
         PHP_CHILD_OVERRIDES["$domain"]="$value"
@@ -742,6 +759,73 @@ write_opcache_ini() {
 php_fpm_service_action() {
     local action="$1" version="$2"
     systemctl daemon-reload && systemctl "$action" "php${version}-fpm"
+}
+
+php_default_pool_override_file() { printf '/etc/php/%s/fpm/pool.d/zz-wp-shell.conf' "$1"; }
+php_legacy_default_pool_override_file() { printf '/etc/php/%s/fpm/pool.d/99-wp-shell.conf' "$1"; }
+
+php_default_pool_file_is_managed() {
+    [[ -f "$1" && ! -L "$1" ]] &&
+        grep -Fxq '; Managed by wp-shell. Keep the distribution pool available with minimal idle use.' "$1"
+}
+
+php_fpm_effective_config_dump() {
+    LC_ALL=C "php-fpm$1" -tt 2>&1
+}
+
+# PHP-FPM -tt renders the merged configuration after every pool include has
+# been processed.  Parse that output instead of inferring precedence from a
+# filename or reading one fragment in isolation.
+read_effective_pool_settings() {
+    local version="$1" pool="$2" dump
+    validate_php_version "$version" || return 1
+    [[ "$pool" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+    dump="$(php_fpm_effective_config_dump "$version")" || return 1
+    awk -v wanted="$pool" '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        {
+            line=$0
+            sub(/^.*NOTICE:[[:space:]]*/, "", line)
+            sub(/\r$/, "", line)
+            if (line ~ /^\[[^][]+\]$/) {
+                section=line
+                sub(/^\[/, "", section)
+                sub(/\]$/, "", section)
+                active=(section == wanted)
+                if (active) {mode=""; limit=""}
+                next
+            }
+            if (!active || index(line, "=") == 0) next
+            key=trim(substr(line, 1, index(line, "=")-1))
+            value=trim(substr(line, index(line, "=")+1))
+            if (key == "pm") mode=value
+            else if (key == "pm.max_children") limit=value
+        }
+        END {
+            if (mode ~ /^(ondemand|dynamic|static)$/ && limit ~ /^[1-9][0-9]*$/) print mode "|" limit
+            else exit 1
+        }
+    ' <<< "$dump"
+}
+
+read_effective_default_pool_limit() {
+    local settings
+    settings="$(read_effective_pool_settings "$1" www)" || return 1
+    printf '%s' "${settings#*|}"
+}
+
+read_effective_site_pool_limit() {
+    local settings
+    settings="$(read_effective_pool_settings "$2" "$(site_pool_id "$1")")" || return 1
+    printf '%s' "${settings#*|}"
+}
+
+verify_effective_default_pool_target() {
+    [[ "$(read_effective_pool_settings "$1" www 2>/dev/null || true)" == 'ondemand|1' ]]
 }
 
 opcache_effective_values() {
@@ -883,6 +967,9 @@ set_opcache() {
     delta=$((memory - ${old%% *}))
     if ((delta > 0)) && { [[ ! "$available" =~ ^[0-9]+$ ]] || ((available < delta + reserve)); }; then
         die "Not enough available RAM to increase OPcache while preserving ${reserve}MB headroom."
+    fi
+    if ((delta > 0)) && ! opcache_candidate_worker_admission "$version" "$memory" "$strings"; then
+        die "Increasing OPcache was rejected before files or services changed because it would make PHP worker capacity unsafe."
     fi
     target="$(opcache_managed_ini "$version")"
     if [[ -e "$target" || -L "$target" ]]; then
@@ -1046,6 +1133,10 @@ swap_memory_mb() {
     awk '/^SwapTotal:/ {print int($2 / 1024)}' /proc/meminfo
 }
 
+swap_used_mb() {
+    awk '/^SwapTotal:/ {total=int($2/1024)} /^SwapFree:/ {free=int($2/1024)} END {print total-free}' /proc/meminfo
+}
+
 cpu_count() {
     nproc
 }
@@ -1063,8 +1154,80 @@ max_sites_for_memory() {
     fi
 }
 
+php_active_version_count() {
+    local version count=0
+    while IFS= read -r version; do
+        [[ -n "$version" ]] && count=$((count + 1))
+    done < <(unique_php_versions)
+    printf '%s' "$count"
+}
+
+php_worker_memory_estimate() {
+    local now since i domain stats count first last rank p95 candidate evidence=""
+    PHP_WORKER_ESTIMATE_MB=96
+    PHP_WORKER_EVIDENCE="baseline 96MB/process; insufficient valid PSS history"
+    command -v sqlite3 >/dev/null 2>&1 && [[ -s "$METRICS_DB" ]] || return 0
+    sqlite3 "$METRICS_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('site_samples','sample_health');" 2>/dev/null | grep -Fxq 2 || return 0
+    now="$(date +%s)"
+    since=$((now - 1209600))
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        stats="$(sqlite3 -separator '|' "$METRICS_DB" "SELECT COUNT(*),COALESCE(MIN(s.ts),0),COALESCE(MAX(s.ts),0) FROM site_samples s JOIN sample_health h ON h.ts=s.ts AND h.domain=s.domain AND h.component='php' AND h.valid=1 WHERE s.domain='$domain' AND s.ts >= $since AND s.php_pss_mb>0 AND s.php_active+s.php_idle>0;" 2>/dev/null || true)"
+        IFS='|' read -r count first last <<< "$stats"
+        [[ "$count" =~ ^[0-9]+$ && "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ ]] || continue
+        ((count >= 1000 && last-first >= 86400 && now-last <= 180)) || continue
+        rank=$(((count * 95 + 99) / 100 - 1))
+        p95="$(sqlite3 "$METRICS_DB" "SELECT 1.0*s.php_pss_mb/(s.php_active+s.php_idle) FROM site_samples s JOIN sample_health h ON h.ts=s.ts AND h.domain=s.domain AND h.component='php' AND h.valid=1 WHERE s.domain='$domain' AND s.ts >= $since AND s.php_pss_mb>0 AND s.php_active+s.php_idle>0 ORDER BY 1 LIMIT 1 OFFSET $rank;" 2>/dev/null || true)"
+        [[ "$p95" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+        candidate="$(awk -v value="$p95" 'BEGIN {printf "%d", int(value*1.25+0.999)}')"
+        ((candidate < 96)) && candidate=96
+        ((candidate > PHP_WORKER_ESTIMATE_MB)) && PHP_WORKER_ESTIMATE_MB="$candidate"
+        evidence+="${evidence:+, }$domain=${candidate}MB"
+    done
+    if [[ -n "$evidence" ]]; then
+        PHP_WORKER_EVIDENCE="valid per-worker PSS p95 plus 25% safety margin ($evidence); host estimate ${PHP_WORKER_ESTIMATE_MB}MB"
+    fi
+}
+
+php_override_summary() {
+    local i domain summary=""
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        [[ -n "${PHP_CHILD_OVERRIDES[$domain]:-}" ]] || continue
+        summary+="${summary:+, }$domain=${PHP_CHILD_OVERRIDES[$domain]}"
+    done
+    printf '%s' "${summary:-none}"
+}
+
+php_site_capacity_summary() {
+    local i domain summary=""
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        summary+="${summary:+, }$domain"
+        [[ "${SITE_WOOCOMMERCE[$i]}" != yes ]] || summary+="[WooCommerce]"
+    done
+    printf '%s' "${summary:-none}"
+}
+
+php_capacity_failure_message() {
+    local reason="$1"
+    printf 'PHP-FPM capacity admission failed before live changes.\n'
+    printf 'Reason: %s\n' "$reason"
+    printf 'Physical RAM: %sMB\n' "$(memory_mb)"
+    printf 'Swap: total %sMB, used %sMB (emergency protection only; not counted as worker capacity)\n' "$(swap_memory_mb)" "$(swap_used_mb)"
+    printf 'PHP total worker budget: %sMB\n' "$PHP_TOTAL_BUDGET_MB"
+    printf 'Worker memory estimate: %sMB (%s)\n' "$PHP_WORKER_ESTIMATE_MB" "$PHP_WORKER_EVIDENCE"
+    printf 'Sites: %s total; normal=%s weight=1; WooCommerce=%s weight=2\n' "$SITE_COUNT" "$PHP_NORMAL_SITE_COUNT" "$PHP_WOO_SITE_COUNT"
+    printf 'Sites involved: %s\n' "$(php_site_capacity_summary)"
+    printf 'Requested aggregate workers: %s (includes %s one-worker default PHP pool reserve(s))\n' "$PHP_REQUESTED_AGGREGATE_WORKERS" "$PHP_DEFAULT_POOL_WORKERS"
+    printf 'Safely available aggregate workers: %s\n' "$PHP_SAFE_AGGREGATE_WORKERS"
+    printf 'Manual tuning overrides: %s\n' "$(php_override_summary)"
+    printf 'Recommendation: reduce site count, reduce explicit worker overrides, add RAM, or move sites to another VPS. Do not increase Swap as a substitute for RAM.'
+}
+
 calculate_resource_budget() {
-    local total_mem site_count os_reserve cache_reserve available version opcache redis_override
+    local output_mode="${1:-}" admission_mode="${2:-enforce}"
+    local total_mem site_count os_reserve cache_reserve available version opcache redis_override max_transient
     total_mem="$(memory_mb)"
     site_count="${SITE_COUNT:-1}"
     ((site_count < 1)) && site_count=1
@@ -1072,6 +1235,12 @@ calculate_resource_budget() {
 
     os_reserve=$((total_mem * 25 / 100))
     ((os_reserve < 384)) && os_reserve=384
+    PHP_TRANSIENT_RESERVE_MB=$((total_mem * 10 / 100))
+    ((PHP_TRANSIENT_RESERVE_MB < 128)) && PHP_TRANSIENT_RESERVE_MB=128
+    max_transient=$((os_reserve - 256))
+    ((PHP_TRANSIENT_RESERVE_MB > max_transient)) && PHP_TRANSIENT_RESERVE_MB="$max_transient"
+    ((PHP_TRANSIENT_RESERVE_MB < 0)) && PHP_TRANSIENT_RESERVE_MB=0
+    HOST_SYSTEM_RESERVE_MB=$((os_reserve - PHP_TRANSIENT_RESERVE_MB))
     if [[ "$ENVIRONMENT_MODE" == "single" ]]; then
         MARIADB_BUFFER_MB=$((total_mem * 35 / 100))
     else
@@ -1099,47 +1268,185 @@ calculate_resource_budget() {
     done < <(opcache_budget_versions)
     available=$((total_mem - os_reserve - MARIADB_BUFFER_MB - REDIS_MAX_MEMORY_MB - cache_reserve - OPCACHE_TOTAL_BUDGET_MB))
     PHP_TOTAL_BUDGET_MB=$available
-    ((PHP_TOTAL_BUDGET_MB < 192)) && PHP_TOTAL_BUDGET_MB=192
+    ((PHP_TOTAL_BUDGET_MB < 0)) && PHP_TOTAL_BUDGET_MB=0
     if ((PHP_TOTAL_BUDGET_MB > total_mem * 35 / 100)); then
         PHP_TOTAL_BUDGET_MB=$((total_mem * 35 / 100))
     fi
-    # With one ondemand pool, a 2GB host that also has at least 1GB swap can use
-    # an eight-worker starting ceiling while retaining the normal evidence tuner.
-    if ((total_mem >= 1800 && total_mem <= 2300 && site_count == 1 && $(swap_memory_mb) >= 1024 && PHP_TOTAL_BUDGET_MB < 768)); then
-        PHP_TOTAL_BUDGET_MB=768
-    fi
 
-    calculate_site_php_allocations
-    if [[ "${1:-}" != "quiet" ]]; then
-        log_message INFO "Resource budget: OS reserve ${os_reserve}MB, MariaDB ${MARIADB_BUFFER_MB}MB, Redis ${REDIS_MAX_MEMORY_MB}MB, shared OPcache ${OPCACHE_TOTAL_BUDGET_MB}MB, PHP-FPM workers ${PHP_TOTAL_BUDGET_MB}MB."
-        if ((available < 192)); then
-            log_message WARNING "Minimum PHP worker allowance exceeds the remaining budget; reduce services/sites or add RAM."
-        fi
+    if ! calculate_site_php_allocations; then
+        [[ "$admission_mode" == advisory ]] && return 1
+        die "$PHP_CAPACITY_ERROR"
+    fi
+    if [[ "$output_mode" != quiet ]]; then
+        log_message INFO "Resource budget: system/page-cache reserve ${HOST_SYSTEM_RESERVE_MB}MB, transient PHP/backup reserve ${PHP_TRANSIENT_RESERVE_MB}MB, MariaDB planning reserve ${MARIADB_BUFFER_MB}MB, Redis ${REDIS_MAX_MEMORY_MB}MB, Nginx site cache zones ${cache_reserve}MB, shared OPcache ${OPCACHE_TOTAL_BUDGET_MB}MB, PHP-FPM workers ${PHP_TOTAL_BUDGET_MB}MB."
     fi
 }
 
 calculate_site_php_allocations() {
-    local process_memory=96 total_slots total_weight=0 i weight children
+    local total_slots remaining i weight step children domain progress requested
     SITE_PHP_MAX_CHILDREN=()
-    ((SITE_COUNT > 0)) || return 0
-    total_slots=$((PHP_TOTAL_BUDGET_MB / process_memory))
-    ((total_slots < SITE_COUNT * 2)) && total_slots=$((SITE_COUNT * 2))
+    PHP_CAPACITY_ERROR=""
+    PHP_REQUESTED_AGGREGATE_WORKERS=0
+    PHP_ESTIMATED_ALLOCATION_MB=0
+    PHP_NORMAL_SITE_COUNT=0
+    PHP_WOO_SITE_COUNT=0
+    php_worker_memory_estimate
+    PHP_DEFAULT_POOL_WORKERS="$(php_active_version_count)"
+    PHP_SAFE_AGGREGATE_WORKERS=$((PHP_TOTAL_BUDGET_MB / PHP_WORKER_ESTIMATE_MB))
+    requested="$PHP_DEFAULT_POOL_WORKERS"
     for ((i = 1; i <= SITE_COUNT; i++)); do
-        weight=1
-        [[ "${SITE_WOOCOMMERCE[$i]}" == "yes" ]] && weight=2
-        total_weight=$((total_weight + weight))
-    done
-    for ((i = 1; i <= SITE_COUNT; i++)); do
-        weight=1
-        [[ "${SITE_WOOCOMMERCE[$i]}" == "yes" ]] && weight=2
-        children=$((total_slots * weight / total_weight))
-        ((children < 2)) && children=2
-        ((children > 50)) && children=50
-        if [[ -n "${PHP_CHILD_OVERRIDES[${SITE_DOMAINS[$i]}]:-}" ]]; then
-            children="${PHP_CHILD_OVERRIDES[${SITE_DOMAINS[$i]}]}"
+        domain="${SITE_DOMAINS[$i]}"
+        if [[ "${SITE_WOOCOMMERCE[$i]}" == yes ]]; then
+            PHP_WOO_SITE_COUNT=$((PHP_WOO_SITE_COUNT + 1))
+        else
+            PHP_NORMAL_SITE_COUNT=$((PHP_NORMAL_SITE_COUNT + 1))
         fi
-        SITE_PHP_MAX_CHILDREN[i]="$children"
+        if [[ -n "${PHP_CHILD_OVERRIDES[$domain]:-}" ]]; then
+            children="${PHP_CHILD_OVERRIDES[$domain]}"
+            if [[ ! "$children" =~ ^[0-9]+$ ]] || ((children < 1 || children > 50)); then
+                PHP_REQUESTED_AGGREGATE_WORKERS="$requested"
+                PHP_CAPACITY_ERROR="$(php_capacity_failure_message "Invalid explicit override for $domain: $children (allowed 1-50).")"
+                return 1
+            fi
+            requested=$((requested + children))
+            SITE_PHP_MAX_CHILDREN[i]="$children"
+        else
+            requested=$((requested + 1))
+            SITE_PHP_MAX_CHILDREN[i]=1
+        fi
     done
+    PHP_REQUESTED_AGGREGATE_WORKERS="$requested"
+    if ((requested > PHP_SAFE_AGGREGATE_WORKERS)); then
+        PHP_CAPACITY_ERROR="$(php_capacity_failure_message "At least one worker per site plus explicit overrides and default pools cannot fit the PHP worker budget.")"
+        SITE_PHP_MAX_CHILDREN=()
+        return 1
+    fi
+    total_slots="$PHP_SAFE_AGGREGATE_WORKERS"
+    remaining=$((total_slots - requested))
+    while ((remaining > 0)); do
+        progress=no
+        for ((i = 1; i <= SITE_COUNT && remaining > 0; i++)); do
+            domain="${SITE_DOMAINS[$i]}"
+            [[ -z "${PHP_CHILD_OVERRIDES[$domain]:-}" ]] || continue
+            weight=1
+            [[ "${SITE_WOOCOMMERCE[$i]}" == yes ]] && weight=2
+            for ((step=0; step<weight && remaining>0; step++)); do
+                children="${SITE_PHP_MAX_CHILDREN[$i]}"
+                ((children < 50)) || continue
+                SITE_PHP_MAX_CHILDREN[i]=$((children + 1))
+                remaining=$((remaining - 1))
+                progress=yes
+            done
+        done
+        [[ "$progress" == yes ]] || break
+    done
+    requested="$PHP_DEFAULT_POOL_WORKERS"
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        requested=$((requested + SITE_PHP_MAX_CHILDREN[i]))
+    done
+    PHP_REQUESTED_AGGREGATE_WORKERS="$requested"
+    PHP_ESTIMATED_ALLOCATION_MB=$((requested * PHP_WORKER_ESTIMATE_MB))
+    if ((PHP_ESTIMATED_ALLOCATION_MB > PHP_TOTAL_BUDGET_MB)); then
+        PHP_CAPACITY_ERROR="$(php_capacity_failure_message "Internal allocation invariant violation: estimated aggregate worker memory exceeds the hard budget.")"
+        SITE_PHP_MAX_CHILDREN=()
+        return 1
+    fi
+    return 0
+}
+
+php_refresh_current_aggregate_workers() {
+    local i version domain limit workers=0 summary=""
+    PHP_CURRENT_AGGREGATE_WORKERS=0
+    PHP_CURRENT_DEFAULT_POOL_WORKERS=0
+    PHP_CURRENT_CAPACITY_ERROR=""
+    PHP_CURRENT_DEFAULT_POOL_SUMMARY=""
+    SITE_EFFECTIVE_PHP_MAX_CHILDREN=()
+    while IFS= read -r version; do
+        [[ -n "$version" ]] || continue
+        if ! limit="$(read_effective_default_pool_limit "$version")"; then
+            PHP_CURRENT_CAPACITY_ERROR="Cannot determine the effective [www] pm.max_children for PHP $version from php-fpm${version} -tt."
+            return 1
+        fi
+        workers=$((workers + limit))
+        PHP_CURRENT_DEFAULT_POOL_WORKERS=$((PHP_CURRENT_DEFAULT_POOL_WORKERS + limit))
+        summary+="${summary:+, }PHP $version=$limit"
+    done < <(unique_php_versions)
+    PHP_CURRENT_DEFAULT_POOL_SUMMARY="${summary:-none}"
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        version="${SITE_PHP_VERSIONS[$i]}"
+        if ! limit="$(read_effective_site_pool_limit "$domain" "$version")"; then
+            PHP_CURRENT_CAPACITY_ERROR="Cannot determine the effective pm.max_children for $domain (PHP $version) from php-fpm${version} -tt."
+            return 1
+        fi
+        SITE_EFFECTIVE_PHP_MAX_CHILDREN[i]="$limit"
+        workers=$((workers + limit))
+    done
+    PHP_CURRENT_AGGREGATE_WORKERS="$workers"
+}
+
+php_current_aggregate_workers() {
+    php_refresh_current_aggregate_workers || return 1
+    printf '%s' "$PHP_CURRENT_AGGREGATE_WORKERS"
+}
+
+opcache_candidate_worker_admission() (
+    local version="$1" memory="$2" strings="$3" current_mb
+    OPCACHE_MEMORY_OVERRIDES[$version]="$memory"
+    OPCACHE_STRINGS_OVERRIDES[$version]="$strings"
+    if ! calculate_resource_budget quiet advisory; then
+        printf '%s\n' "$PHP_CAPACITY_ERROR" >&2
+        return 1
+    fi
+    if ! php_refresh_current_aggregate_workers; then
+        printf 'Current PHP worker exposure is UNKNOWN: %s\n' "$PHP_CURRENT_CAPACITY_ERROR" >&2
+        return 1
+    fi
+    current_mb=$((PHP_CURRENT_AGGREGATE_WORKERS * PHP_WORKER_ESTIMATE_MB))
+    if ((current_mb > PHP_TOTAL_BUDGET_MB)); then
+        printf 'Candidate OPcache would leave a %sMB PHP worker budget, but current effective pools expose %s workers (%sMB). Reduce/reapply pool capacity before increasing OPcache.\n' \
+            "$PHP_TOTAL_BUDGET_MB" "$PHP_CURRENT_AGGREGATE_WORKERS" "$current_mb" >&2
+        return 1
+    fi
+)
+
+php_capacity_status_report() {
+    local admission=SAFE current_known=yes current_workers=0 current_mb=0
+    if ! calculate_resource_budget quiet advisory; then admission=BLOCKED; fi
+    if php_refresh_current_aggregate_workers; then
+        current_workers="$PHP_CURRENT_AGGREGATE_WORKERS"
+        current_mb=$((current_workers * PHP_WORKER_ESTIMATE_MB))
+    else
+        current_known=no
+    fi
+    if [[ "$current_known" == no ]]; then
+        printf 'PHP capacity: UNKNOWN\n'
+    elif ((current_mb > PHP_TOTAL_BUDGET_MB)); then
+        printf 'PHP capacity: OVERCOMMITTED\n'
+    else
+        printf 'PHP capacity: %s\n' "$admission"
+    fi
+    printf '  Physical RAM: %sMB; Swap total/used: %s/%sMB (not capacity)\n' "$(memory_mb)" "$(swap_memory_mb)" "$(swap_used_mb)"
+    printf '  Hard PHP worker budget: %sMB; estimate: %sMB/process\n' "$PHP_TOTAL_BUDGET_MB" "$PHP_WORKER_ESTIMATE_MB"
+    printf '  Estimate evidence: %s\n' "$PHP_WORKER_EVIDENCE"
+    if [[ "$current_known" == yes ]]; then
+        printf '  Current managed/default workers: %s; estimated aggregate: %sMB\n' "$current_workers" "$current_mb"
+        printf '  Effective default pools: %s\n' "$PHP_CURRENT_DEFAULT_POOL_SUMMARY"
+    else
+        printf '  Current managed/default workers: UNKNOWN\n'
+        printf '  Current capacity evidence: %s\n' "$PHP_CURRENT_CAPACITY_ERROR"
+    fi
+    printf '  System/page-cache reserve: %sMB; transient PHP/backup reserve: %sMB; OPcache: %sMB across %s PHP version(s)\n' \
+        "$HOST_SYSTEM_RESERVE_MB" "$PHP_TRANSIENT_RESERVE_MB" "$OPCACHE_TOTAL_BUDGET_MB" "$PHP_DEFAULT_POOL_WORKERS"
+    if [[ "$admission" == BLOCKED ]]; then
+        printf '%s\n' "$PHP_CAPACITY_ERROR"
+    else
+        printf '  Proposed managed/default workers: %s; estimated aggregate: %sMB\n' \
+            "$PHP_REQUESTED_AGGREGATE_WORKERS" "$PHP_ESTIMATED_ALLOCATION_MB"
+        if [[ "$current_known" == yes ]] && ((current_mb > PHP_TOTAL_BUDGET_MB)); then
+            printf '  A confirmed apply will replace default-managed limits with the safe proposed allocation; explicit overrides are never silently clamped.\n'
+        fi
+    fi
 }
 
 check_capacity() {
@@ -1317,6 +1624,7 @@ configure_php() {
     CURRENT_STEP="configure PHP-FPM"
     calculate_resource_budget
     local version memory_limit i domain pool_id pool_file max_children opcache_memory opcache_strings values run_user run_group
+    local default_pool_file legacy_default_pool_file
     local -A before=()
     memory_limit="256M"
     (( $(memory_mb) >= 4096 )) && memory_limit="512M"
@@ -1326,20 +1634,30 @@ configure_php() {
         before[$version]="$(php_config_fingerprint "$version")"
         install -d -m 0755 "/etc/php/$version/fpm/pool.d" "/etc/php/$version/fpm/conf.d"
         transaction_begin "$CURRENT_STEP"
-        transaction_mark_service "php:$version"
         values="$(opcache_values "$version")"
         read -r opcache_memory opcache_strings <<< "$values"
         OPCACHE_MEMORY_OVERRIDES[$version]="$opcache_memory"
         OPCACHE_STRINGS_OVERRIDES[$version]="$opcache_strings"
         write_opcache_ini "$version" "$opcache_memory" "$opcache_strings"
-        write_managed_file "/etc/php/$version/fpm/pool.d/99-wp-shell.conf" 0644 root root <<EOF
+        default_pool_file="$(php_default_pool_override_file "$version")"
+        legacy_default_pool_file="$(php_legacy_default_pool_override_file "$version")"
+        if [[ -e "$default_pool_file" || -L "$default_pool_file" ]]; then
+            php_default_pool_file_is_managed "$default_pool_file" ||
+                die "Refusing to replace an unmanaged PHP default-pool override: $default_pool_file"
+        fi
+        if [[ -e "$legacy_default_pool_file" || -L "$legacy_default_pool_file" ]]; then
+            php_default_pool_file_is_managed "$legacy_default_pool_file" ||
+                die "Refusing to remove an unrecognized legacy PHP default-pool override: $legacy_default_pool_file"
+        fi
+        write_managed_file "$default_pool_file" 0644 root root <<EOF
 ; Managed by wp-shell. Keep the distribution pool available with minimal idle use.
 [www]
 pm = ondemand
-pm.max_children = 2
+pm.max_children = 1
 pm.process_idle_timeout = 20s
 pm.max_requests = 300
 EOF
+        remove_managed_file "$legacy_default_pool_file"
         write_managed_file "/etc/php/$version/fpm/conf.d/99-wp-shell.ini" 0644 root root <<EOF
 ; Managed by wp-shell.
 memory_limit = $memory_limit
@@ -1400,8 +1718,21 @@ EOF
     while IFS= read -r version; do
         [[ -n "$version" ]] || continue
         "php-fpm${version}" -t || return 1
+        verify_effective_default_pool_target "$version" ||
+            die "PHP $version effective [www] pool is not pm=ondemand with pm.max_children=1; FPM was not reloaded. Check later pool overrides."
         values="$(opcache_values "$version")"
         [[ "$(opcache_effective_values "$version")" == "$values" ]] || die "PHP $version OPcache settings are overridden by another INI file; FPM was not restarted."
+    done < <(unique_php_versions)
+    for ((i = 1; i <= SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        version="${SITE_PHP_VERSIONS[$i]}"
+        max_children="${SITE_PHP_MAX_CHILDREN[$i]}"
+        [[ "$(read_effective_site_pool_limit "$domain" "$version" 2>/dev/null || true)" == "$max_children" ]] ||
+            die "PHP $version effective pool for $domain does not have pm.max_children=$max_children; FPM was not reloaded. Check later pool overrides."
+    done
+    while IFS= read -r version; do
+        [[ -n "$version" ]] || continue
+        transaction_mark_service "php:$version"
         systemctl enable "php${version}-fpm"
         if systemctl is-active --quiet "php${version}-fpm"; then
             if [[ "${before[$version]}" != "$(php_config_fingerprint "$version")" ]]; then
@@ -3519,12 +3850,16 @@ collect_site_input() {
     SITE_TITLES[next_index]="$title"
     SITE_PATHS[next_index]="/var/www/$domain/public"
     SITE_MODES[next_index]="managed"
+    # Capacity admission must precede persistent site/policy changes.
+    calculate_resource_budget quiet
     save_sites_config
     set_site_policy "$domain" page-cache "$page_cache"
     set_site_policy "$domain" object-cache "$object_cache"
 }
 
 prepare_stack() {
+    # Refuse an unsafe PHP allocation before package/service/config changes.
+    calculate_resource_budget quiet
     check_capacity
     install_system_packages
     configure_mariadb
@@ -4703,10 +5038,42 @@ read_pool_limit() {
     if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then printf '%s' "$value"; else printf '%s' "$fallback"; fi
 }
 
+read_managed_site_pool_limit() {
+    local domain="$1" version="$2" file value
+    file="/etc/php/$version/fpm/pool.d/wp-shell-$(site_pool_id "$domain").conf"
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    grep -Fxq "; Managed by wp-shell for $domain." "$file" || return 1
+    value="$(read_pool_limit "$domain" "$version" 0)"
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s' "$value"
+}
+
+php_tuning_pool_ownership_error() {
+    local i domain version managed effective
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        version="${SITE_PHP_VERSIONS[$i]}"
+        if ! managed="$(read_managed_site_pool_limit "$domain" "$version")"; then
+            printf '%s does not have a regular wp-shell-managed PHP-FPM pool file; automatic tuning is disabled.\n' "$domain"
+            return 1
+        fi
+        effective="${SITE_EFFECTIVE_PHP_MAX_CHILDREN[$i]:-}"
+        if [[ ! "$effective" =~ ^[1-9][0-9]*$ ]]; then
+            printf 'The effective PHP-FPM pool limit for %s is UNKNOWN; automatic tuning is disabled.\n' "$domain"
+            return 1
+        fi
+        if [[ "$managed" != "$effective" ]]; then
+            printf '%s managed pool limit is %s but php-fpm reports effective limit %s; resolve the external/later override before automatic tuning.\n' \
+                "$domain" "$managed" "$effective"
+            return 1
+        fi
+    done
+}
+
 refresh_actual_pool_limits() {
     local i
     for ((i=1; i<=SITE_COUNT; i++)); do
-        SITE_PHP_MAX_CHILDREN[i]="$(read_pool_limit "${SITE_DOMAINS[$i]}" "${SITE_PHP_VERSIONS[$i]}" "${SITE_PHP_MAX_CHILDREN[$i]:-2}")"
+        SITE_PHP_MAX_CHILDREN[i]="$(read_pool_limit "${SITE_DOMAINS[$i]}" "${SITE_PHP_VERSIONS[$i]}" "${SITE_PHP_MAX_CHILDREN[$i]:-1}")"
     done
 }
 
@@ -4939,7 +5306,8 @@ collect_metrics() (
     exec 8>"$STATE_DIR/collector.lock"
     flock -n 8 || return 0
     init_metrics_database
-    calculate_resource_budget quiet
+    # Keep collecting evidence when an existing host is overcommitted.
+    calculate_resource_budget quiet advisory || true
     refresh_actual_pool_limits
     local ts i stage cursor
     ts="$(date +%s)"
@@ -5439,14 +5807,92 @@ curses.wrapper(run)
 PY
 }
 
+php_tuning_host_veto_reasons() {
+    local seconds="$1" capacity_source="${2:-refresh}" since now current_workers=0 current_mb=0 mariadb_reason system_stats count first_swap last_swap max_swap swap_samples
+    local pressure_stats oom_delta memory_psi io_psi io_wait
+    now="$(date +%s)"
+    since=$((now - seconds))
+    if [[ "$capacity_source" == current ]] || php_refresh_current_aggregate_workers; then
+        current_workers="$PHP_CURRENT_AGGREGATE_WORKERS"
+        current_mb=$((current_workers * PHP_WORKER_ESTIMATE_MB))
+        if ((current_mb > PHP_TOTAL_BUDGET_MB)); then
+            printf 'Current aggregate PHP allocation is %sMB (%s workers), above the %sMB hard budget.\n' "$current_mb" "$current_workers" "$PHP_TOTAL_BUDGET_MB"
+        fi
+    else
+        printf 'Current PHP worker capacity is UNKNOWN; automatic expansion is vetoed: %s\n' "$PHP_CURRENT_CAPACITY_ERROR"
+    fi
+    mariadb_reason="$(mariadb_apply_block_reason 2>/dev/null || true)"
+    [[ -z "$mariadb_reason" ]] || printf 'MariaDB admission is unsafe or unknown: %s\n' "$mariadb_reason"
+    system_stats="$(sqlite3 -separator '|' "$METRICS_DB" "SELECT COUNT(*),COALESCE((SELECT swap_used_mb FROM system_samples WHERE ts >= $since ORDER BY ts LIMIT 1),0),COALESCE((SELECT swap_used_mb FROM system_samples WHERE ts >= $since ORDER BY ts DESC LIMIT 1),0),COALESCE(MAX(swap_used_mb),0),COALESCE(SUM(CASE WHEN swap_used_mb>0 THEN 1 ELSE 0 END),0) FROM system_samples WHERE ts >= $since;" 2>/dev/null || true)"
+    IFS='|' read -r count first_swap last_swap max_swap swap_samples <<< "$system_stats"
+    if [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 && "$max_swap" =~ ^[0-9]+$ && "$max_swap" -ge 64 ]] &&
+        { ((last_swap > first_swap + 32)) || ((swap_samples * 10 >= count)); }; then
+        printf 'Recent metrics show sustained or growing Swap use; Swap is a risk signal, not worker capacity.\n'
+    fi
+    pressure_stats="$(sqlite3 -separator '|' "$METRICS_DB" "WITH relevant AS (SELECT * FROM system_pressure WHERE ts >= $since UNION ALL SELECT * FROM system_pressure WHERE ts=(SELECT MAX(ts) FROM system_pressure WHERE ts < $since)), ordered AS (SELECT *,LAG(oom_kills) OVER (ORDER BY ts) AS previous_oom FROM relevant) SELECT COALESCE(SUM(CASE WHEN previous_oom IS NULL OR oom_kills<0 THEN 0 WHEN previous_oom<0 THEN oom_kills WHEN oom_kills>=previous_oom THEN oom_kills-previous_oom ELSE oom_kills END),0),COALESCE(MAX(CASE WHEN ts >= $since THEN memory_psi END),-1),COALESCE(MAX(CASE WHEN ts >= $since THEN io_psi END),-1),COALESCE(MAX(CASE WHEN ts >= $since THEN io_wait END),-1) FROM ordered;" 2>/dev/null || true)"
+    IFS='|' read -r oom_delta memory_psi io_psi io_wait <<< "$pressure_stats"
+    [[ "$oom_delta" =~ ^[0-9]+$ ]] && ((oom_delta > 0)) && printf 'The kernel OOM counter increased in the observation window.\n'
+    [[ "$memory_psi" =~ ^-?[0-9]+([.][0-9]+)?$ ]] && awk -v value="$memory_psi" 'BEGIN {exit !(value>=1.0)}' && \
+        printf 'Memory PSI reached %s%%, which vetoes worker expansion.\n' "$memory_psi"
+    if { [[ "$io_psi" =~ ^-?[0-9]+([.][0-9]+)?$ ]] && awk -v value="$io_psi" 'BEGIN {exit !(value>=5.0)}'; } ||
+        { [[ "$io_wait" =~ ^-?[0-9]+([.][0-9]+)?$ ]] && awk -v value="$io_wait" 'BEGIN {exit !(value>=20.0)}'; }; then
+        printf 'Severe IO pressure was observed (IO PSI %s%%, IO wait %s%%).\n' "${io_psi:--1}" "${io_wait:--1}"
+    fi
+}
+
+php_validate_tuning_recommendations() (
+    local recommendation_file="$1" domain current proposed _reason index effective ownership_error
+    local prospective_workers prospective_mb
+    local -A seen=()
+    if ! php_refresh_current_aggregate_workers; then
+        printf 'Current PHP worker capacity is UNKNOWN: %s\n' "$PHP_CURRENT_CAPACITY_ERROR" >&2
+        return 1
+    fi
+    if ! ownership_error="$(php_tuning_pool_ownership_error)"; then
+        printf '%s\n' "$ownership_error" >&2
+        return 1
+    fi
+    prospective_workers="$PHP_CURRENT_AGGREGATE_WORKERS"
+    while IFS='|' read -r domain current proposed _reason; do
+        index="$(site_index_by_domain "$domain")" || { printf 'Unknown tuning domain: %s\n' "$domain" >&2; return 1; }
+        [[ -z "${seen[$domain]:-}" ]] || { printf 'Duplicate tuning domain: %s\n' "$domain" >&2; return 1; }
+        seen[$domain]=1
+        [[ "$proposed" =~ ^[0-9]+$ && "$proposed" -ge 1 && "$proposed" -le 50 ]] || return 1
+        effective="${SITE_EFFECTIVE_PHP_MAX_CHILDREN[$index]:-}"
+        [[ "$current" == "$effective" ]] || {
+            printf '%s recommendation was based on limit %s but its effective limit is now %s.\n' "$domain" "$current" "${effective:-UNKNOWN}" >&2
+            return 1
+        }
+        prospective_workers=$((prospective_workers - effective + proposed))
+    done < "$recommendation_file"
+    prospective_mb=$((prospective_workers * PHP_WORKER_ESTIMATE_MB))
+    if ((prospective_mb > PHP_TOTAL_BUDGET_MB)); then
+        printf 'Prospective effective PHP allocation is %sMB (%s workers), above the %sMB hard budget; current effective default pools remain unchanged by tune --apply.\n' \
+            "$prospective_mb" "$prospective_workers" "$PHP_TOTAL_BUDGET_MB" >&2
+        return 1
+    fi
+)
+
 build_tuning_recommendations() {
-    local output="$1" seconds="${2:-1209600}" now since i domain current stats count first last peak saturated worker
-    local system_stats system_count min_available_pct peak_cpu system_last allocation=0 recommended reason
+    local output="$1" seconds="${2:-1209600}" now since i domain current stats count first last peak saturated
+    local system_stats system_count min_available_pct peak_cpu system_last allocation recommended reason ownership_error
     local -A evidence=()
     : > "$output"
     # Legacy rows and failed probes are historical evidence, not safe tuning input.
     init_metrics_database
     refresh_actual_pool_limits
+    php_worker_memory_estimate
+    if ! php_refresh_current_aggregate_workers; then
+        PHP_TUNING_VETO_REASONS="Current PHP worker capacity is UNKNOWN; automatic expansion is vetoed: $PHP_CURRENT_CAPACITY_ERROR"
+        return 0
+    fi
+    if ! ownership_error="$(php_tuning_pool_ownership_error)"; then
+        PHP_TUNING_VETO_REASONS="$ownership_error"
+        return 0
+    fi
+    PHP_TUNING_VETO_REASONS="$(php_tuning_host_veto_reasons "$seconds" current)"
+    [[ -z "$PHP_TUNING_VETO_REASONS" ]] || return 0
+    allocation=$((PHP_CURRENT_AGGREGATE_WORKERS * PHP_WORKER_ESTIMATE_MB))
     now="$(date +%s)"
     since=$((now - seconds))
     system_stats="$(sqlite3 -separator '|' "$METRICS_DB" "SELECT COUNT(*),COALESCE(MIN(100.0*s.mem_available_mb/NULLIF(s.mem_total_mb,0)),0),COALESCE(MAX(s.cpu_pct),100),COALESCE(MAX(s.ts),0) FROM system_samples s JOIN sample_health h ON h.ts=s.ts AND h.domain='' AND h.component='system' AND h.valid=1 WHERE s.ts >= $since;")"
@@ -5454,46 +5900,45 @@ build_tuning_recommendations() {
     ((system_count >= 1000 && now-system_last <= 180)) || return 0
     for ((i = 1; i <= SITE_COUNT; i++)); do
         domain="${SITE_DOMAINS[$i]}"
-        current="${SITE_PHP_MAX_CHILDREN[$i]:-2}"
+        current="${SITE_EFFECTIVE_PHP_MAX_CHILDREN[$i]}"
         stats="$(sqlite3 -separator '|' "$METRICS_DB" "SELECT COUNT(*),COALESCE(MIN(s.ts),0),COALESCE(MAX(s.ts),0),COALESCE(MAX(s.php_active),0),COALESCE(SUM(CASE WHEN s.php_queue>0 OR (s.php_active>=s.php_max_children AND s.php_max_children>0) THEN 1 ELSE 0 END),0),CAST(MAX(96,COALESCE(MAX(1.25*s.php_pss_mb/NULLIF(s.php_active+s.php_idle,0)),96))+0.999 AS INTEGER) FROM site_samples s JOIN sample_health h ON h.ts=s.ts AND h.domain=s.domain AND h.component='php' AND h.valid=1 WHERE s.domain='$domain' AND s.ts >= $since;")"
-        IFS='|' read -r count first last peak saturated worker <<< "$stats"
+        IFS='|' read -r count first last peak saturated _worker <<< "$stats"
         # All pools need valid evidence, otherwise their future memory demand is unknown.
         ((count >= 1000 && last-first >= 86400 && now-last <= 180)) || return 0
         evidence[$domain]="$stats"
-        allocation=$((allocation + current * worker))
     done
     for ((i = 1; i <= SITE_COUNT; i++)); do
         domain="${SITE_DOMAINS[$i]}"
-        current="${SITE_PHP_MAX_CHILDREN[$i]:-2}"
-        IFS='|' read -r count first last peak saturated worker <<< "${evidence[$domain]}"
+        current="${SITE_EFFECTIVE_PHP_MAX_CHILDREN[$i]}"
+        IFS='|' read -r count first last peak saturated _worker <<< "${evidence[$domain]}"
         recommended="$current"
         reason=""
         if awk -v m="$min_available_pct" -v c="$peak_cpu" 'BEGIN{exit !(m>=25 && c<85)}'; then
             if ((saturated >= 10 && saturated * 100 >= count)); then
                 recommended=$((current + (current + 4) / 5))
                 ((recommended > 50)) && recommended=50
-                while ((recommended > current && allocation + (recommended-current)*worker > PHP_TOTAL_BUDGET_MB)); do
+                while ((recommended > current && allocation + (recommended-current)*PHP_WORKER_ESTIMATE_MB > PHP_TOTAL_BUDGET_MB)); do
                     recommended=$((recommended-1))
                 done
-                reason="Repeated saturation; CPU <85%; memory >=25%; measured worker estimate ${worker}MB; within global budget"
-            elif ((last-first >= 1200000 && peak * 3 < current && current > 2 && saturated == 0)); then
+                reason="Repeated saturation; CPU <85%; memory >=25%; host worker estimate ${PHP_WORKER_ESTIMATE_MB}MB; within hard global budget"
+            elif ((last-first >= 1200000 && peak * 3 < current && current > 1 && saturated == 0)); then
                 recommended=$((current - (current + 4) / 5))
-                ((recommended < 2)) && recommended=2
+                ((recommended < 1)) && recommended=1
                 reason="Fourteen days of valid samples; peak below one third of the actual pool limit"
             fi
         fi
         if ((recommended != current)); then
             printf '%s|%s|%s|%s\n' "$domain" "$current" "$recommended" "$reason" >> "$output"
-            allocation=$((allocation + (recommended-current)*worker))
+            allocation=$((allocation + (recommended-current)*PHP_WORKER_ESTIMATE_MB))
         fi
     done
 }
 
 analyze_metrics() {
-    local range="${1:-7d}" seconds since recommendation_file
+    local range="${1:-7d}" seconds since recommendation_file capacity_safe=yes
     seconds="$(duration_seconds "$range")" || die "Unsupported range: $range (use 1h, 6h, 24h, 7d, 14d, or 30d)."
     [[ -s "$METRICS_DB" ]] || die "No metrics are available yet. Run: sudo wp-shell metrics collect"
-    calculate_resource_budget
+    if ! calculate_resource_budget quiet advisory; then capacity_safe=no; fi
     since=$(( $(date +%s) - seconds ))
     printf 'wp-shell resource analysis | range %s\n\n' "$range"
     sqlite3 -header -column "$METRICS_DB" "SELECT COUNT(*) AS Samples, printf('%.1f%%',MAX(cpu_pct)) AS 'Peak CPU', printf('%.1f%%',MIN(100.0*mem_available_mb/NULLIF(mem_total_mb,0))) AS 'Minimum free memory', printf('%.0f%%',MAX(disk_pct)) AS 'Peak disk' FROM system_samples WHERE ts >= $since;"
@@ -5501,9 +5946,15 @@ analyze_metrics() {
     sqlite3 -header -column "$METRICS_DB" "WITH ordered AS (SELECT *,LAG(php_max_reached) OVER (PARTITION BY domain ORDER BY ts) AS previous_reached FROM site_samples WHERE ts >= $since) SELECT domain AS Domain,COUNT(*) AS Samples,MAX(php_active) AS 'Peak active',MAX(php_queue) AS 'Peak queue',COALESCE(SUM(CASE WHEN previous_reached IS NULL THEN 0 WHEN php_max_reached >= previous_reached THEN php_max_reached-previous_reached ELSE php_max_reached END),0) AS 'New max events',printf('%.0f MB',MAX(php_pss_mb)) AS 'Peak PSS',printf('%.0f MB',MAX(php_rss_mb)) AS 'Peak RSS sum',printf('%.0f ms',MAX(p95_ms)) AS 'Peak P95' FROM ordered GROUP BY domain ORDER BY domain;"
     printf '\nShared services\n'
     sqlite3 -header -column "$METRICS_DB" "WITH ordered AS (SELECT *,LAG(mariadb_slow_queries) OVER (ORDER BY ts) AS previous_slow,LAG(redis_evicted) OVER (ORDER BY ts) AS previous_evicted FROM service_samples WHERE ts >= $since) SELECT MAX(mariadb_threads) AS 'Peak DB threads',COALESCE(SUM(CASE WHEN previous_slow IS NULL THEN 0 WHEN mariadb_slow_queries >= previous_slow THEN mariadb_slow_queries-previous_slow ELSE mariadb_slow_queries END),0) AS 'New slow queries',printf('%.1f MB',MAX(redis_used_mb)) AS 'Peak Redis',COALESCE(SUM(CASE WHEN previous_evicted IS NULL THEN 0 WHEN redis_evicted >= previous_evicted THEN redis_evicted-previous_evicted ELSE redis_evicted END),0) AS 'Redis evictions' FROM ordered;"
-    printf '\nConfigured budget: MariaDB %sMB | Redis %sMB | shared OPcache %sMB | PHP-FPM workers %sMB\n' "$MARIADB_BUFFER_MB" "$REDIS_MAX_MEMORY_MB" "$OPCACHE_TOTAL_BUDGET_MB" "$PHP_TOTAL_BUDGET_MB"
+    printf '\nPlanning reserves: MariaDB %sMB (not the effective setting) | Redis %sMB | shared OPcache %sMB | hard PHP-FPM worker budget %sMB\n' "$MARIADB_BUFFER_MB" "$REDIS_MAX_MEMORY_MB" "$OPCACHE_TOTAL_BUDGET_MB" "$PHP_TOTAL_BUDGET_MB"
+    php_capacity_status_report
     recommendation_file="$STATE_DIR/last-recommendations.tsv"
-    build_tuning_recommendations "$recommendation_file" "$seconds"
+    if [[ "$capacity_safe" == yes ]]; then
+        build_tuning_recommendations "$recommendation_file" "$seconds"
+    else
+        : > "$recommendation_file"
+        PHP_TUNING_VETO_REASONS="$PHP_CAPACITY_ERROR"
+    fi
     printf '\nSafe automatic PHP recommendations\n'
     if [[ -s "$recommendation_file" ]]; then
         printf '%-28s %8s %8s  %s\n' "DOMAIN" "CURRENT" "PROPOSED" "REASON"
@@ -5513,6 +5964,7 @@ analyze_metrics() {
         printf '\nReview with: sudo wp-shell tune --apply --range %s\n' "$range"
     else
         printf 'No safe changes. Requires >=1,000 valid samples per pool spanning >=24h, fresh data, repeated saturation, CPU <85%%, memory >=25%%, and global budget headroom.\n'
+        [[ -z "$PHP_TUNING_VETO_REASONS" ]] || printf 'Tuning veto:\n%s' "$PHP_TUNING_VETO_REASONS"
     fi
     printf '\nProbe validity (unmarked old samples are UNKNOWN; never used for automatic tuning)\n'
     sqlite3 -header -column "$METRICS_DB" "SELECT component,domain,COUNT(*) AS probes,SUM(valid) AS valid FROM sample_health WHERE ts >= $since GROUP BY component,domain;"
@@ -5524,7 +5976,7 @@ analyze_metrics() {
 }
 
 apply_tuning() {
-    local assume_yes="" range=14d seconds recommendation_file="$STATE_DIR/pending-tuning-recommendations.tsv" domain current proposed reason
+    local assume_yes="" range=14d seconds recommendation_file="$STATE_DIR/pending-tuning-recommendations.tsv" domain current proposed reason tuning_status
     while (($#)); do
         case "$1" in
             --yes) assume_yes=--yes; shift ;;
@@ -5538,6 +5990,8 @@ apply_tuning() {
     calculate_resource_budget
     build_tuning_recommendations "$recommendation_file" "$seconds"
     [[ -s "$recommendation_file" ]] || { log_message INFO "No high-confidence changes are available."; return 0; }
+    php_validate_tuning_recommendations "$recommendation_file" || \
+        die "Aggregate PHP capacity validation rejected the tuning plan; no pool or tuning configuration was changed."
     printf 'The following PHP-FPM limits will be applied:\n'
     while IFS='|' read -r domain current proposed reason; do
         printf '  %s: %s -> %s (%s)\n' "$domain" "$current" "$proposed" "$reason"
@@ -5546,12 +6000,14 @@ apply_tuning() {
         collect_yes_no "Apply these reversible tuning overrides" no || { log_message INFO "No changes were applied."; return 0; }
     fi
     (
-        local stage success=no index version pool_file i
-        local -A versions=()
+        local stage success=no index version pool_file i effective
+        local -A versions=() reload_attempted=()
         stage="$(mktemp -d "$STATE_DIR/.tuning.XXXXXX")"
         [[ ! -f "$TUNING_CONFIG_FILE" ]] || cp -a "$TUNING_CONFIG_FILE" "$stage/tuning.v1"
         # shellcheck disable=SC2317,SC2329
         cleanup_tuning() {
+            local cleanup_status=$?
+            trap - EXIT
             if [[ "$success" != yes ]]; then
                 while IFS='|' read -r domain _current _proposed _reason; do
                     index="$(site_index_by_domain "$domain")"
@@ -5560,21 +6016,24 @@ apply_tuning() {
                     [[ ! -f "$stage/$domain.conf" ]] || cp -a "$stage/$domain.conf" "$pool_file"
                 done < "$recommendation_file"
                 if [[ -f "$stage/tuning.v1" ]]; then cp -a "$stage/tuning.v1" "$TUNING_CONFIG_FILE"; else rm -f "$TUNING_CONFIG_FILE"; fi
-                for version in "${!versions[@]}"; do php_fpm_service_action reload "$version" || true; done
+                for version in "${!reload_attempted[@]}"; do php_fpm_service_action reload "$version" || true; done
                 log_message WARNING "PHP tuning failed; previous pool files and tuning policy restored."
             fi
             rm -rf -- "$stage"
+            exit "$cleanup_status"
         }
         trap cleanup_tuning EXIT
         build_tuning_recommendations "$stage/rechecked.tsv" "$seconds"
         cmp -s "$recommendation_file" "$stage/rechecked.tsv" || die "Metrics or pool configuration changed while waiting; review recommendations again."
+        php_validate_tuning_recommendations "$stage/rechecked.tsv" || \
+            die "Aggregate PHP capacity changed while waiting; no pool or tuning configuration was changed."
         # Preserve all actual limits; a future budget reapply must not silently undo them.
         for ((i=1; i<=SITE_COUNT; i++)); do PHP_CHILD_OVERRIDES["${SITE_DOMAINS[$i]}"]="${SITE_PHP_MAX_CHILDREN[$i]}"; done
         while IFS='|' read -r domain current proposed _reason; do
             index="$(site_index_by_domain "$domain")"
             version="${SITE_PHP_VERSIONS[$index]}"
             pool_file="/etc/php/$version/fpm/pool.d/wp-shell-$(site_pool_id "$domain").conf"
-            [[ -f "$pool_file" && "$(read_pool_limit "$domain" "$version" 0)" == "$current" ]] || die "Pool configuration changed; review recommendations again."
+            [[ "$(read_managed_site_pool_limit "$domain" "$version" 2>/dev/null || true)" == "$current" ]] || die "Pool configuration changed or is no longer controlled by wp-shell; review recommendations again."
             cp -a "$pool_file" "$stage/$domain.conf"
             sed -E "s/^[[:space:]]*pm[.]max_children[[:space:]]*=.*/pm.max_children = $proposed/" "$pool_file" > "$stage/new.conf"
             install -m 0644 "$stage/new.conf" "$pool_file"
@@ -5582,10 +6041,22 @@ apply_tuning() {
             versions[$version]=1
         done < "$recommendation_file"
         for version in "${!versions[@]}"; do "php-fpm$version" -t; done
+        while IFS='|' read -r domain _current proposed _reason; do
+            index="$(site_index_by_domain "$domain")"
+            version="${SITE_PHP_VERSIONS[$index]}"
+            effective="$(read_effective_site_pool_limit "$domain" "$version" 2>/dev/null || true)"
+            [[ "$effective" == "$proposed" ]] ||
+                die "PHP $version effective pool for $domain is ${effective:-UNKNOWN}, not the proposed $proposed; tuning files will be restored without reloading the candidate."
+        done < "$recommendation_file"
         save_tuning_config
-        for version in "${!versions[@]}"; do php_fpm_service_action reload "$version"; done
+        for version in "${!versions[@]}"; do
+            reload_attempted[$version]=1
+            php_fpm_service_action reload "$version"
+        done
         success=yes
     )
+    tuning_status=$?
+    ((tuning_status == 0)) || return "$tuning_status"
     log_message SUCCESS "PHP-FPM tuning overrides were saved to $TUNING_CONFIG_FILE and applied."
 }
 
@@ -5627,7 +6098,7 @@ list_sites() {
         printf 'No sites are managed.\n'
         return
     fi
-    calculate_resource_budget quiet
+    calculate_resource_budget quiet advisory || true
     refresh_actual_pool_limits
     local i redis_label
     printf '%-3s %-28s %-28s %-5s %-8s %-8s %-5s\n' "ID" "DOMAIN" "PRIMARY" "PHP" "MODE" "REDIS" "POOL"
@@ -5706,7 +6177,8 @@ import_existing_sites() {
         apt_install ca-certificates curl gnupg php-cli
         install_wp_cli
     fi
-    local wp_config wp_path wp_owner url host domain primary www php_version next_index redis_db imported=0
+    local wp_config wp_path wp_owner url host domain primary www php_version next_index redis_db imported=0 imported_domain
+    local -A imported_users=()
     while IFS= read -r -d '' wp_config; do
         wp_path="$(dirname "$wp_config")"
         [[ ! "$wp_path" =~ [[:space:]] ]] || { log_message WARNING "Skipping a path containing whitespace: $wp_path"; continue; }
@@ -5748,11 +6220,22 @@ import_existing_sites() {
         SITE_TITLES[next_index]="$domain"
         SITE_PATHS[next_index]="$wp_path"
         SITE_MODES[next_index]="imported"
-        set_site_policy "$domain" user "$wp_owner"
+        imported_users["$domain"]="$wp_owner"
         imported=$((imported + 1))
-        log_message SUCCESS "Imported $domain from $wp_path."
+        log_message INFO "Discovered $domain at $wp_path; capacity admission is pending."
     done < <(find /var/www /home -xdev -type f -name wp-config.php -print0 2>/dev/null)
+    if ((imported == 0)); then
+        ensure_environment_config
+        log_message INFO "Import completed; no unmanaged WordPress sites were found."
+        return 0
+    fi
+    # Imported and legacy site counts are not trusted to fit the coarse UI cap.
+    # Refuse before sites.v3 or per-site policy is changed.
+    calculate_resource_budget quiet
     save_sites_config
+    for imported_domain in "${!imported_users[@]}"; do
+        set_site_policy "$imported_domain" user "${imported_users[$imported_domain]}"
+    done
     ensure_environment_config
     log_message INFO "Import completed; $imported site(s) added."
 }
@@ -6063,6 +6546,8 @@ control_plane_audit() {
     fi
     printf '\n'
     mariadb_audit
+    printf '\nPHP-FPM hard capacity admission\n'
+    php_capacity_status_report
     printf '\nWordPress sites\n'
     for ((i=1; i<=SITE_COUNT; i++)); do
         domain="${SITE_DOMAINS[$i]}"
@@ -6095,7 +6580,7 @@ control_plane_audit() {
 }
 
 control_plane_plan() {
-    local i domain version mariadb_block
+    local i domain version mariadb_block php_capacity
     printf 'wp-shell apply plan (no changes)\n'
     printf '  Host: Nginx global/default-host/log format, PHP baseline, loopback Redis/MariaDB, SSH-only Fail2ban, logrotate and certificate hook.\n'
     printf '  Excluded: SSH hardening, UFW reconciliation, AIDE install, Cloudflare enablement, plugin/theme updates, due tasks, email tests, backup deletion and reboot.\n'
@@ -6110,6 +6595,8 @@ control_plane_plan() {
     if [[ -n "$mariadb_block" ]]; then
         printf '  BLOCKED: %s\n' "$mariadb_block"
     fi
+    php_capacity="$(php_capacity_status_report)"
+    while IFS= read -r domain; do printf '  %s\n' "$domain"; done <<< "$php_capacity"
 }
 
 apply_wordpress_baseline() {
@@ -6138,6 +6625,8 @@ apply_control_plane() {
     [[ "$confirmation" == --confirm ]] || { control_plane_plan; die "Impact: rewrite managed service/site configuration and gracefully reload affected services. Re-run with: wp-shell apply --confirm"; }
     CURRENT_STEP="apply audited baseline"
     control_plane_plan
+    # This must run before MariaDB, Redis, PHP or site configuration changes.
+    calculate_resource_budget quiet
     configure_mariadb
     configure_redis
     configure_php

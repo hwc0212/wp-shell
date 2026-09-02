@@ -63,7 +63,7 @@ OPCACHE_MEMORY_OVERRIDES[8.4]=256
 OPCACHE_STRINGS_OVERRIDES[8.4]=32
 calculate_resource_budget quiet
 [[ "$OPCACHE_TOTAL_BUDGET_MB" == 256 && "$PHP_TOTAL_BUDGET_MB" == 1246 ]]
-[[ "${SITE_PHP_MAX_CHILDREN[1]} ${SITE_PHP_MAX_CHILDREN[2]}" == '8 4' ]]
+[[ "${SITE_PHP_MAX_CHILDREN[1]} ${SITE_PHP_MAX_CHILDREN[2]}" == '7 4' ]]
 SITE_PHP_VERSIONS[2]=8.3
 calculate_resource_budget quiet
 [[ "$OPCACHE_TOTAL_BUDGET_MB" == 384 ]]
@@ -87,6 +87,23 @@ systemctl() {
     [[ ! -f "$test_root/reject-daemon-reload" || "$1" != daemon-reload ]]
 }
 php-fpm8.4() { [[ ! -f "$test_root/reject-fpm-test" ]]; }
+TEST_EFFECTIVE_DUMP_KNOWN=yes
+TEST_DEFAULT_POOL_LIMIT=1
+declare -A TEST_SITE_POOL_LIMITS=(
+    [first.example.com]=7
+    [second.example.com]=4
+)
+php_fpm_effective_config_dump() {
+    local version="$1" i domain pool
+    [[ "$TEST_EFFECTIVE_DUMP_KNOWN" == yes && "$version" == 8.4 ]] || return 1
+    printf '[www]\npm = ondemand\npm.max_children = %s\n' "$TEST_DEFAULT_POOL_LIMIT"
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        domain="${SITE_DOMAINS[$i]}"
+        pool="$(site_pool_id "$domain")"
+        printf '[%s]\npm = ondemand\npm.max_children = %s\n' \
+            "$pool" "${TEST_SITE_POOL_LIMITS[$domain]}"
+    done
+}
 opcache_effective_values() {
     if [[ -f "$test_root/later-ini-conflict" ]]; then printf '128 16'; return; fi
     local ini
@@ -98,6 +115,16 @@ opcache_effective_values() {
     fi
 }
 opcache_runtime_json() { return 1; }
+
+# Current-state accounting reads the effective merged pool configuration. An
+# upgraded v10.0.3 default pool can still expose two workers even though the
+# new proposed target reserves only one.
+TEST_DEFAULT_POOL_LIMIT=2
+php_refresh_current_aggregate_workers
+[[ "$PHP_CURRENT_AGGREGATE_WORKERS" == 13 ]]
+[[ "$PHP_DEFAULT_POOL_WORKERS" == 1 ]]
+TEST_DEFAULT_POOL_LIMIT=1
+
 save_opcache_config
 set_opcache 8.4 256 32 > "$test_root/set-output"
 [[ "$(opcache_effective_values 8.4)" == '256 32' ]]
@@ -110,6 +137,59 @@ load_opcache_config
 
 original_ini_hash="$(sha256sum "$(opcache_managed_ini 8.4)")"
 original_state_hash="$(sha256sum "$OPCACHE_CONFIG_FILE")"
+install -d "$test_root/pools"
+printf 'pm.max_children=7\n' > "$test_root/pools/first.conf"
+printf 'pm.max_children=4\n' > "$test_root/pools/second.conf"
+first_pool_hash="$(sha256sum "$test_root/pools/first.conf")"
+second_pool_hash="$(sha256sum "$test_root/pools/second.conf")"
+
+# The existing 12-worker exposure fits the 1246MB budget at OPcache 256MB,
+# but not the candidate budget after increasing OPcache to 384MB. Admission
+# must reject before either managed file, any pool, or FPM is touched.
+reload_calls_before="$(awk '$1 == "reload" {count++} END {print count+0}' "$service_calls")"
+backup_count_before="$(find "$CONFIG_DIR/opcache-backups" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+expect_failure set_opcache 8.4 384 48
+grep -Fq 'Candidate OPcache would leave a 1118MB PHP worker budget' "$test_root/failure-output"
+grep -Fq 'current effective pools expose 12 workers (1152MB)' "$test_root/failure-output"
+[[ "$(sha256sum "$(opcache_managed_ini 8.4)")" == "$original_ini_hash" ]]
+[[ "$(sha256sum "$OPCACHE_CONFIG_FILE")" == "$original_state_hash" ]]
+[[ "$(sha256sum "$test_root/pools/first.conf")" == "$first_pool_hash" ]]
+[[ "$(sha256sum "$test_root/pools/second.conf")" == "$second_pool_hash" ]]
+[[ "$(awk '$1 == "reload" {count++} END {print count+0}' "$service_calls")" == "$reload_calls_before" ]]
+[[ "$(find "$CONFIG_DIR/opcache-backups" -mindepth 1 -maxdepth 1 -type d | wc -l)" == "$backup_count_before" ]]
+
+# Unknown effective default-pool evidence fails closed for reporting, tuning,
+# and OPcache increases without causing writes or a reload.
+TEST_EFFECTIVE_DUMP_KNOWN=no
+expect_failure set_opcache 8.4 384 48
+grep -Fq 'Current PHP worker exposure is UNKNOWN' "$test_root/failure-output"
+grep -Fq 'PHP capacity: UNKNOWN' <<< "$(php_capacity_status_report)"
+[[ "$(sha256sum "$(opcache_managed_ini 8.4)")" == "$original_ini_hash" ]]
+[[ "$(sha256sum "$OPCACHE_CONFIG_FILE")" == "$original_state_hash" ]]
+[[ "$(awk '$1 == "reload" {count++} END {print count+0}' "$service_calls")" == "$reload_calls_before" ]]
+[[ "$(find "$CONFIG_DIR/opcache-backups" -mindepth 1 -maxdepth 1 -type d | wc -l)" == "$backup_count_before" ]]
+
+# A safe increase remains possible with enough current worker headroom. A
+# later decrease is a recovery operation and remains possible even when the
+# old effective pools are already above the smaller current worker budget.
+TEST_EFFECTIVE_DUMP_KNOWN=yes
+TEST_SITE_POOL_LIMITS[first.example.com]=2
+TEST_SITE_POOL_LIMITS[second.example.com]=1
+set_opcache 8.4 384 48 > "$test_root/safe-increase-output"
+[[ "$(opcache_effective_values 8.4)" == '384 48' ]]
+[[ "$(sha256sum "$test_root/pools/first.conf")" == "$first_pool_hash" ]]
+[[ "$(sha256sum "$test_root/pools/second.conf")" == "$second_pool_hash" ]]
+TEST_SITE_POOL_LIMITS[first.example.com]=7
+TEST_SITE_POOL_LIMITS[second.example.com]=4
+set_opcache 8.4 256 32 > "$test_root/recovery-decrease-output"
+[[ "$(opcache_effective_values 8.4)" == '256 32' ]]
+[[ "$(sha256sum "$test_root/pools/first.conf")" == "$first_pool_hash" ]]
+[[ "$(sha256sum "$test_root/pools/second.conf")" == "$second_pool_hash" ]]
+
+# Leave enough headroom so the following fault-injection cases reach their
+# intended validation/reload boundaries instead of the new capacity gate.
+TEST_SITE_POOL_LIMITS[first.example.com]=2
+TEST_SITE_POOL_LIMITS[second.example.com]=1
 for failure in reject-fpm-test later-ini-conflict reject-reload-once reject-daemon-reload; do
     : > "$test_root/$failure"
     expect_failure set_opcache 8.4 384 48
