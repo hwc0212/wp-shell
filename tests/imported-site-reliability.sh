@@ -46,4 +46,32 @@ for unsafe_value in 1 true FALSE off no arbitrary; do
     fi
 done
 
+# Security decisions must preserve the WP-CLI exit status.  Empty output is
+# safe only after a successful command; even output that says "false" is
+# unverifiable when the command itself returns non-zero.
+probe_output=""
+probe_exit=0
+site_wp_cli() {
+    printf '%s' "$probe_output"
+    return "$probe_exit"
+}
+assert_wp_debug_probe_status() {
+    local expected="$1" output="$2" command_status="$3" actual=0
+    probe_output="$output"
+    probe_exit="$command_status"
+    wp_debug_probe fixture.example.com || actual=$?
+    if [[ "$actual" -ne "$expected" ]]; then
+        printf 'WP_DEBUG probe status mismatch: expected=%s actual=%s output=%q command_status=%s\n' \
+            "$expected" "$actual" "$output" "$command_status" >&2
+        exit 1
+    fi
+}
+assert_wp_debug_probe_status 0 "" 0
+assert_wp_debug_probe_status 0 0 0
+assert_wp_debug_probe_status 0 false 0
+assert_wp_debug_probe_status 1 1 0
+assert_wp_debug_probe_status 1 true 0
+assert_wp_debug_probe_status 2 "" 7
+assert_wp_debug_probe_status 2 false 7
+
 printf 'Imported-site helper, pipefail and WP_DEBUG regressions passed.\n'

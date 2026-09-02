@@ -5770,6 +5770,17 @@ wp_debug_value_is_false() {
     esac
 }
 
+# Return 0 only when WP-CLI successfully read a semantically false value.
+# Return 1 for a successfully read enabled/invalid value and 2 when the
+# security probe itself failed, so an empty failure cannot be treated as safe.
+wp_debug_probe() {
+    local domain="$1" value
+    if ! value="$(site_wp_cli "$domain" config get WP_DEBUG 2>/dev/null)"; then
+        return 2
+    fi
+    wp_debug_value_is_false "$value"
+}
+
 host_audit_line() {
     printf '%-7s %-24s %s\n' "$1" "$2" "$3"
 }
@@ -6170,7 +6181,7 @@ dry_run_command() {
 
 security_scan() {
     local failed=0 i domain primary wp_config perms version constant value credentials_file
-    local origin_headers public_headers redis_secret
+    local origin_headers public_headers redis_secret wp_debug_status
     for service in nginx mariadb redis-server fail2ban; do
         if ! systemctl is-active --quiet "$service"; then
             log_message ERROR "$service is not running."
@@ -6203,8 +6214,17 @@ security_scan() {
                     failed=$((failed + 1))
                 }
             done
-            value="$(site_wp_cli "$domain" config get WP_DEBUG 2>/dev/null || true)"
-            wp_debug_value_is_false "$value" || { log_message WARNING "$domain must have WP_DEBUG disabled."; failed=$((failed + 1)); }
+            if wp_debug_probe "$domain"; then
+                :
+            else
+                wp_debug_status=$?
+                if ((wp_debug_status == 2)); then
+                    log_message WARNING "$domain WP_DEBUG could not be verified because the WP-CLI probe failed."
+                else
+                    log_message WARNING "$domain has an enabled or invalid WP_DEBUG value."
+                fi
+                failed=$((failed + 1))
+            fi
             value="$(site_wp_cli "$domain" config get WP_ENVIRONMENT_TYPE 2>/dev/null || true)"
             [[ "$value" == production ]] || { log_message WARNING "$domain main site environment type is not production."; failed=$((failed + 1)); }
             if [[ "$(site_policy_value "$domain" object-cache disabled)" == enabled ]] && \

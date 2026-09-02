@@ -93,7 +93,7 @@ sudo wp-shell apply --confirm
 
 导入站点仍然使用原网站的非 root 运行账户执行 WP-CLI。部署或修复时，脚本不会在 WordPress 配置更新之前先对整棵目录执行最终权限收紧。每条 `wp config set/delete/create` 命令都有独立、短暂的写入窗口：脚本先确认登记的 WordPress 绝对路径和 `wp-config.php` 都不是符号链接，再把现有配置临时设为 `0660 root:站点私有组`；命令成功、失败或被中断后都恢复为 `0640 root:站点私有组`。最终 `core is-installed` 检查通过后才统一收紧站点权限。
 
-如果站点没有可识别的 Nginx PHP socket，导入会使用环境配置中的 `DEFAULT_PHP_VERSION`，不会再静默写死 PHP 8.3。符号链接、消失的配置文件或无法恢复的所有权/权限会使操作明确失败，不会继续把站点标记为已完成。
+如果站点没有可识别的 Nginx PHP socket，导入会使用环境配置中的 `DEFAULT_PHP_VERSION`，不会再静默写死 PHP 8.3。符号链接、消失的配置文件或无法恢复的所有权/权限会使操作明确失败，不会继续把站点标记为已完成。安全扫描只有在 WP-CLI 成功读取 `WP_DEBUG` 后才解释空值、`0` 或 `false`；命令失败会报告“无法验证”，不会把空输出误判为安全状态。
 
 ### 内部模块边界与单文件兼容性
 
