@@ -85,7 +85,7 @@ sudo wp-shell mariadb audit
 sudo wp-shell apply --confirm
 ```
 
-迁移只从识别出的 `50-wordpress.cnf` 和 wp-shell 管理文件中移除 `innodb_buffer_pool_size`、`max_connections`、`tmp_table_size`、`max_heap_table_size` 四项，让发行版默认值或其他管理员配置重新决定结果；不会用另一组百分比覆盖旧值，不删除配置文件，也不修改其他行。候选片段和完整配置都必须通过 MariaDB 解析，事务会保存文件原始内容、权限和所有者。只有配置的实际生效值发生变化才重启 MariaDB；重启、健康检查或 runtime 对照失败时自动恢复精确旧文件并尝试恢复服务。
+迁移会从识别出的旧版 `50-wordpress.cnf` 中移除 `innodb_buffer_pool_size`、`max_connections`、`tmp_table_size`、`max_heap_table_size` 四项；对当前 wp-shell 管理的 `60-wp-shell.cnf` 则逐项使用同一低内存风险策略，只移除该定义本身已被判定为危险的行，安全的已有调优值和无关内容保持原样。迁移不会用另一组百分比覆盖旧值，不删除配置文件，也不会因为另一个旧文件存在风险而清空安全的受管调优。候选片段和完整配置都必须通过 MariaDB 解析，事务会保存文件原始内容、权限和所有者。只有配置的实际生效值发生变化才重启 MariaDB；重启、健康检查或 runtime 对照失败时自动恢复精确旧文件并尝试恢复服务。
 
 未知管理员文件永远不会被迁移命令自动删除或改写。如果危险值仍由这类文件提供，迁移会失败并回滚，必须由管理员结合业务负载和监控证据人工处理。
 

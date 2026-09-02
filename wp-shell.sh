@@ -1624,24 +1624,37 @@ mariadb_high_risk_reasons() {
     fi
 }
 
+mariadb_definition_is_unsafe_for_migration() {
+    local variable="$1" raw="$2" total_mb="${3:-}" normalized total_bytes
+    [[ -n "$total_mb" ]] || total_mb="$(memory_mb)"
+    [[ "$total_mb" =~ ^[0-9]+$ && "$total_mb" -le 4096 ]] || return 1
+    normalized="$(mariadb_normalize_value "$variable" "$raw" 2>/dev/null || true)"
+    [[ -n "$normalized" ]] || return 1
+    total_bytes=$((total_mb * 1024 * 1024))
+    case "$variable" in
+        innodb_buffer_pool_size) ((normalized * 2 >= total_bytes)) ;;
+        max_connections) ((normalized >= 250)) ;;
+        tmp_table_size|max_heap_table_size) ((normalized >= 64 * 1024 * 1024)) ;;
+        *) return 1 ;;
+    esac
+}
+
 mariadb_unsafe_migratable_reasons() {
-    local definitions="$1" total_mb total_bytes key raw file line class normalized
+    local definitions="$1" total_mb key raw file line class
     total_mb="$(memory_mb)"
     [[ "$total_mb" =~ ^[0-9]+$ && "$total_mb" -le 4096 ]] || return 0
-    total_bytes=$((total_mb * 1024 * 1024))
     while IFS='|' read -r key raw file line class; do
         [[ "$class" == legacy-wp-shell || "$class" == wp-shell-managed ]] || continue
-        normalized="$(mariadb_normalize_value "$key" "$raw" 2>/dev/null || true)"
-        [[ -n "$normalized" ]] || continue
+        mariadb_definition_is_unsafe_for_migration "$key" "$raw" "$total_mb" || continue
         case "$key" in
             innodb_buffer_pool_size)
-                ((normalized * 2 >= total_bytes)) && printf '%s:%s defines %s=%s (at least 50%% of physical RAM).\n' "$file" "$line" "$key" "$raw"
+                printf '%s:%s defines %s=%s (at least 50%% of physical RAM).\n' "$file" "$line" "$key" "$raw"
                 ;;
             max_connections)
-                ((normalized >= 250)) && printf '%s:%s defines %s=%s on a low-memory host.\n' "$file" "$line" "$key" "$raw"
+                printf '%s:%s defines %s=%s on a low-memory host.\n' "$file" "$line" "$key" "$raw"
                 ;;
             tmp_table_size|max_heap_table_size)
-                ((normalized >= 64 * 1024 * 1024)) && printf '%s:%s defines %s=%s on a low-memory host.\n' "$file" "$line" "$key" "$raw"
+                printf '%s:%s defines %s=%s on a low-memory host.\n' "$file" "$line" "$key" "$raw"
                 ;;
         esac
     done <<< "$definitions"
@@ -1694,8 +1707,24 @@ mariadb_snapshots_match() {
 }
 
 mariadb_render_legacy_candidate() {
-    local source="$1" destination="$2"
-    awk '
+    local source="$1" destination="$2" class removal_mode unsafe_lines="" key raw file line definition_class
+    class="$(mariadb_definition_class "$source")"
+    case "$class" in
+        legacy-wp-shell) removal_mode=legacy ;;
+        wp-shell-managed)
+            removal_mode='unsafe-managed'
+            while IFS='|' read -r key raw file line definition_class; do
+                [[ "$file" == "$source" && "$definition_class" == wp-shell-managed ]] || continue
+                mariadb_definition_is_unsafe_for_migration "$key" "$raw" && unsafe_lines+="${line}"$'\n'
+            done < <(mariadb_config_definitions)
+            ;;
+        *) return 1 ;;
+    esac
+    awk -v removal_mode="$removal_mode" -v unsafe_lines="$unsafe_lines" '
+        BEGIN {
+            count=split(unsafe_lines, lines, "\n")
+            for (item=1; item<=count; item++) if (lines[item] != "") remove_line[lines[item]]=1
+        }
         function trim(value) {
             sub(/^[[:space:]]+/, "", value)
             sub(/[[:space:]]+$/, "", value)
@@ -1714,8 +1743,10 @@ mariadb_render_legacy_candidate() {
                 key=trim(key)
                 gsub(/-/, "_", key)
                 sub(/^loose_/, "", key)
-                if (key ~ /^(innodb_buffer_pool_size|max_connections|tmp_table_size|max_heap_table_size)$/) {
-                    print "# wp-shell migration removed legacy " key "; the exact prior file is in the transaction backup."
+                removable=(key ~ /^(innodb_buffer_pool_size|max_connections|tmp_table_size|max_heap_table_size)$/)
+                if (removable && (removal_mode == "legacy" || remove_line[NR])) {
+                    reason=(removal_mode == "legacy" ? "legacy " : "unsafe managed ")
+                    print "# wp-shell migration removed " reason key "; the exact prior file is in the transaction backup."
                     next
                 }
             }
@@ -1779,7 +1810,7 @@ mariadb_migrate_legacy() {
     local stage index=0
     local -a targets=() candidates=() modes=() owners=() groups=()
     mariadb_audit
-    [[ "$confirmation" == --confirm ]] || die "Impact: remove only four legacy memory directives from recognized wp-shell MariaDB files, preserve all other content, and restart MariaDB only if effective values change. Re-run with --confirm."
+    [[ "$confirmation" == --confirm ]] || die "Impact: remove the four historical memory directives from recognized 50-wordpress.cnf files, remove only individually unsafe definitions from the current wp-shell-managed file, preserve all other content, and restart MariaDB only if effective values change. Re-run with --confirm."
     CURRENT_STEP="migrate legacy MariaDB memory configuration"
     before_config="$(mariadb_config_effective_snapshot)" || die "Cannot determine the current effective MariaDB configuration. No files were changed."
     stage="$(safe_temp_dir)"

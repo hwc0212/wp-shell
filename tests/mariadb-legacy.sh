@@ -26,8 +26,6 @@ EOF
 cat > "$MARIADB_CONFIG_ROOT/mariadb.conf.d/50-wordpress.cnf" <<'EOF'
 [mysqld]
 # WordPress legacy fixture
-max_connections = 300
-innodb_buffer_pool_size = 1G
 tmp_table_size = 128M
 max_heap_table_size = 128M
 innodb_flush_log_at_trx_commit = 1
@@ -35,7 +33,9 @@ EOF
 cat > "$MARIADB_MANAGED_CONFIG_FILE" <<'EOF'
 [mysqld]
 bind-address = 127.0.0.1
-max_connections = 300
+innodb_buffer_pool_size = 256M
+max_connections = 80
+table_open_cache = 512
 EOF
 cat > "$MARIADB_CONFIG_ROOT/mariadb.conf.d/70-administrator.cnf" <<'EOF'
 [client]
@@ -59,31 +59,25 @@ mariadb_validate_fragment() { return 0; }
 mariadb_validate_installed_config() { return 0; }
 mariadb_health_check() { return 0; }
 mariadb_config_effective_snapshot() {
-    if grep -Eq '^[[:space:]]*max_connections[[:space:]]*=[[:space:]]*300' "$legacy_file"; then
-        cat <<'EOF'
-innodb_buffer_pool_size|1073741824
-max_connections|300
-tmp_table_size|134217728
-max_heap_table_size|134217728
+    local pool=134217728 connections=151 tmp=16777216 heap=16777216
+    grep -Eq '^[[:space:]]*innodb_buffer_pool_size[[:space:]]*=[[:space:]]*1G' "$legacy_file" && pool=1073741824
+    grep -Eq '^[[:space:]]*max_connections[[:space:]]*=[[:space:]]*300' "$legacy_file" && connections=300
+    grep -Eq '^[[:space:]]*tmp_table_size[[:space:]]*=[[:space:]]*128M' "$legacy_file" && tmp=134217728
+    grep -Eq '^[[:space:]]*max_heap_table_size[[:space:]]*=[[:space:]]*128M' "$legacy_file" && heap=134217728
+    grep -Eq '^[[:space:]]*innodb_buffer_pool_size[[:space:]]*=[[:space:]]*256M' "$MARIADB_MANAGED_CONFIG_FILE" && pool=268435456
+    grep -Eq '^[[:space:]]*max_connections[[:space:]]*=[[:space:]]*80' "$MARIADB_MANAGED_CONFIG_FILE" && connections=80
+    grep -Eq '^[[:space:]]*max_connections[[:space:]]*=[[:space:]]*300' "$MARIADB_MANAGED_CONFIG_FILE" && connections=300
+    cat <<EOF
+innodb_buffer_pool_size|$pool
+max_connections|$connections
+tmp_table_size|$tmp
+max_heap_table_size|$heap
 sort_buffer_size|2097152
 join_buffer_size|262144
 read_buffer_size|131072
 read_rnd_buffer_size|262144
 thread_stack|299008
 EOF
-    else
-        cat <<'EOF'
-innodb_buffer_pool_size|134217728
-max_connections|151
-tmp_table_size|16777216
-max_heap_table_size|16777216
-sort_buffer_size|2097152
-join_buffer_size|262144
-read_buffer_size|131072
-read_rnd_buffer_size|262144
-thread_stack|299008
-EOF
-    fi
 }
 mariadb_runtime_snapshot() {
     mariadb_config_effective_snapshot
@@ -111,10 +105,12 @@ audit_output="$(mariadb_audit)"
 after_tree="$(find "$MARIADB_CONFIG_ROOT" -type f -print0 | sort -z | xargs -0 sha256sum)"
 [[ "$before_tree" == "$after_tree" ]]
 grep -Fq 'innodb_buffer_pool_size' <<< "$audit_output"
-grep -Fq '1073741824 bytes (1024 MiB)' <<< "$audit_output"
+grep -Fq '268435456 bytes (256 MiB)' <<< "$audit_output"
+grep -Fq '134217728 bytes (128 MiB)' <<< "$audit_output"
 grep -Fq 'max_used_connections' <<< "$audit_output"
 grep -Fq "$legacy_file" <<< "$audit_output"
 grep -Fq '[legacy-wp-shell]' <<< "$audit_output"
+grep -Fq '[wp-shell-managed]' <<< "$audit_output"
 grep -Fq 'sort_buffer_size                1M' <<< "$audit_output"
 grep -Fq 'sort_buffer_size                2M' <<< "$audit_output"
 grep -Fq "$MARIADB_CONFIG_ROOT/conf.d/40-administrator.cnf:2" <<< "$audit_output"
@@ -134,9 +130,9 @@ grep -Fq 'mariadb migrate-legacy --confirm' "$test_root/apply-output"
 [[ ! -e "$test_root/systemctl-calls" ]]
 [[ "$(sha256sum "$legacy_file" | cut -d' ' -f1)" == "$(sha256sum "$legacy_original" | cut -d' ' -f1)" ]]
 
-# The explicit transaction strips only the four recognized memory directives,
-# restarts once because effective values changed, and preserves administrator
-# content byte-for-byte.
+# The explicit transaction strips the legacy file's historical directives,
+# preserves safe managed tuning byte-for-byte, restarts once because effective
+# values changed, and preserves administrator content byte-for-byte.
 TRANSACTION_CONTEXT=yes
 mariadb_migrate_legacy --confirm > "$test_root/migration-output"
 transaction_commit
@@ -146,15 +142,16 @@ for option in innodb_buffer_pool_size max_connections tmp_table_size max_heap_ta
         exit 1
     fi
 done
-if grep -Eq '^[[:space:]]*max_connections[[:space:]]*=' "$MARIADB_MANAGED_CONFIG_FILE"; then
-    printf 'Managed legacy max_connections survived migration.\n' >&2
-    exit 1
-fi
 grep -Fq 'innodb_flush_log_at_trx_commit = 1' "$legacy_file"
+grep -Fxq 'innodb_buffer_pool_size = 256M' "$MARIADB_MANAGED_CONFIG_FILE"
+grep -Fxq 'max_connections = 80' "$MARIADB_MANAGED_CONFIG_FILE"
+grep -Fxq 'table_open_cache = 512' "$MARIADB_MANAGED_CONFIG_FILE"
+cmp -s "$MARIADB_MANAGED_CONFIG_FILE" "$managed_original"
 [[ "$(stat -c '%a' "$legacy_file")" == 640 ]]
 [[ "$(sha256sum "$admin_file")" == "$admin_hash" ]]
-grep -Fxq 'restart mariadb' "$test_root/systemctl-calls"
-[[ "$(mariadb_snapshot_value "$(mariadb_config_effective_snapshot)" max_connections)" == 151 ]]
+[[ "$(grep -Fxc 'restart mariadb' "$test_root/systemctl-calls")" == 1 ]]
+[[ "$(mariadb_snapshot_value "$(mariadb_config_effective_snapshot)" innodb_buffer_pool_size)" == 268435456 ]]
+[[ "$(mariadb_snapshot_value "$(mariadb_config_effective_snapshot)" max_connections)" == 80 ]]
 
 # Repeating the migration is a no-op and causes no second restart.
 restart_count="$(grep -Fxc 'restart mariadb' "$test_root/systemctl-calls")"
@@ -162,21 +159,41 @@ mariadb_migrate_legacy --confirm > "$test_root/migration-repeat-output"
 [[ "$(grep -Fxc 'restart mariadb' "$test_root/systemctl-calls")" == "$restart_count" ]]
 [[ "$(sha256sum "$admin_file")" == "$admin_hash" ]]
 
-# Fault injection: the first restart fails. Automatic rollback must restore the
-# exact original file, including mode and comments; the recovery restart then
-# receives the previous configuration.
-cp -a "$legacy_original" "$legacy_file"
-cp -a "$managed_original" "$MARIADB_MANAGED_CONFIG_FILE"
-legacy_fingerprint="$(stat -c '%a:%U:%G' "$legacy_file"):$(sha256sum "$legacy_file" | cut -d' ' -f1)"
+# A genuinely unsafe definition in the managed file is handled separately.
+# Inject a restart failure first so the exact managed file rollback path is
+# exercised before allowing the migration to succeed.
+cat > "$MARIADB_MANAGED_CONFIG_FILE" <<'EOF'
+[mysqld]
+bind-address = 127.0.0.1
+innodb_buffer_pool_size = 256M
+max_connections = 300
+table_open_cache = 777
+EOF
 managed_fingerprint="$(stat -c '%a:%U:%G' "$MARIADB_MANAGED_CONFIG_FILE"):$(sha256sum "$MARIADB_MANAGED_CONFIG_FILE" | cut -d' ' -f1)"
 touch "$test_root/fail-next-restart"
 if (TRANSACTION_ACTIVE=no; TRANSACTION_CONTEXT=yes; mariadb_migrate_legacy --confirm) > "$test_root/restart-failure-output" 2>&1; then
     printf 'The injected MariaDB restart failure unexpectedly succeeded.\n' >&2
     exit 1
 fi
-[[ "$(stat -c '%a:%U:%G' "$legacy_file"):$(sha256sum "$legacy_file" | cut -d' ' -f1)" == "$legacy_fingerprint" ]]
 [[ "$(stat -c '%a:%U:%G' "$MARIADB_MANAGED_CONFIG_FILE"):$(sha256sum "$MARIADB_MANAGED_CONFIG_FILE" | cut -d' ' -f1)" == "$managed_fingerprint" ]]
 [[ "$(sha256sum "$admin_file")" == "$admin_hash" ]]
 [[ -f "$admin_file" ]]
+
+# Retrying succeeds: only unsafe max_connections is removed. Safe managed
+# tuning and unrelated lines remain exact, and the following run is a no-op.
+mariadb_migrate_legacy --confirm > "$test_root/unsafe-managed-output"
+transaction_commit
+grep -Fxq 'innodb_buffer_pool_size = 256M' "$MARIADB_MANAGED_CONFIG_FILE"
+grep -Fxq 'table_open_cache = 777' "$MARIADB_MANAGED_CONFIG_FILE"
+if grep -Eq '^[[:space:]]*max_connections[[:space:]]*=' "$MARIADB_MANAGED_CONFIG_FILE"; then
+    printf 'Unsafe managed max_connections survived migration.\n' >&2
+    exit 1
+fi
+[[ "$(mariadb_snapshot_value "$(mariadb_config_effective_snapshot)" innodb_buffer_pool_size)" == 268435456 ]]
+[[ "$(mariadb_snapshot_value "$(mariadb_config_effective_snapshot)" max_connections)" == 151 ]]
+restart_count="$(grep -Fxc 'restart mariadb' "$test_root/systemctl-calls")"
+mariadb_migrate_legacy --confirm > "$test_root/unsafe-managed-repeat-output"
+[[ "$(grep -Fxc 'restart mariadb' "$test_root/systemctl-calls")" == "$restart_count" ]]
+[[ "$(sha256sum "$admin_file")" == "$admin_hash" ]]
 
 printf 'MariaDB legacy audit, admission, explicit migration, idempotence, secret filtering and exact rollback tests passed.\n'
