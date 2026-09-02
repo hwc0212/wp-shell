@@ -30,6 +30,17 @@ SITE_TITLES[1]="Example"
 SITE_PATHS[1]="/var/www/example.com/public"
 
 systemctl() { printf '%s\n' "$*" >> "$CONFIG_DIR/systemctl-calls"; }
+mariadb_health_check() { return 0; }
+mariadb_runtime_snapshot() {
+    mariadb_config_effective_snapshot
+    cat <<'EOF'
+max_used_connections|0
+threads_connected|0
+threads_running|0
+created_tmp_tables|0
+created_tmp_disk_tables|0
+EOF
+}
 configure_mariadb
 mariadbd --defaults-file=/etc/mysql/my.cnf --verbose --help >/dev/null
 

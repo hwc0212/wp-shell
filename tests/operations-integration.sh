@@ -159,6 +159,13 @@ for ((attempt=0; attempt<100; attempt++)); do
     if mariadb -e 'SELECT 1' >/dev/null 2>&1; then break; fi
     sleep 0.1
 done
+runtime_snapshot="$(mariadb_runtime_snapshot)"
+while IFS= read -r variable; do
+    [[ -n "$(mariadb_snapshot_value "$runtime_snapshot" "$variable")" ]]
+done < <(mariadb_audit_variables)
+while IFS= read -r variable; do
+    [[ -n "$(mariadb_snapshot_value "$runtime_snapshot" "$variable")" ]]
+done < <(mariadb_audit_status_names)
 mkdir -p "$test_root/drill/files"
 printf '<?php\n' > "$test_root/drill/files/wp-config.php"
 tar -czf "$test_root/drill/files.tar.gz" -C "$test_root/drill/files" .

@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v10.0.1
+- 当前版本：`wp-shell.sh` v10.0.2
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -55,6 +55,40 @@ sudo wp-shell status
 
 `manifest.v1` 记录操作名称、修改前文件、提交后指纹和需要重新加载的服务。配置验证或命令中途失败时会自动恢复本事务已记录的文件；自动回滚不删除网站数据库、WordPress 内容或已完成的网站备份。新建网站、恢复数据库和插件升级属于应用数据操作，仍然依赖网站备份，而不是把配置事务误当成数据库快照。
 
+### MariaDB 实际配置审计与旧配置迁移（v10.0.2）
+
+早期 `wp-vps-manager` 曾生成 `/etc/mysql/mariadb.conf.d/50-wordpress.cnf`，其中可能包含 `1G` InnoDB Buffer Pool、`300` 个连接和 `128M` 内存临时表。MariaDB 会合并读取多个 `.cnf`；只生成新的 `60-wp-shell.cnf` 并不能证明这些旧值已经失效。v10.0.2 因此先检查实际生效状态，不再把资源报告里的理论预算当作 MariaDB 实际配置。
+
+只读检查：
+
+```bash
+sudo wp-shell mariadb audit
+# 完整控制面审计也包含同一段 MariaDB 结果
+sudo wp-shell audit
+```
+
+输出明确区分：
+
+- 当前运行中的 runtime 值；
+- 按磁盘配置在下次启动时生效的值；
+- `Max_used_connections`、当前连接/运行线程和内存/磁盘临时表累计计数；
+- `/etc/mysql/my.cnf`、`conf.d/` 与 `mariadb.conf.d/` 中相关定义及可能的最终来源；
+- 已知旧 wp-shell 文件与管理员/发行版文件；
+- 低内存主机上的高风险组合。风险判断是保守的准入信号，不是 MariaDB 实际内存上限证明，也不把 Swap 当作 RAM。
+
+审计完全只读。检测到危险的已知旧值时，普通 `apply` 会在写文件或重启 MariaDB 前停止，并要求显式迁移：
+
+```bash
+sudo wp-shell mariadb audit
+sudo wp-shell mariadb migrate-legacy --confirm
+sudo wp-shell mariadb audit
+sudo wp-shell apply --confirm
+```
+
+迁移会从识别出的旧版 `50-wordpress.cnf` 中移除 `innodb_buffer_pool_size`、`max_connections`、`tmp_table_size`、`max_heap_table_size` 四项；对当前 wp-shell 管理的 `60-wp-shell.cnf` 则逐项使用同一低内存风险策略，只移除该定义本身已被判定为危险的行，安全的已有调优值和无关内容保持原样。迁移不会用另一组百分比覆盖旧值，不删除配置文件，也不会因为另一个旧文件存在风险而清空安全的受管调优。候选片段和完整配置都必须通过 MariaDB 解析，事务会保存文件原始内容、权限和所有者。只有配置的实际生效值发生变化才重启 MariaDB；重启、健康检查或 runtime 对照失败时自动恢复精确旧文件并尝试恢复服务。
+
+未知管理员文件永远不会被迁移命令自动删除或改写。如果危险值仍由这类文件提供，迁移会失败并回滚，必须由管理员结合业务负载和监控证据人工处理。
+
 ### 内部模块边界与单文件兼容性
 
 为了保留 `wget` 后一个文件即可安装、旧包装器仍可委托执行的兼容性，v10 继续发布单个 `wp-shell.sh`，但代码按职责分区，而不是再拆出一组可能只下载到一半的运行时文件：
@@ -79,7 +113,7 @@ sudo wp-shell status
 
 ### 兼容优先的站点默认值
 
-v10.0.1 不再把性能或安全偏好当成所有 WordPress 网站的共同前提：
+v10.0.1 起不再把性能或安全偏好当成所有 WordPress 网站的共同前提：
 
 - FastCGI 匿名整页缓存、Redis Object Cache、严格 iframe/Permissions 响应头、HSTS、登录限速、系统 WP-Cron 和 Cloudflare 信任均默认关闭。
 - XML-RPC 保持 WordPress 默认可用；确认不依赖移动端、远程发布或外部集成后才禁用。
@@ -1092,7 +1126,7 @@ sudo wp-shell dry-run apply
 sudo wp-shell optimize --confirm
 ```
 
-`optimize` 在 v10 中是事务化 `apply` 的兼容别名，不再无确认改写资源。MariaDB 新配置不会在缺少命中率、慢查询和磁盘延迟证据时自动设置 Buffer Pool；已有受管数值会保留。PHP worker 的自动变化仍只来自满足采样门槛的 `tune --apply`。
+`optimize` 在 v10 中是事务化 `apply` 的兼容别名，不再无确认改写资源。MariaDB 新配置不会在缺少命中率、慢查询和磁盘延迟证据时自动设置 Buffer Pool；风险门槛内的已有受管数值会保留，危险的旧值则阻断普通 `apply`，必须先显式审计和迁移。PHP worker 的自动变化仍只来自满足采样门槛的 `tune --apply`。
 
 ### 5. OPcache：检查、调整和验收（v9.4.8 起）
 
@@ -1174,7 +1208,7 @@ sudo systemctl daemon-reload
 
 脚本先为操作系统预留内存，再为各服务计算安全初始值：
 
-- MariaDB：资源报告仍保留保守预算估算，但新安装只设置 loopback、字符集和慢查询日志；没有监控证据时不把估算值写成 Buffer Pool。已有受管内存值会保留。
+- MariaDB：资源报告仍保留保守预算估算，但该数字不是实际配置；`mariadb audit` 才显示 runtime、下次启动值和定义来源。新安装只设置 loopback、字符集和慢查询日志；没有监控证据时不把估算值写成 Buffer Pool。风险门槛内的已有受管内存值会保留，危险旧值会阻断普通应用。
 - Redis：通常约总内存的 5%，限制为 32MB 至 512MB；约 2GB VPS 的默认起点为 96MB，可通过受验证参数覆盖。
 - OPcache：每个不同的受管 PHP 版本预留一份共享容量，沿用已保存或已有的手工值；未配置时为 128MB（其中字符串空间 16MB）。
 - PHP-FPM：扣除共享 OPcache 后使用受限制的剩余预算；分析输出分别列出共享缓存和 worker 预算。
@@ -1265,7 +1299,7 @@ sudo install -o root -g root -m 0755 wp-shell.sh.new /usr/local/sbin/wp-shell &&
 sudo wp-shell --version
 ```
 
-只更新脚本不需要重新运行 `install` 或 `site deploy`。这不会自动改动现有网站、PHP 用户、OPcache 手工参数或 SSH 登录方式。v10 功能的应用和验收见下方“十八、v10.0.1 升级后的操作”。
+只更新脚本不需要重新运行 `install` 或 `site deploy`。这不会自动改动现有网站、PHP 用户、OPcache 手工参数或 SSH 登录方式。v10 功能的应用和验收见下方“十八、v10.0.2 升级后的操作”。
 
 ### 2. 从 v9.4.2 或 v9.4.3 升级后的必要安全操作
 
@@ -1517,6 +1551,7 @@ bash tests/wordpress-core.sh
 bash tests/dashboard-smoke.sh
 bash tests/menu-routing.sh
 bash tests/opcache-config.sh
+bash tests/mariadb-legacy.sh
 bash tests/reliability-regression.sh
 bash tests/control-plane.sh
 bash tests/cloudflare-policy.sh
@@ -1529,9 +1564,9 @@ ShellCheck：
 shellcheck -x wp-shell.sh wp-vps-manager.sh deploy-single-wordpress.sh tests/*.sh
 ```
 
-GitHub Actions 还会在 Ubuntu 24.04 容器中使用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 验证生成的配置。OPcache 测试覆盖手工参数接管、持久值重用、共享预算去重、无效参数/低内存拒绝、配置及重载失败回滚、INI 加载冲突，以及通过真实 FPM socket 读取运行时状态。
+GitHub Actions 还会在 Ubuntu 24.04 容器中使用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 验证生成的配置，并在 Ubuntu 22.04/24.04 容器中分别验证 MariaDB 旧配置的实际解析、显式迁移和幂等性。OPcache 测试覆盖手工参数接管、持久值重用、共享预算去重、无效参数/低内存拒绝、配置及重载失败回滚、INI 加载冲突，以及通过真实 FPM socket 读取运行时状态。
 
-v10.0.1 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签名和恢复演练测试，并覆盖配置事务、失败回滚、Cloudflare CIDR、staging noindex、未知 Host、敏感路径、不存在 PHP 404，以及页面缓存、对象缓存、XML-RPC、响应头和 Cloudflare 登录策略不会在未选择时自动启用。`nginx-integration.sh`、`service-config-integration.sh` 和 `operations-integration.sh` 会修改系统配置，只能按 CI 的方式在可丢弃容器中以 root 运行，不能在生产 VPS 上执行。
+v10.0.2 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签名和恢复演练测试，并覆盖配置事务、失败回滚、MariaDB 旧值检测/只读审计/精确回滚、Cloudflare CIDR、staging noindex、未知 Host、敏感路径、不存在 PHP 404，以及页面缓存、对象缓存、XML-RPC、响应头和 Cloudflare 登录策略不会在未选择时自动启用。`nginx-integration.sh`、`service-config-integration.sh`、`operations-integration.sh` 和 `mariadb-legacy-integration.sh` 会修改系统配置，只能按 CI 的方式在可丢弃容器中以 root 运行，不能在生产 VPS 上执行。
 
 ## 十七、当前边界
 
@@ -1549,7 +1584,7 @@ v10.0.1 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签�
 
 异地备份已提供显式选择的 rclone crypt 上传与下载校验；其余未列入命令帮助的能力不视为已实现。脚本也不会自动关闭 SSH 密码登录、修改内核/sysctl、创建 swap、关闭或配置第三方安全插件，或把 Redis DB 编号当作安全隔离。
 
-## 十八、v10.0.1 升级后的操作
+## 十八、v10.0.2 升级后的操作
 
 ### 1. 先验证脚本和现有站点，不要重新部署全部环境
 
@@ -1564,7 +1599,10 @@ sudo wp-shell metrics install
 sudo wp-shell metrics collect
 sudo wp-shell metrics status
 sudo wp-shell system audit
+sudo wp-shell mariadb audit
 ```
+
+如果 MariaDB 审计报告 `Unsafe legacy/wp-shell definitions detected`，先不要执行普通 `apply`。确认已具备外部备份和 SSH 维护窗口后，运行 `sudo wp-shell mariadb migrate-legacy --confirm`，再重复审计；没有该警告时不需要为了版本号主动重启 MariaDB。
 
 采样历史保留。新采样才带有探测有效性标记，因此升级后暂时没有自动扩容建议是正常保护，不是采集故障。看板中的 `PHP ?`、`Logs ?` 或共享服务的 `?` 表示探测不可用或日志覆盖不完整，不能解释为零负载。目录大小最多每 15 分钟刷新一次，单次扫描限时；失败时保留上次值或显示未知。访问日志每次最多处理 5MiB，超限会标记覆盖不完整。
 

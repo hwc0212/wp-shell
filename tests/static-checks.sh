@@ -27,7 +27,7 @@ if grep -nE 'ufw[[:space:]]+--force[[:space:]]+reset|/tmp/wp-(single-)?deploy\.s
 fi
 
 grep -Fq "readonly METRICS_DB=\"\$STATE_DIR/metrics.sqlite3\"" "$repo_root/wp-shell.sh"
-grep -Fq 'readonly WP_SHELL_VERSION="10.0.1"' "$repo_root/wp-shell.sh"
+grep -Fq 'readonly WP_SHELL_VERSION="10.0.2"' "$repo_root/wp-shell.sh"
 grep -Fq 'PRAGMA wal_checkpoint(PASSIVE);" >/dev/null' "$repo_root/wp-shell.sh"
 grep -Fq 'core download "$download_url" --force --skip-content --locale="$locale"' "$repo_root/wp-shell.sh"
 grep -Fq 'verify_wordpress_core_strict "$domain"' "$repo_root/wp-shell.sh"
