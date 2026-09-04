@@ -4,7 +4,7 @@
 
 项目不需要常驻的面板 Web 服务、面板数据库或额外后台应用。服务器管理通过 Shell、WP-CLI 和 systemd 完成，更适合希望节省 VPS 资源、减少攻击面，并愿意通过 SSH 管理服务器的用户。
 
-- 当前版本：`wp-shell.sh` v10.0.4
+- 当前版本：`wp-shell.sh` v10.0.5
 - 支持系统：Ubuntu 22.04 / 24.04 LTS
 - 支持架构：x86_64、aarch64
 - GitHub：<https://github.com/hwc0212/wp-shell>
@@ -873,7 +873,7 @@ sudo wp-shell site example.com core-repair
 sudo wp-shell site example.com cache-clear
 sudo wp-shell site example.com backup
 sudo wp-shell site example.com backups
-sudo wp-shell site example.com restore 20260817-020000
+sudo wp-shell site example.com restore 20260817-020000 --confirm
 sudo wp-shell site example.com update --confirm-updates
 sudo wp-shell site example.com restart
 ```
@@ -955,22 +955,48 @@ sudo wp-shell site 2 backups
 
 ### 4. 恢复备份
 
+恢复会同时替换网站文件和数据库，命令行必须显式确认：
+
 ```bash
-sudo wp-shell restore example.com 20260817-020000
-sudo wp-shell restore 2 20260817-020000
+sudo wp-shell restore example.com 20260817-020000 --confirm
+sudo wp-shell restore 2 20260817-020000 --confirm
 ```
 
 恢复流程会：
 
-1. 校验完整的 `SHA256SUMS`、站点归属和压缩包，并拒绝需要人工审查的链接/危险归档路径。
-2. 为当前网站自动创建一份恢复前安全备份。
-3. 启用 Nginx 层维护标记和 WordPress 维护模式，防止旧页面缓存绕过维护。
-4. 恢复网站文件。
-5. 恢复数据库。
-6. 重设文件权限。
-7. 清理缓存并关闭维护模式。
+1. 校验完整的 `SHA256SUMS`、站点归属和压缩包，并拒绝链接、设备文件和危险归档路径。
+2. 在一次性临时数据库中完整导入目标 SQL；预演失败时不进入 maintenance，也不改网站。
+3. 创建持久化、追加式 operation journal，锁住该站点的手工与系统 WP-Cron；非法状态跳转会被拒绝。
+4. 启用 Nginx maintenance，并通过 `127.0.0.1` 对站点 HTTPS 做实际 `503` 探测；只有确认新请求已被阻断，才等待站点 PHP-FPM pool 连续处于 idle，减少恢复快照期间的并发写入。
+5. 创建经过校验的本地 safety backup。该事务快照不会触发 remote upload 或 retention，完成后保留供审计/人工恢复。
+6. 依次记录并执行 `files-applying`、`database-applying`、权限/Redis policy/WordPress 验证和缓存清理。
+7. 只有全部验证成功才进入 `commit-ready`，移除维护标记并记录 `committed`。
 
-恢复中途失败时，Nginx 维护标记会保留，避免继续提供半恢复的网站。先检查日志、数据库连接和文件状态，修复并验收后再运行 `sudo wp-shell site example.com maintenance off`，不要只为恢复访问而直接关闭维护模式。旧模板需先更新为支持 `.wp-shell-maintenance` 的模板。
+恢复会还原备份中的 `wp-config.php`，以保留与旧数据库内容匹配的 `$table_prefix` 和网站级常量；随后在进入数据库导入前重新写入当前 `DB_NAME`、`DB_USER`、`DB_HOST`、`DB_PASSWORD`。数据库密码通过临时 placeholder 原子替换，不出现在命令行、journal 或日志中。对 managed 站点，验证阶段还会按当前站点 policy 重建 Redis 连接，因此备份里的旧数据库/Redis 凭据不会重新上线；尚未接管的 imported 站点不会被脚本猜测或重写第三方插件专用常量，应在恢复前审查其 `wp-config.php` 和对象缓存方案。脚本自己的 `.maintenance` 控制文件不从旧备份恢复。
+
+从 `files-applying` 开始发生语法错误、磁盘/数据库错误、验证失败，或收到 `HUP`、`INT`、`TERM` 时，脚本会从 safety backup 自动恢复恢复前的文件和数据库。自动回滚验证成功后才关闭 maintenance，并把 journal 标记为 `rolled-back`；自动回滚本身失败则标记为 `recovery-required`，维护页保持，不会误报成功。
+
+查看最近一次恢复状态：
+
+```bash
+sudo wp-shell restore status example.com
+```
+
+断电、`SIGKILL` 或回滚失败后，先查看 journal，再显式继续恢复：
+
+```bash
+sudo wp-shell restore recover example.com --confirm
+```
+
+`commit-ready` 表示文件、数据库和缓存已经验证，只差 maintenance 收尾；recovery 会完成提交而不反向回滚。`files-applying` 到 `recovery-required` 会使用 journal 记录的 safety backup 重新执行幂等回滚。不要直接删除 `/var/lib/wp-shell/restore-operations/`，也不要只运行 `maintenance off` 掩盖未完成事务。
+
+journal 位于：
+
+```text
+/var/lib/wp-shell/restore-operations/POOL_ID/current/journal.v1
+```
+
+它只保存域名、备份 ID、数据库名称、编码后的站点路径和状态事件，不保存数据库密码、API Token 或私钥。完成的 journal 在下一次恢复开始时移动到同一站点的 `history/`，不会被静默覆盖。旧 Nginx 模板需先更新为包含 wp-shell 管理的 `.wp-shell-maintenance` fail-closed 规则；仅在文件中出现同名注释并不算通过，实际 HTTPS 探测不是 `503` 时恢复会在任何文件/数据库写入前停止。尚未采用 managed Nginx 模板的 imported 站点，应先审查并明确接管其 Nginx 配置，不能为绕过准入而手工关闭该检查。
 
 ### 5. 备份文件内容
 
@@ -979,7 +1005,7 @@ sudo wp-shell restore 2 20260817-020000
 ```text
 files.tar.gz       WordPress 文件
 database.sql.gz    MariaDB 数据库
-manifest.txt       域名、时间和 WordPress 版本
+manifest.txt       域名、时间、WordPress 版本和备份用途
 SHA256SUMS         完整性校验
 ```
 
@@ -1338,7 +1364,7 @@ sudo install -o root -g root -m 0755 wp-shell.sh.new /usr/local/sbin/wp-shell &&
 sudo wp-shell --version
 ```
 
-只更新脚本不需要重新运行 `install` 或 `site deploy`。这不会自动改动现有网站、PHP 用户、OPcache 手工参数或 SSH 登录方式。v10 功能的应用和验收见下方“十八、v10.0.4 升级后的操作”。
+只更新脚本不需要重新运行 `install` 或 `site deploy`。这不会自动改动现有网站、PHP 用户、OPcache 手工参数或 SSH 登录方式。v10 功能的应用和验收见下方“十八、v10.0.5 升级后的操作”。
 
 ### 2. 从 v9.4.2 或 v9.4.3 升级后的必要安全操作
 
@@ -1591,6 +1617,7 @@ bash tests/dashboard-smoke.sh
 bash tests/menu-routing.sh
 bash tests/opcache-config.sh
 bash tests/php-memory-budget.sh
+bash tests/restore-transaction.sh
 bash tests/mariadb-legacy.sh
 bash tests/imported-site-reliability.sh
 bash tests/reliability-regression.sh
@@ -1607,7 +1634,7 @@ shellcheck -x wp-shell.sh wp-vps-manager.sh deploy-single-wordpress.sh tests/*.s
 
 GitHub Actions 还会在 Ubuntu 24.04 容器中使用真实的 Nginx、MariaDB、Redis 和 PHP-FPM 验证生成的配置，并在 Ubuntu 22.04/24.04 容器中分别验证 MariaDB 旧配置的实际解析、显式迁移和幂等性。OPcache 测试覆盖手工参数接管、持久值重用、共享预算去重、无效参数/低内存拒绝、配置及重载失败回滚、INI 加载冲突，以及通过真实 FPM socket 读取运行时状态。
 
-v10.0.4 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签名和恢复演练测试，并覆盖配置事务、失败回滚、MariaDB 旧值检测/只读审计/精确回滚、导入站点非 root 连续配置写入及失败后权限恢复、Cloudflare CIDR、staging noindex、未知 Host、敏感路径、不存在 PHP 404，以及页面缓存、对象缓存、XML-RPC、响应头和 Cloudflare 登录策略不会在未选择时自动启用。新增 PHP 硬预算矩阵覆盖 1/2/4/8/16GB、单站点/多站点、普通/WooCommerce/混合站点、零/低/较大 Swap、多 PHP 版本、旧站点数量、全局 override、PSS 证据、压力否决、幂等和失败前无写入，并通过导入联合测试确认容量不足时不持久化站点或 policy、容量足够时仅按目标站点或默认 PHP 完成一次幂等导入。`nginx-integration.sh`、`service-config-integration.sh`、`operations-integration.sh`、`mariadb-legacy-integration.sh` 和 `imported-site-integration.sh` 会修改系统配置，只能按 CI 的方式在可丢弃容器中以 root 运行，不能在生产 VPS 上执行。
+v10.0.5 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签名和恢复演练测试，并覆盖配置事务、失败回滚、MariaDB 旧值检测/只读审计/精确回滚、导入站点非 root 连续配置写入及失败后权限恢复、Cloudflare CIDR、staging noindex、未知 Host、敏感路径、不存在 PHP 404，以及页面缓存、对象缓存、XML-RPC、响应头和 Cloudflare 登录策略不会在未选择时自动启用。PHP 硬预算矩阵覆盖 1/2/4/8/16GB、单站点/多站点、普通/WooCommerce/混合站点、零/低/较大 Swap、多 PHP 版本、旧站点数量、全局 override、PSS 证据、压力否决、幂等和失败前无写入，并通过导入联合测试确认容量不足时不持久化站点或 policy、容量足够时仅按目标站点或默认 PHP 完成一次幂等导入。新增 restore 测试覆盖 journal admission、历史保留、低磁盘拒绝、备份 `wp-config.php` 恢复后当前数据库凭据的无命令行泄露重写、真实 MariaDB 成功恢复、数据库中途失败自动回滚、`TERM` 中断回滚、回滚失败保持 maintenance，以及后续显式 recovery。`nginx-integration.sh`、`service-config-integration.sh`、`restore-transaction-integration.sh`、`operations-integration.sh`、`mariadb-legacy-integration.sh` 和 `imported-site-integration.sh` 会修改系统配置，只能按 CI 的方式在可丢弃容器中以 root 运行，不能在生产 VPS 上执行。
 
 ## 十七、当前边界
 
@@ -1625,7 +1652,7 @@ v10.0.4 继续保留原有备份、调优、采集、Redis 隔离、WP-CLI 签�
 
 异地备份已提供显式选择的 rclone crypt 上传与下载校验；其余未列入命令帮助的能力不视为已实现。脚本也不会自动关闭 SSH 密码登录、修改内核/sysctl、创建 swap、关闭或配置第三方安全插件，或把 Redis DB 编号当作安全隔离。
 
-## 十八、v10.0.4 升级后的操作
+## 十八、v10.0.5 升级后的操作
 
 ### 1. 先验证脚本和现有站点，不要重新部署全部环境
 
@@ -1647,7 +1674,7 @@ sudo wp-shell dry-run apply
 
 如果 MariaDB 审计报告 `Unsafe legacy/wp-shell definitions detected`，先不要执行普通 `apply`。确认已具备外部备份和 SSH 维护窗口后，运行 `sudo wp-shell mariadb migrate-legacy --confirm`，再重复审计；没有该警告时不需要为了版本号主动重启 MariaDB。
 
-升级到 v10.0.4 后先查看 `audit` 中的 `PHP-FPM hard capacity admission`。`SAFE` 表示按当前物理 RAM、站点、PHP 版本、OPcache 和 worker 证据可以生成不超过硬预算的配置；`OVERCOMMITTED` 表示实际 pool 总量高于预算；`BLOCKED` 表示站点最低需求或已有 tuning override 已经无法容纳。只读审计不会改 pool 或重载 PHP。
+升级到 v10.0.4/v10.0.5 后先查看 `audit` 中的 `PHP-FPM hard capacity admission`。`SAFE` 表示按当前物理 RAM、站点、PHP 版本、OPcache 和 worker 证据可以生成不超过硬预算的配置；`OVERCOMMITTED` 表示实际 pool 总量高于预算；`BLOCKED` 表示站点最低需求或已有 tuning override 已经无法容纳。只读审计不会改 pool 或重载 PHP。
 
 现有 pool 超预算但没有强制 override 时，确认计划后运行 `sudo wp-shell apply --confirm` 会把 wp-shell 管理的 limits 重新分配到硬预算内。显式 override 不会被静默缩小；请先审查 `/etc/wp-shell/tuning.v1`，明确降低对应值后再运行审计与 apply。不要通过增加 Swap、删除 OPcache 余量或提高 PHP 预算来绕过准入。低流量站点变为一个 ondemand worker 是允许的兼容结果；高峰负载不能接受该容量时，应减少同机站点或增加物理 RAM。
 

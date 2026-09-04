@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 # wp-shell - WordPress VPS manager
-# Version 10.0.4
+# Version 10.0.5
 # Supported systems: Ubuntu 22.04/24.04 LTS
 
 set -Eeuo pipefail
 umask 077
 
-readonly WP_SHELL_VERSION="10.0.4"
+readonly WP_SHELL_VERSION="10.0.5"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 CONFIG_DIR="${WP_SHELL_CONFIG_DIR:-/etc/wp-shell}"
@@ -18,6 +18,7 @@ readonly DATABASE_CONFIG_DIR="$CONFIG_DIR/databases"
 readonly REDIS_SECRET_FILE="$CONFIG_DIR/redis.secret"
 readonly STATE_DIR="${WP_SHELL_STATE_DIR:-/var/lib/wp-shell}"
 readonly METRICS_DB="$STATE_DIR/metrics.sqlite3"
+readonly RESTORE_STATE_DIR="$STATE_DIR/restore-operations"
 readonly TUNING_CONFIG_FILE="$CONFIG_DIR/tuning.v1"
 readonly OPCACHE_CONFIG_FILE="$CONFIG_DIR/opcache.v1"
 readonly SITE_POLICY_DIR="$CONFIG_DIR/site-policy"
@@ -4274,12 +4275,16 @@ validate_restore_archive() {
     python3 - "$1" <<'PY'
 import sys, tarfile, posixpath
 with tarfile.open(sys.argv[1], "r:gz") as archive:
+    seen = set()
     for member in archive:
         path = posixpath.normpath(member.name)
         if path.startswith("/") or path == ".." or path.startswith("../") or member.isdev():
             raise SystemExit("Unsafe archive member; restore refused.")
         if member.issym() or member.islnk():
             raise SystemExit("Archive contains links; review them before a privileged restore.")
+        if path != "." and path in seen:
+            raise SystemExit("Archive contains duplicate normalized paths; restore refused.")
+        seen.add(path)
 PY
 }
 
@@ -4321,10 +4326,11 @@ SQL
 
 backup_site() (
     CURRENT_STEP="back up the site"
-    local index="$1" domain wp_path timestamp site_backup_root temp_dir final_dir defaults_file db_name
+    local index="$1" purpose="${2:-normal}" domain wp_path timestamp site_backup_root temp_dir final_dir defaults_file db_name
     local required_kb free_kb database_kb
     temp_dir=""; defaults_file=""
     trap '[[ -z "$defaults_file" ]] || rm -f -- "$defaults_file"; [[ -z "$temp_dir" ]] || rm -rf -- "$temp_dir"' EXIT
+    [[ "$purpose" == normal || "$purpose" == restore-safety ]] || exit 1
     domain="${SITE_DOMAINS[$index]}"
     wp_path="$(site_wp_path "$domain")"
     [[ -f "$wp_path/wp-config.php" ]] || { log_message ERROR "WordPress is not installed for $domain." >&2; exit 1; }
@@ -4379,6 +4385,7 @@ backup_site() (
         printf 'database_name=%s\n' "$db_name"
         printf 'created_at=%s\n' "$(date --iso-8601=seconds)"
         printf 'wordpress_version=%s\n' "$core_version"
+        printf 'purpose=%s\n' "$purpose"
     } > "$temp_dir/manifest.txt" || exit 1
     (cd "$temp_dir" && sha256sum files.tar.gz database.sql.gz manifest.txt > SHA256SUMS) || {
         log_message ERROR "Backup checksum generation failed for $domain." >&2; exit 1;
@@ -4386,66 +4393,553 @@ backup_site() (
     verify_backup_directory "$temp_dir" "$domain" || { log_message ERROR "Backup verification failed for $domain." >&2; exit 1; }
     mv -T "$temp_dir" "$final_dir" || exit 1
     temp_dir=""
-    upload_remote_backup "$domain" "$final_dir" || exit 1
-    if ((BACKUP_RETENTION_DAYS > 0)); then
-        find "$site_backup_root" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' \
-            -mtime "+$BACKUP_RETENTION_DAYS" -exec rm -rf -- {} + || exit 1
+    if [[ "$purpose" == normal ]]; then
+        upload_remote_backup "$domain" "$final_dir" || exit 1
+        if ((BACKUP_RETENTION_DAYS > 0)); then
+            find "$site_backup_root" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' \
+                -mtime "+$BACKUP_RETENTION_DAYS" -exec rm -rf -- {} + || exit 1
+        fi
     fi
     log_message SUCCESS "Backup completed: $final_dir"
     printf '%s\n' "$final_dir"
     exit 0
 )
 
-restore_site() {
-    CURRENT_STEP="restore the site"
-    local index="$1" backup_id="$2" domain wp_path backup_dir defaults_file db_name
+restore_terminal_state() {
+    [[ "$1" == committed || "$1" == rolled-back || "$1" == aborted ]]
+}
+
+restore_state_transition_allowed() {
+    case "$1:$2" in
+        initialized:source-ready|initialized:aborted|\
+        source-ready:maintenance|source-ready:aborted|\
+        maintenance:safety-ready|maintenance:aborted|\
+        safety-ready:files-applying|safety-ready:aborted|\
+        files-applying:files-applied|files-applying:rollback-running|\
+        files-applied:database-applying|files-applied:rollback-running|\
+        database-applying:database-applied|database-applying:rollback-running|\
+        database-applied:validating|database-applied:rollback-running|\
+        validating:commit-ready|validating:rollback-running|\
+        commit-ready:committed|\
+        rollback-running:rollback-running|rollback-running:rolled-back|rollback-running:recovery-required|\
+        recovery-required:rollback-running) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+restore_state_requires_rollback() {
+    case "$1" in
+        files-applying|files-applied|database-applying|database-applied|validating|rollback-running|recovery-required) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+restore_current_operation_dir() {
+    printf '%s/%s/current' "$RESTORE_STATE_DIR" "$(site_pool_id "$1")"
+}
+
+restore_journal_value() {
+    local journal="$1" key="$2"
+    awk -F'|' -v key="$key" '$1==key {value=$2} END {if (value!="") print value; else exit 1}' "$journal"
+}
+
+restore_journal_last_state() {
+    local journal="$1"
+    awk -F'|' '$1=="state" {state=$2} END {if (state!="") print state; else exit 1}' "$journal"
+}
+
+restore_journal_append() {
+    local journal="$1" key="$2" value="$3"
+    [[ -f "$journal" && ! -L "$journal" && "$key" =~ ^[a-z][a-z0-9-]*$ && "$value" != *'|'* && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+    printf '%s|%s\n' "$key" "$value" >> "$journal"
+    sync -f "$journal"
+}
+
+restore_journal_state() {
+    local journal="$1" state="$2" detail="${3:-}" current
+    case "$state" in
+        initialized|source-ready|maintenance|safety-ready|files-applying|files-applied|database-applying|database-applied|validating|commit-ready|committed|rollback-running|rolled-back|recovery-required|aborted) ;;
+        *) return 1 ;;
+    esac
+    current="$(restore_journal_last_state "$journal")" || return 1
+    restore_state_transition_allowed "$current" "$state" || return 1
+    restore_journal_append "$journal" state "$state"
+    restore_journal_append "$journal" updated "$(date --iso-8601=seconds)"
+    [[ -z "$detail" ]] || restore_journal_append "$journal" detail "$(b64_encode "$detail")"
+}
+
+restore_begin_operation() {
+    local domain="$1" backup_id="$2" wp_path="$3" db_name="$4" site_dir current history state old_id candidate operation_id journal
+    site_dir="$RESTORE_STATE_DIR/$(site_pool_id "$domain")"
+    current="$site_dir/current"
+    history="$site_dir/history"
+    [[ ! -L "$RESTORE_STATE_DIR" && ! -L "$site_dir" && ! -L "$history" ]] || return 1
+    install -d -m 0700 "$RESTORE_STATE_DIR" "$site_dir" "$history"
+    [[ -d "$RESTORE_STATE_DIR" && ! -L "$RESTORE_STATE_DIR" && -d "$site_dir" && ! -L "$site_dir" &&
+       -d "$history" && ! -L "$history" ]] || return 1
+    if [[ -e "$current" || -L "$current" ]]; then
+        [[ -d "$current" && ! -L "$current" && -f "$current/journal.v1" && ! -L "$current/journal.v1" ]] || return 1
+        state="$(restore_journal_last_state "$current/journal.v1")" || return 1
+        restore_terminal_state "$state" || return 1
+        old_id="$(restore_journal_value "$current/journal.v1" id)" || return 1
+        [[ "$old_id" =~ ^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$ &&
+           ! -e "$history/$old_id" && ! -L "$history/$old_id" ]] || return 1
+        # A SIGKILL immediately after the terminal journal append can skip the
+        # normal EXIT cleanup. Remove only known disposable staging trees
+        # before preserving the completed journal in history.
+        rm -rf -- "$current/source-files" "$current/rollback-files" || return 1
+        mv -T -- "$current" "$history/$old_id" || return 1
+        sync -f "$site_dir" || return 1
+    fi
+    candidate="$(mktemp -d "$site_dir/.current.XXXXXXXX")" || return 1
+    operation_id="$(date -u +%Y%m%dT%H%M%SZ)-$(openssl rand -hex 4)" || { rm -rf -- "$candidate"; return 1; }
+    journal="$candidate/journal.v1"
+    {
+        printf 'version|1\n'
+        printf 'id|%s\n' "$operation_id"
+        printf 'domain|%s\n' "$domain"
+        printf 'source-backup|%s\n' "$backup_id"
+        printf 'wp-path|%s\n' "$(b64_encode "$wp_path")"
+        printf 'database|%s\n' "$db_name"
+        printf 'created|%s\n' "$(date --iso-8601=seconds)"
+        printf 'state|initialized\n'
+    } > "$journal"
+    chmod 0600 "$journal"
+    sync -f "$journal"
+    if ! mv -T -- "$candidate" "$current"; then
+        rm -rf -- "$candidate"
+        return 1
+    fi
+    sync -f "$site_dir" || return 1
+    printf '%s' "$current"
+}
+
+restore_archive_unpacked_kb() {
+    python3 - "$1" <<'PY'
+import math, sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as archive:
+    total = sum(member.size for member in archive if member.isfile())
+print(math.ceil(total / 1024))
+PY
+}
+
+restore_stage_source() {
+    local archive="$1" operation_dir="$2" stage required_kb free_kb
+    stage="$operation_dir/source-files"
+    [[ "$operation_dir" == "$RESTORE_STATE_DIR"/*/current && -d "$operation_dir" && ! -L "$operation_dir" ]] || return 1
+    required_kb="$(restore_archive_unpacked_kb "$archive")" || return 1
+    free_kb="$(df -Pk "$operation_dir" | awk 'NR==2 {print $4}')" || return 1
+    [[ "$required_kb" =~ ^[0-9]+$ && "$free_kb" =~ ^[0-9]+$ ]] || return 1
+    if ((free_kb <= required_kb + 262144)); then
+        log_message ERROR "Insufficient disk to stage the restore archive plus a 256MB reserve." >&2
+        return 1
+    fi
+    mkdir -m 0700 "$stage" || return 1
+    tar --no-same-owner --no-same-permissions -xzf "$archive" -C "$stage" || return 1
+    [[ -f "$stage/wp-config.php" && ! -L "$stage/wp-config.php" ]] || return 1
+}
+
+restore_sync_tree() {
+    local source="$1" domain="$2" wp_path="$3" storage_path relative_path canonical
+    local -a excludes=(--exclude=/.maintenance)
+    canonical="$(readlink -f -- "$wp_path")" || return 1
+    [[ "$canonical" == "$wp_path" && "$wp_path" != / && "$wp_path" != /var/www && ! -L "$wp_path" ]] || return 1
+    [[ -d "$source" && ! -L "$source" && -f "$source/wp-config.php" && ! -L "$source/wp-config.php" ]] || return 1
+    for storage_path in "$(site_backup_dir "$domain")" "$(site_cache_dir "$domain")" "$(site_wp_cli_home "$domain")" "/var/www/$domain/logs"; do
+        [[ -e "$storage_path" ]] || continue
+        storage_path="$(readlink -f -- "$storage_path")" || return 1
+        if [[ "$storage_path/" == "$wp_path/"* ]]; then
+            relative_path="${storage_path#"$wp_path/"}"
+            [[ -n "$relative_path" && "$relative_path" != "$storage_path" ]] || return 1
+            excludes+=("--exclude=/$relative_path/")
+        fi
+    done
+    rsync -a --delete --one-file-system "${excludes[@]}" "$source/" "$wp_path/"
+}
+
+restore_import_database() {
+    local archive="$1" defaults_file="$2" db_name="$3"
+    [[ -s "$archive" && -f "$defaults_file" && ! -L "$defaults_file" && "$db_name" =~ ^[a-zA-Z0-9_\$-]{1,64}$ ]] || return 1
+    # shellcheck disable=SC2016
+    timeout 30m bash -o pipefail -c \
+        'gzip -dc -- "$1" | mariadb --defaults-extra-file="$2" --binary-mode --local-infile=0 "$3"' \
+        _ "$archive" "$defaults_file" "$db_name"
+}
+
+restore_set_database_password() {
+    local domain="$1" secret="$2" wp_path wp_config placeholder backup temp_file original_mode
+    local status=0 backup_ready=no
+    [[ "$secret" != *$'\n'* && "$secret" != *$'\r'* ]] || return 1
+    wp_path="$(site_wp_path "$domain")"
+    wp_config="$wp_path/wp-config.php"
+    site_wp_config_path_is_safe "$wp_path" || return 1
+    placeholder="__WP_SHELL_DB_PASSWORD_$(openssl rand -hex 12)__"
+    backup="$(mktemp "$wp_path/.wp-config.restore-backup.XXXXXXXX")" || return 1
+    temp_file="$(mktemp "$wp_path/.wp-config.restore-secret.XXXXXXXX")" || { rm -f -- "$backup"; return 1; }
+    if cp --preserve=all -- "$wp_config" "$backup"; then
+        backup_ready=yes
+        chmod 0600 "$backup" || status=1
+    else
+        status=1
+    fi
+    original_mode="$(stat -c '%a' "$wp_config")" || status=1
+    if ((status == 0)) && ! site_wp_cli "$domain" config set DB_PASSWORD "$placeholder" --quiet >/dev/null; then status=1; fi
+    if ((status == 0)); then
+        # Keep the real password out of argv and logs. Replace the random
+        # placeholder as bytes after escaping the two special characters in a
+        # PHP single-quoted string. Exactly one placeholder must be present.
+        python3 - "$wp_config" "$placeholder" "$temp_file" 3<<< "$secret" <<'PY' || status=1
+from pathlib import Path
+import os
+import sys
+
+source = Path(sys.argv[1]).read_bytes()
+placeholder = sys.argv[2].encode("ascii")
+secret = os.fdopen(3, "rb").read()
+if not secret.endswith(b"\n"):
+    raise SystemExit(1)
+secret = secret[:-1]
+if b"\n" in secret or b"\r" in secret or source.count(placeholder) != 1:
+    raise SystemExit(1)
+escaped = secret.replace(b"\\", b"\\\\").replace(b"'", b"\\'")
+Path(sys.argv[3]).write_bytes(source.replace(placeholder, escaped))
+PY
+    fi
+    if ((status == 0)); then
+        chown --reference="$wp_config" "$temp_file" || status=1
+        chmod "$original_mode" "$temp_file" || status=1
+        mv -f -- "$temp_file" "$wp_config" || status=1
+    fi
+    if ((status == 0)) && [[ "$(site_wp_cli "$domain" config get DB_PASSWORD 2>/dev/null || true)" != "$secret" ]]; then
+        status=1
+    fi
+    if ((status != 0)); then
+        if [[ "$backup_ready" == yes ]]; then
+            cp --preserve=all -- "$backup" "$wp_config" || true
+        fi
+        rm -f -- "$backup" "$temp_file"
+        return 1
+    fi
+    rm -f -- "$backup" "$temp_file"
+}
+
+restore_reapply_database_config() {
+    local domain="$1" db_name="$2" db_user="$3" db_password="$4" db_host="$5"
+    [[ "$db_name" =~ ^[a-zA-Z0-9_\$-]{1,64}$ && "$db_user" =~ ^[a-zA-Z0-9_\$-]{1,64}$ && "$db_user" != root &&
+       "$db_host" =~ ^[a-zA-Z0-9_.:-]+$ && "$db_password" != *$'\n'* && "$db_password" != *$'\r'* ]] || return 1
+    site_wp_cli "$domain" config set DB_NAME "$db_name" --quiet >/dev/null || return 1
+    site_wp_cli "$domain" config set DB_USER "$db_user" --quiet >/dev/null || return 1
+    site_wp_cli "$domain" config set DB_HOST "$db_host" --quiet >/dev/null || return 1
+    restore_set_database_password "$domain" "$db_password" || return 1
+}
+
+restore_wait_for_php_idle() {
+    local domain="$1" index mode attempt stats active _idle queue _max _reached _rss _pss valid idle_checks=0 observed=no
+    index="$(site_index_by_domain "$domain")" || return 1
+    mode="${SITE_MODES[$index]}"
+    for ((attempt=0; attempt<30; attempt++)); do
+        stats="$(collect_php_pool_status "$domain")"
+        IFS=$'\t' read -r active _idle queue _max _reached _rss _pss valid <<< "$stats"
+        [[ "$valid" != 1 ]] || observed=yes
+        if [[ "$valid" == 1 && "$active" == 0 && "$queue" == 0 ]]; then
+            idle_checks=$((idle_checks + 1))
+            ((idle_checks >= 2)) && return 0
+        else
+            idle_checks=0
+        fi
+        sleep 1
+    done
+    if [[ "$observed" == no && "$mode" == imported ]]; then
+        log_message WARNING "No managed PHP-FPM status socket is available for imported site $domain; new Web requests were blocked and a fixed 30-second drain window was used."
+        return 0
+    fi
+    log_message ERROR "PHP-FPM did not report an idle, empty site pool within 30 seconds; restore was not started." >&2
+    return 1
+}
+
+restore_maintenance_configuration_ready() {
+    local domain="$1" nginx_site expected
+    nginx_site="/etc/nginx/sites-available/$domain"
+    expected="if (-f /var/www/$domain/.wp-shell-maintenance) { return 503; }"
+    [[ -f "$nginx_site" && ! -L "$nginx_site" ]] || return 1
+    sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' "$nginx_site" | grep -Fxq "$expected"
+}
+
+restore_verify_maintenance_barrier() {
+    local domain="$1" index primary code
+    command -v curl >/dev/null 2>&1 || return 1
+    index="$(site_index_by_domain "$domain")" || return 1
+    primary="${SITE_PRIMARY_DOMAINS[$index]:-$domain}"
+    validate_domain "$primary" >/dev/null || return 1
+    code="$(curl --noproxy '*' --silent --show-error --insecure \
+        --resolve "$primary:443:127.0.0.1" --connect-timeout 5 --max-time 10 \
+        --output /dev/null --write-out '%{http_code}' \
+        "https://$primary/__wp_shell_restore_barrier__")" || return 1
+    [[ "$code" == 503 ]]
+}
+
+restore_create_safety_backup() {
+    local index="$1" domain="$2" result_file="$3" output safety_dir safety_id temp
+    [[ "$result_file" == "$RESTORE_STATE_DIR"/*/current/safety.id && -d "$(dirname "$result_file")" && ! -L "$(dirname "$result_file")" ]] || return 1
+    output="$(backup_site "$index" restore-safety)" || return 1
+    printf '%s\n' "$output"
+    safety_dir="${output##*$'\n'}"
+    safety_id="${safety_dir##*/}"
+    [[ "$safety_id" =~ ^20[0-9]{6}-[0-9]{6}$ && "$safety_dir" == "$(site_backup_dir "$domain")/$safety_id" ]] || return 1
+    verify_backup_directory "$safety_dir" "$domain" || return 1
+    temp="$(mktemp "$(dirname "$result_file")/.safety.XXXXXXXX")" || return 1
+    printf '%s\n' "$safety_id" > "$temp"
+    chmod 0600 "$temp"
+    mv -T -- "$temp" "$result_file"
+}
+
+restore_finalize_maintenance() {
+    local domain="$1" wp_path="$2" marker
+    marker="/var/www/$domain/.wp-shell-maintenance"
+    [[ "$wp_path" == /* && "$wp_path" != / && ! -L "$wp_path" ]] || return 1
+    rm -f -- "$wp_path/.maintenance"
+    rm -f -- "$marker"
+}
+
+restore_validate_site() {
+    local index="$1" domain="$2" defaults_file="$3" db_name="$4" tables
+    tables="$(mariadb --defaults-extra-file="$defaults_file" --batch --skip-column-names \
+        -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$db_name';")" || return 1
+    [[ "$tables" =~ ^[1-9][0-9]*$ ]] || return 1
+    set_site_permissions "$domain" || return 1
+    [[ "${SITE_MODES[$index]}" != managed ]] || apply_site_redis_connection "$domain" || return 1
+    site_wp_cli "$domain" core is-installed >/dev/null || return 1
+}
+
+restore_from_safety_backup() (
+    set -Eeuo pipefail
+    trap - ERR
+    local index="$1" domain="$2" wp_path="$3" operation_dir="$4" safety_id="$5" db_name="$6"
+    local safety_dir rollback_stage defaults_file="" required_kb free_kb
+    trap '[[ -z "$defaults_file" ]] || rm -f -- "$defaults_file"' EXIT
+    safety_dir="$(site_backup_dir "$domain")/$safety_id"
+    verify_backup_directory "$safety_dir" "$domain" || exit 1
+    validate_restore_archive "$safety_dir/files.tar.gz" || exit 1
+    rollback_stage="$operation_dir/rollback-files"
+    rm -rf -- "$rollback_stage" || exit 1
+    required_kb="$(restore_archive_unpacked_kb "$safety_dir/files.tar.gz")" || exit 1
+    free_kb="$(df -Pk "$operation_dir" | awk 'NR==2 {print $4}')" || exit 1
+    [[ "$required_kb" =~ ^[0-9]+$ && "$free_kb" =~ ^[0-9]+$ && "$free_kb" -gt $((required_kb + 262144)) ]] || exit 1
+    mkdir -m 0700 "$rollback_stage" || exit 1
+    tar --no-same-owner --no-same-permissions -xzf "$safety_dir/files.tar.gz" -C "$rollback_stage" || exit 1
+    restore_sync_tree "$rollback_stage" "$domain" "$wp_path" || exit 1
+    site_wp_config_path_is_safe "$wp_path" || exit 1
+    defaults_file="$(create_mysql_defaults_file "$domain")" || exit 1
+    [[ "$(site_wp_cli "$domain" config get DB_NAME)" == "$db_name" ]] || exit 1
+    restore_import_database "$safety_dir/database.sql.gz" "$defaults_file" "$db_name" || exit 1
+    restore_validate_site "$index" "$domain" "$defaults_file" "$db_name" || exit 1
+    clear_site_cache "$index" all || exit 1
+    restore_finalize_maintenance "$domain" "$wp_path" || exit 1
+)
+
+restore_operation_status() {
+    local selector="$1" domain current journal state source safety updated detail
+    domain="$(site_domain_from_selector "$selector")" || die "Unknown site ID or domain: $selector"
+    current="$(restore_current_operation_dir "$domain")"
+    if [[ ! -d "$current" || -L "$current" || ! -f "$current/journal.v1" ]]; then
+        printf '%s: no restore operation journal.\n' "$domain"
+        return 0
+    fi
+    journal="$current/journal.v1"
+    state="$(restore_journal_last_state "$journal")" || die "Invalid restore journal for $domain."
+    source="$(restore_journal_value "$journal" source-backup 2>/dev/null || printf UNKNOWN)"
+    safety="$(restore_journal_value "$journal" safety-backup 2>/dev/null || printf none)"
+    updated="$(restore_journal_value "$journal" updated 2>/dev/null || restore_journal_value "$journal" created 2>/dev/null || printf UNKNOWN)"
+    detail="$(restore_journal_value "$journal" detail 2>/dev/null || true)"
+    printf 'Domain: %s\nState: %s\nSource backup: %s\nSafety backup: %s\nUpdated: %s\nJournal: %s\n' \
+        "$domain" "$state" "$source" "$safety" "$updated" "$journal"
+    [[ -z "$detail" ]] || printf 'Detail: %s\n' "$(b64_decode "$detail")"
+}
+
+restore_recover_site() (
+    set -Eeuo pipefail
+    trap - ERR
+    local index="$1" confirmation="${2:-}" domain wp_path current journal state journal_domain journal_path db_name safety_id marker
+    local cron_state_lock cron_site_lock run_user run_group
+    [[ "$confirmation" == --confirm ]] || die "Impact: finish or roll back the interrupted restore using its recorded safety backup. Re-run with --confirm."
     domain="${SITE_DOMAINS[$index]}"
     wp_path="$(site_wp_path "$domain")"
+    current="$(restore_current_operation_dir "$domain")"
+    journal="$current/journal.v1"
+    [[ -d "$current" && ! -L "$current" && -f "$journal" && ! -L "$journal" ]] || die "No recoverable restore journal exists for $domain."
+    state="$(restore_journal_last_state "$journal")" || die "Invalid restore journal for $domain."
+    restore_terminal_state "$state" && { log_message INFO "$domain restore journal is already $state."; exit 0; }
+    journal_domain="$(restore_journal_value "$journal" domain)"
+    journal_path="$(b64_decode "$(restore_journal_value "$journal" wp-path)")"
+    db_name="$(restore_journal_value "$journal" database)"
+    [[ "$journal_domain" == "$domain" && "$journal_path" == "$wp_path" && "$db_name" =~ ^[a-zA-Z0-9_\$-]{1,64}$ ]] || die "Restore journal metadata does not match the registered site."
+    site_wp_config_path_is_safe "$wp_path" || die "Registered WordPress path or wp-config.php is unsafe."
+    marker="/var/www/$domain/.wp-shell-maintenance"
+    [[ ! -L "$marker" ]] || die "Unsafe maintenance marker."
+    run_user="$(site_run_user "$domain")"; run_group="$(id -gn "$run_user")"
+    cron_state_lock="$STATE_DIR/cron-$(site_pool_id "$domain").lock"
+    install -d -o "$run_user" -g "$run_group" -m 0700 "/var/www/$domain/.wp-shell" || exit 1
+    cron_site_lock="/var/www/$domain/.wp-shell/cron.lock"
+    [[ -e "$cron_site_lock" ]] || install -o "$run_user" -g "$run_group" -m 0600 /dev/null "$cron_site_lock"
+    [[ -f "$cron_site_lock" && ! -L "$cron_site_lock" ]] || die "Unsafe site Cron lock."
+    exec 7>"$cron_state_lock"; flock -w 300 7 || die "Timed out waiting for the manual WP-Cron lock."
+    exec 8>"$cron_site_lock"; flock -w 300 8 || die "Timed out waiting for the system WP-Cron lock."
+    install -m 0600 /dev/null "$marker" || exit 1
+    if [[ "$state" == commit-ready ]]; then
+        restore_finalize_maintenance "$domain" "$wp_path" || die "Could not finish restore maintenance cleanup; journal remains commit-ready."
+        restore_journal_state "$journal" committed "Recovered and finalized the already validated restore." || exit 1
+        rm -rf -- "$current/source-files" "$current/rollback-files" || exit 1
+        log_message SUCCESS "$domain restore commit was finalized from its journal."
+        exit 0
+    fi
+    if ! restore_state_requires_rollback "$state"; then
+        restore_finalize_maintenance "$domain" "$wp_path" || die "Could not cancel the pre-mutation restore safely."
+        restore_journal_state "$journal" aborted "Recovered before authoritative files or database were changed." || exit 1
+        rm -rf -- "$current/source-files" "$current/rollback-files" || exit 1
+        log_message SUCCESS "$domain interrupted restore was cancelled before data mutation."
+        exit 0
+    fi
+    restore_maintenance_configuration_ready "$domain" || \
+        die "The Nginx maintenance rule is not the managed fail-closed rule; recovery did not mutate site data."
+    restore_verify_maintenance_barrier "$domain" || \
+        die "Could not prove the local HTTPS maintenance barrier; recovery did not mutate site data."
+    restore_wait_for_php_idle "$domain" || \
+        die "PHP-FPM did not drain behind the maintenance barrier; recovery did not mutate site data."
+    safety_id="$(restore_journal_value "$journal" safety-backup)" || die "Interrupted restore has no recorded safety backup."
+    restore_journal_state "$journal" rollback-running "Explicit recovery requested." || exit 1
+    rm -rf -- "$current/source-files" "$current/rollback-files" || exit 1
+    if restore_from_safety_backup "$index" "$domain" "$wp_path" "$current" "$safety_id" "$db_name"; then
+        restore_journal_state "$journal" rolled-back "Explicit recovery restored the pre-restore files and database." || exit 1
+        rm -rf -- "$current/source-files" "$current/rollback-files" || exit 1
+        log_message SUCCESS "$domain was recovered from safety backup $safety_id."
+        exit 0
+    fi
+    restore_journal_state "$journal" recovery-required "Explicit recovery failed; maintenance remains enabled."
+    die "Recovery failed for $domain. Maintenance remains enabled. Inspect: $journal"
+)
+
+restore_site() (
+    set -Eeuo pipefail
+    trap - ERR
+    CURRENT_STEP="restore the site"
+    local index="$1" backup_id="$2" confirmation="${3:-}" domain wp_path backup_dir defaults_file="" db_name
+    local current_db_user current_db_password current_db_host
+    local operation_dir journal state safety_id marker run_user run_group cron_state_lock cron_site_lock exit_status
+    local completed=no
+    domain="${SITE_DOMAINS[$index]}"
+    wp_path="$(site_wp_path "$domain")"
+    marker="/var/www/$domain/.wp-shell-maintenance"
+    [[ "$confirmation" == --confirm ]] || die "Impact: replace the site files and database after creating a local safety backup. Re-run with --confirm."
     [[ "$backup_id" =~ ^20[0-9]{6}-[0-9]{6}$ ]] || die "Invalid backup ID format."
     ensure_site_storage "$domain"
     backup_dir="$(site_backup_dir "$domain")/$backup_id"
-    [[ -d "$backup_dir" ]] || die "Backup not found: $backup_dir"
+    [[ -d "$backup_dir" && ! -L "$backup_dir" ]] || die "Backup not found: $backup_dir"
     verify_backup_directory "$backup_dir" "$domain" || die "Backup verification failed; nothing was restored."
     validate_restore_archive "$backup_dir/files.tar.gz" || die "Unsafe archive; nothing was restored."
-    grep -Fq '.wp-shell-maintenance' "/etc/nginx/sites-available/$domain" || die "Apply the maintenance-capable Nginx template before restoring."
-    [[ ! -e "/var/www/$domain/.wp-shell-maintenance" ]] || die "Site is already in maintenance mode; resolve that operation first."
-    log_message INFO "Creating a safety backup before restore."
-    backup_site "$index" >/dev/null
-    defaults_file="$(create_mysql_defaults_file "$domain")"
+    restore_maintenance_configuration_ready "$domain" || \
+        die "Apply the managed Nginx maintenance rule before restoring: wp-shell site $domain nginx-apply"
+    [[ ! -e "$marker" && ! -L "$marker" ]] || die "Site is already in maintenance mode; inspect restore status before continuing."
+    [[ ! -e "$wp_path/.maintenance" && ! -L "$wp_path/.maintenance" ]] || die "WordPress is already in maintenance mode; resolve it before restoring."
+    site_wp_config_path_is_safe "$wp_path" || die "Registered WordPress path or wp-config.php is unsafe."
     db_name="$(site_wp_cli "$domain" config get DB_NAME)"
+    current_db_user="$(site_wp_cli "$domain" config get DB_USER)"
+    current_db_password="$(site_wp_cli "$domain" config get DB_PASSWORD)"
+    current_db_host="$(site_wp_cli "$domain" config get DB_HOST)"
+    [[ "$db_name" =~ ^[a-zA-Z0-9_\$-]{1,64}$ ]] || die "Unsafe database name."
+    [[ "$current_db_user" =~ ^[a-zA-Z0-9_\$-]{1,64}$ && "$current_db_user" != root &&
+       "$current_db_host" =~ ^[a-zA-Z0-9_.:-]+$ && "$current_db_password" != *$'\n'* && "$current_db_password" != *$'\r'* ]] || \
+        die "Unsafe current database connection settings."
+    log_message INFO "Validating the requested backup in a disposable database before maintenance."
+    backup_restore_drill "$domain" "$backup_dir" || die "Backup restore drill failed; nothing was changed."
+    operation_dir="$(restore_begin_operation "$domain" "$backup_id" "$wp_path" "$db_name")" || \
+        die "A non-terminal restore journal already exists or its metadata is unsafe. Run: wp-shell restore status $domain"
+    journal="$operation_dir/journal.v1"
 
-    (
-        set -Eeuo pipefail
-        local_stage="$(mktemp -d /tmp/wp-restore.XXXXXX)"
-        # shellcheck disable=SC2317,SC2329
-        cleanup_restore() {
-            rm -rf -- "$local_stage"
-            rm -f "$defaults_file"
-        }
-        trap cleanup_restore EXIT
-        tar -xzf "$backup_dir/files.tar.gz" -C "$local_stage"
-        [[ -f "$local_stage/wp-config.php" ]]
-        install -m 0600 /dev/null "/var/www/$domain/.wp-shell-maintenance"
-        site_wp_cli "$domain" maintenance-mode activate >/dev/null 2>&1 || true
-        local storage_path relative_path
-        local -a restore_excludes=()
-        for storage_path in "$(site_backup_dir "$domain")" "$(site_cache_dir "$domain")" "$(site_wp_cli_home "$domain")" "/var/www/$domain/logs"; do
-            if [[ "$storage_path/" == "$wp_path/"* ]]; then
-                relative_path="${storage_path#"$wp_path/"}"
-                restore_excludes+=("--exclude=/$relative_path/")
+    # Invoked indirectly by EXIT and signal traps.
+    # shellcheck disable=SC2317,SC2329
+    cleanup_restore_operation() {
+        exit_status=$?
+        trap - EXIT HUP INT TERM
+        [[ -z "$defaults_file" ]] || rm -f -- "$defaults_file"
+        if [[ "$completed" == yes ]]; then
+            rm -rf -- "$operation_dir/source-files" "$operation_dir/rollback-files"
+            exit 0
+        fi
+        state="$(restore_journal_last_state "$journal" 2>/dev/null || printf initialized)"
+        if restore_terminal_state "$state"; then
+            rm -rf -- "$operation_dir/source-files" "$operation_dir/rollback-files" || true
+            exit "${exit_status:-0}"
+        fi
+        if [[ "$state" == commit-ready ]]; then
+            log_message ERROR "Restore data was validated, but final maintenance cleanup did not complete. Run: wp-shell restore recover $domain --confirm" >&2
+            exit "${exit_status:-1}"
+        fi
+        if restore_state_requires_rollback "$state"; then
+            safety_id="$(restore_journal_value "$journal" safety-backup 2>/dev/null || true)"
+            restore_journal_state "$journal" rollback-running "Automatic rollback after failure in state $state." || true
+            rm -rf -- "$operation_dir/source-files" "$operation_dir/rollback-files" || true
+            if [[ -n "$safety_id" ]] && restore_from_safety_backup "$index" "$domain" "$wp_path" "$operation_dir" "$safety_id" "$db_name"; then
+                restore_journal_state "$journal" rolled-back "Automatic rollback restored the pre-restore files and database." || true
+                rm -rf -- "$operation_dir/source-files" "$operation_dir/rollback-files"
+                log_message WARNING "Restore failed; the pre-restore files and database were recovered from safety backup $safety_id."
+            else
+                restore_journal_state "$journal" recovery-required "Automatic rollback failed; maintenance remains enabled." || true
+                log_message ERROR "Automatic restore rollback failed. Maintenance remains enabled. Run: wp-shell restore recover $domain --confirm" >&2
             fi
-        done
-        rsync -a --delete "${restore_excludes[@]}" "$local_stage/" "$wp_path/"
-        gzip -dc "$backup_dir/database.sql.gz" | mariadb --defaults-extra-file="$defaults_file" --binary-mode --local-infile=0 "$db_name"
-        set_site_permissions "$domain"
-        [[ "${SITE_MODES[$index]}" != managed ]] || apply_site_redis_connection "$domain"
-        site_wp_cli "$domain" core is-installed
-        site_wp_cli "$domain" maintenance-mode deactivate >/dev/null
-    )
-    clear_site_cache "$index" all
-    rm -f -- "/var/www/$domain/.wp-shell-maintenance"
-    log_message SUCCESS "$domain was restored to $backup_id."
-}
+        else
+            restore_finalize_maintenance "$domain" "$wp_path" || true
+            restore_journal_state "$journal" aborted "Restore stopped before authoritative files or database were changed." || true
+            rm -rf -- "$operation_dir/source-files" "$operation_dir/rollback-files"
+        fi
+        exit "${exit_status:-1}"
+    }
+    trap cleanup_restore_operation EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    defaults_file="$(create_mysql_defaults_file "$domain")" || exit 1
+    restore_stage_source "$backup_dir/files.tar.gz" "$operation_dir" || exit 1
+    restore_journal_state "$journal" source-ready || exit 1
+    run_user="$(site_run_user "$domain")"; run_group="$(id -gn "$run_user")"
+    cron_state_lock="$STATE_DIR/cron-$(site_pool_id "$domain").lock"
+    install -d -o "$run_user" -g "$run_group" -m 0700 "/var/www/$domain/.wp-shell" || exit 1
+    cron_site_lock="/var/www/$domain/.wp-shell/cron.lock"
+    [[ -e "$cron_site_lock" ]] || install -o "$run_user" -g "$run_group" -m 0600 /dev/null "$cron_site_lock"
+    [[ -f "$cron_site_lock" && ! -L "$cron_site_lock" ]] || die "Unsafe site Cron lock."
+    exec 7>"$cron_state_lock"; flock -w 300 7 || die "Timed out waiting for the manual WP-Cron lock."
+    exec 8>"$cron_site_lock"; flock -w 300 8 || die "Timed out waiting for the system WP-Cron lock."
+    install -m 0600 /dev/null "$marker" || exit 1
+    restore_journal_state "$journal" maintenance || exit 1
+    restore_verify_maintenance_barrier "$domain" || {
+        log_message ERROR "The local HTTPS probe did not return 503 through the maintenance marker; restore was stopped before the safety snapshot or data mutation." >&2
+        exit 1
+    }
+    restore_wait_for_php_idle "$domain" || exit 1
+    log_message INFO "Creating a verified local safety backup before restore; remote upload and retention are intentionally skipped."
+    restore_create_safety_backup "$index" "$domain" "$operation_dir/safety.id" || exit 1
+    safety_id="$(<"$operation_dir/safety.id")"
+    [[ "$safety_id" =~ ^20[0-9]{6}-[0-9]{6}$ && "$safety_id" != "$backup_id" ]] || die "Safety backup unexpectedly matches the requested source backup."
+    restore_journal_append "$journal" safety-backup "$safety_id" || exit 1
+    restore_journal_state "$journal" safety-ready || exit 1
+    site_wp_cli "$domain" maintenance-mode activate >/dev/null || exit 1
+    restore_journal_state "$journal" files-applying || exit 1
+    restore_sync_tree "$operation_dir/source-files" "$domain" "$wp_path" || exit 1
+    site_wp_config_path_is_safe "$wp_path" || exit 1
+    restore_reapply_database_config "$domain" "$db_name" "$current_db_user" "$current_db_password" "$current_db_host" || exit 1
+    restore_journal_state "$journal" files-applied || exit 1
+    restore_journal_state "$journal" database-applying || exit 1
+    restore_import_database "$backup_dir/database.sql.gz" "$defaults_file" "$db_name" || exit 1
+    restore_journal_state "$journal" database-applied || exit 1
+    restore_journal_state "$journal" validating || exit 1
+    restore_validate_site "$index" "$domain" "$defaults_file" "$db_name" || exit 1
+    clear_site_cache "$index" all || exit 1
+    restore_journal_state "$journal" commit-ready || exit 1
+    restore_finalize_maintenance "$domain" "$wp_path" || exit 1
+    restore_journal_state "$journal" committed "Restore completed from backup $backup_id; safety backup $safety_id was retained." || exit 1
+    completed=yes
+    log_message SUCCESS "$domain was restored to $backup_id. Safety backup retained: $safety_id"
+)
 
 clear_site_cache() {
     local index="$1" scope="${2:-page}" domain wp_path cache_dir legacy_cache_dir
@@ -4919,7 +5413,7 @@ site_action() {
         cache-clear) clear_site_cache "$index" "${arg1:-page}"; log_message SUCCESS "$domain ${arg1:-page} cache was cleared." ;;
         backup) backup_site "$index" ;;
         backups) list_backups "$index" ;;
-        restore) [[ -n "$arg1" ]] || die "Usage: wp-shell restore $domain BACKUP_ID"; restore_site "$index" "$arg1" ;;
+        restore) [[ -n "$arg1" ]] || die "Usage: wp-shell restore $domain BACKUP_ID --confirm"; restore_site "$index" "$arg1" "$arg2" ;;
         update) [[ "$arg1" == --confirm-updates ]] || die "Impact: update WordPress core, every plugin and every theme after a backup. Re-run with --confirm-updates."; update_site "$index" ;;
         restart)
             php_fpm_service_action restart "${SITE_PHP_VERSIONS[$index]}"
@@ -4937,6 +5431,32 @@ backup_all_sites() {
         fi
     done
     ((failures == 0)) || die "$failures site backup(s) failed."
+}
+
+restore_command() {
+    local action="${1:-}" selector="${2:-}" backup_id="${2:-}" confirmation="${3:-}" domain index
+    case "$action" in
+        status)
+            [[ -n "$selector" ]] || die "Usage: wp-shell restore status DOMAIN|ID"
+            restore_operation_status "$selector"
+            ;;
+        recover)
+            [[ -n "$selector" ]] || die "Usage: wp-shell restore recover DOMAIN|ID --confirm"
+            domain="$(site_domain_from_selector "$selector")" || die "Unknown site ID or domain: $selector"
+            index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
+            restore_recover_site "$index" "$confirmation"
+            ;;
+        '') die "Usage: wp-shell restore DOMAIN|ID BACKUP_ID --confirm" ;;
+        *)
+            selector="$action"
+            backup_id="${2:-}"
+            confirmation="${3:-}"
+            [[ -n "$backup_id" ]] || die "Usage: wp-shell restore DOMAIN|ID BACKUP_ID --confirm"
+            domain="$(site_domain_from_selector "$selector")" || die "Unknown site ID or domain: $selector"
+            index="$(site_index_by_domain "$domain")" || die "Unmanaged site: $domain"
+            restore_site "$index" "$backup_id" "$confirmation"
+            ;;
+    esac
 }
 
 init_metrics_database() {
@@ -7017,7 +7537,9 @@ management_menu() {
             read -r -p "Site ID or domain: " domain
             site_action "$domain" backups
             read -r -p "Backup ID: " backup_id
-            site_action "$domain" restore "$backup_id"
+            printf 'Restore replaces the website files and database. A verified local safety backup will be retained.\n'
+            collect_yes_no "Restore $domain from $backup_id" no || { log_message INFO "No changes were applied."; return; }
+            site_action "$domain" restore "$backup_id" --confirm
             ;;
         9) import_existing_sites; install_self ;;
         10)
@@ -7086,7 +7608,11 @@ Usage:
   sudo wp-shell metrics collect                  Collect one local metrics sample
   sudo wp-shell metrics install                  Install the one-minute collector
   sudo wp-shell backup-all                       Back up all sites
-  sudo wp-shell restore DOMAIN|ID BACKUP_ID      Restore one backup
+  sudo wp-shell restore DOMAIN|ID BACKUP_ID --confirm
+                                                Transactionally restore one backup
+  sudo wp-shell restore status DOMAIN|ID         Show the latest restore journal
+  sudo wp-shell restore recover DOMAIN|ID --confirm
+                                                Recover an interrupted restore
   sudo wp-shell optimize --confirm               Compatibility alias for the audited baseline apply
   sudo wp-shell rotate-redis-secret              Rotate Redis auth and redact matching logs
   sudo wp-shell cloudflare enable --confirm      Trust verified official Cloudflare proxy ranges
@@ -7215,7 +7741,7 @@ execute_command() {
         import) import_existing_sites; install_self ;;
         backup-all) backup_all_sites ;;
         backup) shift; backup_command "$@" ;;
-        restore) [[ -n "${2:-}" && -n "${3:-}" ]] || die "Usage: restore DOMAIN|ID BACKUP_ID"; site_action "$2" restore "$3" ;;
+        restore) shift; restore_command "$@" ;;
         optimize) [[ "${2:-}" == --confirm ]] || die "'optimize' now applies the audited baseline. Review 'wp-shell dry-run apply', then use 'wp-shell optimize --confirm'."; apply_control_plane --confirm ;;
         rotate-redis-secret) rotate_redis_secret ;;
         cloudflare) shift; cloudflare_command "$@" ;;
@@ -7258,6 +7784,27 @@ main() {
             if [[ "${2:-audit}" == audit ]]; then
                 # MariaDB audit is contractually read-only and must not create
                 # wp-shell state or migrate unrelated legacy configuration.
+                load_sites_config
+                load_environment_config
+                load_tuning_config
+                load_opcache_config
+                execute_command "$@"
+            else
+                init_runtime
+                TRANSACTION_CONTEXT=yes
+                migrate_legacy_configs
+                load_sites_config
+                ensure_environment_config
+                load_tuning_config
+                load_opcache_config
+                execute_command "$@"
+                transaction_commit
+            fi
+            ;;
+        restore)
+            if [[ "${2:-}" == status ]]; then
+                # Restore status is journal inspection only. Do not migrate
+                # configuration or synthesize state while diagnosing a crash.
                 load_sites_config
                 load_environment_config
                 load_tuning_config

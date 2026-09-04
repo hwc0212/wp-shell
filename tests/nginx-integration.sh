@@ -175,6 +175,8 @@ printf '# operator customization\n' > /etc/nginx/wp-shell-custom/example.com/90-
 configure_https_site 1
 grep -q 'operator customization' /etc/nginx/wp-shell-custom/example.com/90-local.conf
 touch /var/www/example.com/.wp-shell-maintenance
+restore_maintenance_configuration_ready example.com
+restore_verify_maintenance_barrier example.com
 request_headers / | grep -q '503'
 rm -f /var/www/example.com/.wp-shell-maintenance
 site_login_limit example.com direct
