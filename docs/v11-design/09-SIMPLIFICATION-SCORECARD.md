@@ -28,6 +28,12 @@ The scorecard separates source size from operational complexity. The latter—pe
 | PHP packages per version | 12 | About 12 | Site functionality, not a simplification target |
 | Hidden automatic mutation loops | Metrics, tuning, cache operations, remote upload and optional site/host schedules | None mandatory; only explicit/optional schedules | Operator-visible ownership |
 
+## S1 measured checkpoint
+
+The S1 review branch measures 6,588 lines, 308,823 bytes and 311 Shell functions in `wp-shell-v11.sh`, versus 7,326 lines, 349,060 bytes and 322 functions at v11 base `40844a7e46006057721686d329acd53388f2e619`. Runtime source fell by 738 lines (10.1%) and 40,237 bytes (11.5%). Function counts include both brace-bodied functions and subshell-bodied transaction helpers. More importantly, clean v11 ownership fell from six SQLite tables, two generated metrics producer units and one embedded curses application to zero. No replacement daemon, persistent history store or runtime dependency was added. Full details are in `10-S1-MANUAL-CAPACITY-IMPLEMENTATION.md`.
+
+The function-count reduction is intentionally small because fail-closed current capacity, manual transaction and explicit migration boundaries replace one large automated cluster. This does not meet the final post-S1-S5 size target by itself and must not be presented as if later stages were complete.
+
 ## Runtime reduction estimate by responsibility
 
 These ranges overlap at shared helpers and should not be added as exact deletion promises. They are an order-of-magnitude planning check.

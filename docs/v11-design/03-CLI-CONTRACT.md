@@ -1,4 +1,4 @@
-# 03 - Proposed v11 CLI Contract
+# 03 - v11 CLI Contract
 
 ## Goals
 
@@ -14,7 +14,7 @@ The v11 CLI should be predictable enough for both an SSH operator and automation
 
 ## Global behavior
 
-During development these contracts are exercised through `./wp-shell-v11.sh`; they do not change the stable root `wp-shell.sh` or public `/usr/local/sbin/wp-shell`. Mutating development execution requires an explicit experimental opt-in and is limited to disposable/test systems. The production command spelling below describes the eventual v11 interface, not current GA routing.
+During development these contracts are exercised through `./wp-shell-v11.sh`; they do not change the stable root `wp-shell.sh` or public `/usr/local/sbin/wp-shell`. Mutating development execution requires an explicit experimental opt-in and is limited to disposable/test systems. S1 implements `capacity`, manual per-site workers, and the narrow v10 metrics-producer migration; later-stage command descriptions remain design contracts rather than current GA routing.
 
 ### Read-only commands
 
@@ -313,7 +313,7 @@ With confirmation:
 
 There is no automatic recommendation, WooCommerce weighting, silent clamping, or redistribution of other sites.
 
-If a legacy host is already overcommitted across multiple sites, a single-site command may be unable to produce a safe final aggregate. S1 must decide between an explicit atomic multi-site form or a confirmed `apply` plan that sets all unpinned sites to one; it must not allow a sequence of successful-but-still-unsafe pool writes.
+If a legacy host is already overcommitted across multiple sites, a single-site change succeeds only when that one transaction produces a safe final aggregate. S1 does not add an atomic multi-site setter and does not permit a sequence of successful-but-still-unsafe writes. The operator must first reduce the requested scope outside wp-shell under an independently reviewed recovery plan, reduce site count, move sites, or add physical RAM.
 
 ### Core verify and repair
 
