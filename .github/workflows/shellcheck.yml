@@ -18,6 +18,7 @@ jobs:
         run: |
           sudo apt-get update >/dev/null
           sudo apt-get install -y sqlite3 jq >/dev/null
+          bash tests/v11-bootstrap.sh
           bash tests/static-checks.sh
           bash tests/config-roundtrip.sh
           bash tests/render-nginx.sh
@@ -42,9 +43,11 @@ jobs:
           koalaman/shellcheck:stable
           -x
           /mnt/wp-shell.sh
+          /mnt/wp-shell-v11.sh
           /mnt/wp-vps-manager.sh
           /mnt/deploy-single-wordpress.sh
           /mnt/tests/static-checks.sh
+          /mnt/tests/v11-bootstrap.sh
           /mnt/tests/config-roundtrip.sh
           /mnt/tests/render-nginx.sh
           /mnt/tests/storage-layout.sh
