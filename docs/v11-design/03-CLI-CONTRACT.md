@@ -14,6 +14,8 @@ The v11 CLI should be predictable enough for both an SSH operator and automation
 
 ## Global behavior
 
+During development these contracts are exercised through `./wp-shell-v11.sh`; they do not change the stable root `wp-shell.sh` or public `/usr/local/sbin/wp-shell`. Mutating development execution requires an explicit experimental opt-in and is limited to disposable/test systems. The production command spelling below describes the eventual v11 interface, not current GA routing.
+
 ### Read-only commands
 
 The following must not call `init_paths()`, `migrate_legacy_configs()`, `install_self()`, package management, service reload/restart, or a mutating WP-CLI wrapper:
@@ -159,6 +161,7 @@ wp-shell apply --confirm
 Confirmed apply owns only:
 
 - Core Nginx global/default-host/site transport/security template;
+- optional FastCGI Page Cache Lite state and Nginx template for explicitly enabled sites;
 - Core PHP INI, default pool, per-site pool, and effective semantic validation;
 - conservative MariaDB baseline and legacy admission;
 - shared loopback Redis baseline without plugin activation;
@@ -167,7 +170,7 @@ Confirmed apply owns only:
 - Certbot Nginx deploy hook;
 - explicit production WordPress constants and secure permissions for managed sites.
 
-It does not own old page cache, private Redis, remote backup, staging, HSTS/header policy, application updates, SSH, UFW, AIDE, mail, or unattended-upgrades unless an explicit separate Core command is invoked.
+It does not own legacy automatic cache invalidation/custom plugin exclusions, private Redis, remote backup, staging, HSTS/header policy, application updates, SSH, UFW, AIDE, mail, or unattended-upgrades unless an explicit separate Core command is invoked.
 
 Apply sequence remains:
 
@@ -208,13 +211,13 @@ Without confirmation, report only:
 - deprecated units active;
 - metrics database/cursors;
 - automatic tuning state;
-- page/object cache policies;
+- Page Cache Lite state, legacy automatic invalidation, custom cache exclusions and object-cache policies;
 - private Redis instances;
 - remote backup policies and timer;
 - staging/custom Nginx state;
 - exact actions that require confirmation or manual replacement.
 
-Confirmed migration performs only approved, reversible ownership changes. It does not delete historical data, unit files, Nginx custom configuration, remote data, Redis instances, or administrator files. Features with unresolved external replacement, especially remote backups and active page caching, remain blockers rather than being silently stopped.
+Confirmed migration performs only approved, reversible ownership changes. It does not delete historical data, unit files, Nginx custom configuration, remote data, Redis instances, or administrator files. Compatible generic page-cache state is adopted by Page Cache Lite; custom/plugin-specific rules remain preserved compatibility state. Remote backups and other unresolved external ownership remain blockers rather than being silently stopped.
 
 ## Site commands
 
@@ -234,7 +237,7 @@ List fields:
 - PHP version;
 - per-site runtime identity;
 - effective `pm.max_children` or `UNKNOWN`;
-- compatibility flags such as legacy page cache/private Redis/staging/remote backup.
+- Page Cache Lite mode/profile and compatibility flags such as legacy cache-auto/private Redis/staging/remote backup.
 
 Status is current-state only. Verbose output may add TLS, core checksum, permissions, Nginx route, Cron, and backup age calculated from the filesystem. It does not query historical SQLite data.
 
@@ -251,7 +254,7 @@ Interactive inputs remain limited to infrastructure/lifecycle facts:
 - PHP version when different from the environment default;
 - optional WooCommerce installation only when explicitly requested.
 
-Do not ask about page cache, object-cache plugin, CDN, staging, HSTS, or theme/plugin behavior.
+Do not ask about page cache, object-cache plugin, CDN, staging, HSTS, or theme/plugin behavior during site creation. Page Cache Lite remains a separate explicit post-deployment action and defaults off.
 
 The new site is first built in memory with one ondemand worker. Global capacity admission runs before `sites.v3`, database credentials, site policy, user, package, service, Nginx, certificate, or WordPress writes.
 
@@ -334,6 +337,37 @@ wp-shell site DOMAIN maintenance on|off|status
 ```
 
 These commands must remain opt-in, narrowly scoped, validated, and idempotent. `maintenance off` refuses without confirmation when a restore-failure receipt exists.
+
+### FastCGI transport and Page Cache Lite
+
+FastCGI transport is mandatory Core infrastructure, independent of page caching. Every managed site retains:
+
+- a per-site Unix-socket `fastcgi_pass` target;
+- required FastCGI parameters and `try_files $uri =404;` before PHP execution;
+- conservative timeout/buffer settings needed for normal WordPress administration, uploads and updates;
+- syntax validation plus effective PHP-FPM/socket verification before a successful apply.
+
+Page Cache Lite is optional and defaults off:
+
+```text
+wp-shell site DOMAIN page-cache enable --confirm
+wp-shell site DOMAIN page-cache disable --confirm
+wp-shell site DOMAIN page-cache status
+wp-shell site DOMAIN page-cache clear --confirm
+```
+
+The renderer owns one small, deterministic policy:
+
+1. Cache only anonymous `GET`/`HEAD` responses with no authorization and no query string.
+2. Always bypass WordPress administration/login/Cron/REST/XML-RPC/feed/sitemap/preview paths and WordPress login, password and commenter cookies.
+3. When the site's authoritative registry property says WooCommerce is enabled, also bypass cart, checkout, account and WooCommerce API/session/cart cookies.
+4. Do not infer WooCommerce from plugins, files, routes or cookies during rendering.
+5. Do not include Pretty Links, RFQ, form, membership, theme, SEO or other plugin-specific routes/cookies in the generic policy.
+6. Do not install an MU plugin, run an invalidation timer, collect cache history, tune TTLs or coordinate Cloudflare/APO.
+
+Manual clear touches only the selected site's validated wp-shell-owned FastCGI cache directory. It must not flush Redis, reload all OPcache, purge Cloudflare, follow a symlink, or delete an administrator cache root. Because automatic content invalidation is removed, enablement output must state that publishers/operators are responsible for manual clear or their independently owned application/CDN invalidation.
+
+Existing custom Nginx exclusions are preserved outside Lite ownership. If effective legacy cache behavior cannot be represented without changing public responses, normal apply preserves it or fails closed until the operator migrates it; it never silently drops the rule.
 
 ## Backup commands
 

@@ -35,10 +35,11 @@ Classification is about product ownership, not immediate deletion. Any row with 
 | Redis Object Cache plugin automation | EXTERNALIZE | Plugin install/drop-in/config semantics belong to the plugin/operator. | Preserve existing enabled sites and constants; no automatic disable. |
 | Private per-site Redis | DEPRECATE then EXTERNALIZE | Per-site services, secrets, sockets and budgets create a mini service orchestrator. | Keep existing services untouched until explicit site migration is reviewed. |
 | Redis secret rotation | KEEP temporarily | Still needed to recover safely from a leaked shared v10 credential. | Continue redacted, rollback-capable rotation while v10 shared-auth deployments exist. |
-| FastCGI transport | KEEP | Required PHP request path; not page caching. | Preserve `try_files` and socket routing. |
-| FastCGI full-page cache | DEPRECATE then EXTERNALIZE | Application routes/cookies/invalidation cannot be generic across plugins. | Preserve active v10 rendering in a compatibility path until explicitly migrated. |
+| FastCGI transport | KEEP | Required PHP request path. Retain per-site Unix-socket `fastcgi_pass`, required parameters, compatible timeouts/buffers, and effective FPM/FastCGI validation. | Preserve `try_files`, socket routing and validated transport semantics. |
+| FastCGI Page Cache Lite | KEEP optional | Default off; explicit per-site on/off/manual clear; one conservative WordPress bypass set plus WooCommerce rules only for sites explicitly marked WooCommerce. No plugin discovery or cache tuning. | Reuse compatible v10 `page-cache` state; preserve custom exclusions outside Lite ownership. |
 | Cache invalidation MU plugin/timer | REMOVE | Application event intelligence and hidden background work. | Explicit migration disables timer/plugin only with confirmation; keep files/data otherwise. |
-| Manual cache exclusion/clear orchestration | EXTERNALIZE | Only meaningful when wp-shell owns page/application cache. | Preserve existing custom Nginx includes; warn. |
+| Manual page-cache clear | KEEP | A Lite cache without automatic invalidation needs an explicit bounded clear operation. | Clear only the selected site's owned FastCGI cache root after path validation. |
+| Arbitrary cache exclusions and object/OPcache clear orchestration | EXTERNALIZE | Plugin routes and non-page caches have different owners and safety semantics. | Preserve existing custom Nginx includes; warn and do not delete. |
 | Cloudflare real-IP trust | KEEP optional | Correct client IP is required for logs and rate limits behind the proxy. | Current implementation already avoids DNS/API/APO/cache control. |
 | Cloudflare CIDR updater | KEEP optional | Stale trust ranges create correctness/security risk; oneshot timer is justified only when enabled. | Preserve opt-in state; no API token. |
 | Cloudflare API/DNS/APO/purge | REMOVE/N/A | Not implemented in 10.0.4 and must not be added. | None. |
@@ -134,13 +135,14 @@ Classification is about product ownership, not immediate deletion. Any row with 
 | `site DOMAIN cron enable` | KEEP | Optional simple system WP-Cron. |
 | `site DOMAIN cron disable` | KEEP | Restore recorded prior value and remove only owned Cron file. |
 | `site DOMAIN cron status` | KEEP | Current config/schedule state; no queue execution. |
-| `site DOMAIN page-cache enable` | DEPRECATE/EXTERNALIZE | No new enablement after v11; preserve active v10 behavior. |
-| `site DOMAIN page-cache disable` | DEPRECATE | Explicit migration/disable remains while compatibility renderer exists. |
-| `site DOMAIN page-cache status` | DEPRECATE | Included as legacy flag in site status. |
+| `site DOMAIN page-cache enable` | KEEP | Enable Page Cache Lite only with `--confirm`; use generic WordPress bypass and explicit WooCommerce extension. |
+| `site DOMAIN page-cache disable` | KEEP | Disable the selected site's Lite cache transactionally; keep static browser caching. |
+| `site DOMAIN page-cache status` | KEEP | Report effective Nginx cache state and whether generic/WooCommerce bypass profile applies. |
 | `site DOMAIN object-cache enable` | EXTERNALIZE | Plugin/operator documentation owns integration. |
 | `site DOMAIN object-cache disable` | DEPRECATE | Retain only as safe compatibility escape hatch; do not remove plugin/config automatically. |
 | `site DOMAIN object-cache status` | MERGE | Report observed state in site status; do not mutate. |
-| `site DOMAIN cache-clear [scope]` | EXTERNALIZE | Removed after wp-shell stops owning page/plugin cache semantics. |
+| `site DOMAIN cache-clear page` | KEEP/MERGE | Canonical replacement becomes `site DOMAIN page-cache clear`; only the owned site cache root is touched. |
+| `site DOMAIN cache-clear object|opcache|all` | DEPRECATE/EXTERNALIZE | Object cache and OPcache have different owners; old forms warn and do not become Page Cache Lite behavior. |
 | `site DOMAIN cache-auto enable` | REMOVE | No new MU plugin/timer. |
 | `site DOMAIN cache-auto disable` | DEPRECATE | Explicitly remove only the owned MU plugin/marker after confirmation. |
 | `site DOMAIN cache-auto status` | MERGE | Legacy state warning in site status. |

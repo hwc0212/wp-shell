@@ -22,9 +22,25 @@ Baseline validation completed before creating these documents:
 - The exact baseline commit has successful GitHub checks for the main test job and MariaDB legacy integration on Ubuntu 22.04 and 24.04.
 - The working tree remained clean throughout baseline inspection.
 
+## Stable and development line policy
+
+The reviewed `10.0.4` release is the frozen stable/LTS baseline. During v11 development:
+
+```text
+main                         stable v10 line; wp-shell.sh remains the public entry point
+v10-maintenance              critical v10 fixes only
+legacy/wp-shell-v10.0.4.sh   immutable snapshot matching tag v10.0.4
+v11                          simplified development branch
+wp-shell-v11.sh              experimental v11 artifact, not production GA
+```
+
+v11 is derived from the proven v10 source rather than rewritten. It is invoked as `./wp-shell-v11.sh` on disposable/test systems and, if explicitly installed for development, uses `/usr/local/sbin/wp-shell-v11`. It must not replace `/usr/local/sbin/wp-shell`, redirect the root script, change existing raw-main URLs, or publish a v11 Release before GA.
+
+The two versions do not create parallel configuration control planes by default. `/etc/wp-shell`, `/var/lib/wp-shell`, systemd units, Nginx/PHP/MariaDB/Redis files and site backup roots can still collide if the experimental script is deliberately run mutating commands on a v10 host. The bootstrap therefore requires an explicit development mutation opt-in and prominently limits use to disposable/test systems; a later migration design must own production transition.
+
 ## Decision
 
-v11 should remain a single-executable WordPress VPS installer and basic operations tool. It should not continue growing as a local monitoring platform, automatic performance optimizer, application-cache controller, staging manager, remote-backup platform, or generic Linux control panel.
+v11 should remain a single-executable WordPress VPS installer and basic operations tool. It should not continue growing as a local monitoring platform, automatic performance optimizer, plugin-aware cache orchestrator, staging manager, remote-backup platform, or generic Linux control panel.
 
 The simplification should remove responsibilities before considering source modularization. Moving unchanged functions into more files would add a build and distribution problem without reducing operational complexity.
 
@@ -43,6 +59,7 @@ The proposed Core contains:
 - Read-only effective MariaDB auditing and explicit legacy migration.
 - Local backup, checksum verification, deep disposable-database verification, backup-all, and a conservative restore contract.
 - Optional system WP-Cron if it remains a small, non-duplicating Cron entry.
+- Optional per-site FastCGI Page Cache Lite, default off, with explicit enable/disable/manual clear, one generic WordPress bypass set, and a WooCommerce bypass extension only when WooCommerce is an explicit site property.
 - Optional Cloudflare real-IP trust only: verified official CIDRs, trusted-header correctness, and no Cloudflare API or cache policy.
 - Minimal, compatibility-first security controls that do not assume a theme, plugin, CDN, or WooCommerce installation.
 
@@ -53,7 +70,7 @@ The proposed Core contains:
 3. Automatic PHP tuning, historical recommendation files, sample gates, and automatic expansion logic.
 4. OPcache tuning UI and mutation workflow; capacity retains only effective OPcache accounting and a conservative install baseline.
 5. Per-site private Redis services, sockets, credentials, migration workflow, and private Redis metrics.
-6. FastCGI full-page-cache policy, automatic invalidation MU plugin, cache event timer, and route-exclusion intelligence.
+6. FastCGI cache orchestration: automatic invalidation MU plugin, cache event timer, arbitrary route-exclusion CLI, plugin/theme intelligence, historical cache metrics, and automatic cache tuning. The small Page Cache Lite capability remains Core.
 7. Staging orchestration and Action Scheduler-specific inspection.
 8. Remote encrypted backup orchestration; standard external tools should own off-host retention.
 9. WordPress core/plugin/theme bulk-update orchestration.
@@ -109,20 +126,20 @@ This is intentionally not Shell-level ACID across the filesystem and MariaDB. It
 - Treat 10.0.4 as the frozen/LTS behavioral reference.
 - Require a read-only v10 preflight before v11 makes managed changes.
 - Never delete optional v10 files, units, databases, policies, private Redis instances, remote backup settings, or custom Nginx includes automatically.
-- Preserve current site routing and cache behavior during the transition, even for features no longer offered to new v11 sites.
+- Preserve current site routing and cache behavior during the transition. Existing generic v10 page-cache state can be adopted by Page Cache Lite; custom/plugin-specific exclusions remain administrator-owned and are never discarded.
 - Disable a retired background task only in an explicit confirmed migration, and leave its unit/config/data for manual retention or later removal.
 - Block upgrade completion when removing behavior would silently stop off-host backups or alter public page-cache semantics.
 - Keep both compatibility wrappers for v11, emit deprecation warnings, and remove them no earlier than v12.
 
 ## Estimated outcome
 
-After S1-S5, the realistic target is approximately 4,000-4,600 lines and 190-230KB for the main runtime: about 37-45% fewer runtime lines/bytes. This is an estimate, not a line-count target. The more important reductions are:
+After S1-S5, the realistic target is approximately 4,200-4,800 lines and 205-245KB for the main runtime: about 34-42% fewer runtime lines and roughly 30-41% fewer bytes. Retaining Page Cache Lite deliberately raises the target from the earlier estimate. This is not a line-count quota. The more important reductions are:
 
 - mandatory wp-shell background units: from six installed during normal use (backup, metrics, and their services/timers) plus optional units, to zero mandatory units; at most the optional Cloudflare real-IP updater remains two units;
 - historical SQLite tables: six to zero;
 - normal operator command forms: from 60 documented forms to roughly 18 Core forms plus a small compatibility/advanced surface;
 - mutable derived state: metrics DB/cursors/recommendations removed;
-- hidden automation: automatic tuning, cache event processing, remote upload, staging mutation, and bulk WordPress updates removed.
+- hidden automation: automatic tuning, cache event processing, remote upload, staging mutation, and bulk WordPress updates removed. Page Cache Lite has no background invalidation process.
 
 ## Recommended S1
 

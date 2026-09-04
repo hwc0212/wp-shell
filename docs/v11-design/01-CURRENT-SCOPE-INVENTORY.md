@@ -300,4 +300,4 @@ Recommendation: C. It meaningfully improves 10.0.4 recoverability while avoiding
 
 ## Current scope conclusion
 
-The project is not complex merely because it is one file. Complexity comes from multiple mutable policy domains sharing the same site arrays, transaction helper, Nginx renderer, WP-CLI wrapper, systemd surface, and menu/router. Removing historical monitoring, automatic decisions, application-cache semantics, private services, and general host administration will reduce failure modes more than a source split would.
+The project is not complex merely because it is one file. Complexity comes from multiple mutable policy domains sharing the same site arrays, transaction helper, Nginx renderer, WP-CLI wrapper, systemd surface, and menu/router. Removing historical monitoring, automatic decisions, plugin-aware cache orchestration, private services, and general host administration will reduce failure modes more than a source split would. FastCGI transport and a default-off Page Cache Lite remain compatible with that smaller boundary.

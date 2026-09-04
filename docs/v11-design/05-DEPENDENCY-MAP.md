@@ -34,19 +34,21 @@ flowchart TD
     SITE --> WP[WordPress lifecycle and permissions]
     SITE --> BACKUP[Backup and restore]
     SITE --> CRON[WP-Cron units or Cron]
-    SITE --> CACHE[FastCGI cache policy and invalidation]
+    SITE --> CACHE[Optional FastCGI Page Cache Lite]
+    SITE --> CACHEAUTO[Legacy automatic cache invalidation]
     SITE --> STAGING[Staging orchestration]
 
     METRIC_TIMER[Metrics service and timer] --> METRICS
     METRICS --> DASH[Terminal dashboard and reports]
     METRICS --> TUNER
-    OPS_TIMER[Operations service and timer] --> CACHE
+    OPS_TIMER[Operations service and timer] --> CACHEAUTO
     BACKUP_TIMER[Backup service and timer] --> BACKUP
     BACKUP --> REMOTE[Encrypted remote upload]
 
     CF[Cloudflare CIDR updater] --> REALIP[Nginx real-IP include]
     REALIP --> NGINX
     CACHE --> NGINX
+    CACHEAUTO --> CACHE
     REDIS --> WP
     STAGING --> WP
     WP --> CRON
@@ -144,7 +146,8 @@ Remote transfer is not part of the integrity chain. It is a separate retention t
 | Automatic tuner | SQLite history, recommendations, `tuning.v1`, current pools | Pool edits, recommendation files | Shares the hard admission path; deletion must not delete admission or manual desired state | Remove automation; keep manual worker state and admission |
 | Advanced OPcache management | PHP INI, FPM status/CGI probes, metrics | Generated override, status and tuning commands | Capacity needs effective per-version reserve, not a mutation UI | Remove UI/mutation; retain conservative baseline and read-only accounting |
 | Private Redis | site policy, credentials, sockets, systemd template instances | Per-site configs, secrets, services and metrics | WordPress object-cache state and existing plugin config can depend on it | No new instances; preserve existing state until explicit external migration |
-| FastCGI page cache | route/cookie policy, Nginx template, MU plugin | cache directories, invalidation events, operations timer | Public response semantics may depend on it | No new orchestration; compatibility renderer/read-only detection during v11 |
+| FastCGI Page Cache Lite | explicit per-site state, WordPress/WooCommerce property, Nginx template | per-site cache directory and deterministic bypass rules | FastCGI transport and optional simple page caching remain useful Core behavior | Keep default-off on/off/status/manual-clear; no plugin discovery, MU plugin, timer, metrics or tuning |
+| Legacy cache orchestration | MU plugin, arbitrary exclusions and plugin-aware route/cookie policy | invalidation events and operations timer | Existing public behavior/custom rules must not disappear during upgrade | Remove producer only through explicit migration; preserve administrator rules |
 | Cloudflare | official CIDRs and optional updater | trusted real-IP include and two units | Login limits/logs need the real visitor IP | Keep only verified real-IP trust; no API/DNS/APO/cache ownership |
 | Remote backup | local verified backup, encryption policy, rclone | encrypted remote objects, timer/log state | It may be the operator's only off-host recovery copy | Externalize only after explicit replacement/acknowledgement |
 | Staging | production site state, path/database transformations | cloned files/database/Nginx/site policy | Plugin behavior, mail and Cron assumptions are application-specific | Remove/externalize; preserve detected existing routes |
@@ -195,7 +198,7 @@ No new daemon, database, language, package repository, or public port is justifi
 1. **Historical metrics -> dashboard -> analyzer -> tuner.** One-minute collection, six tables, cursors, retention, Python UI, resource analysis and mutation recommendations form a second product inside the installer. The PHP estimator dependency is the only safety edge that must be replaced before deletion.
 2. **Site policy as a feature switchboard.** One per-site policy currently controls caching, Redis, staging, security headers, Cron, TLS and more. Rendering or repairing a site can therefore mutate unrelated behavior. v11 should narrow policy ownership while retaining unknown keys during migration.
 3. **Backup/restore plus remote transport.** Local integrity, retention, encryption, rclone, timers and restore are interwoven. Core should own a verified local artifact and conservative recovery, while transport becomes an explicit external responsibility.
-4. **Private Redis and FastCGI cache orchestration.** These create credentials, services, sockets, WordPress drop-ins, Nginx behavior, event queues and timers. They are optional application acceleration features with a disproportionate rollback surface.
+4. **Private Redis and FastCGI cache orchestration.** Credentials, services, sockets, WordPress drop-ins, arbitrary exclusions, event queues and timers create the disproportionate cost. Page Cache Lite retains only deterministic Nginx state and an explicit manual clear.
 5. **Broad host/application operations.** SSH/UFW, AIDE, mail, unattended upgrades, WordPress bulk upgrades, Action Scheduler and staging make `apply`, status and the menu ambiguous. Only small platform invariants remain Core; application/plugin policy stays with the site owner.
 
 ## Safe edge-cutting order
@@ -203,8 +206,8 @@ No new daemon, database, language, package repository, or public port is justifi
 1. Replace historical PSS consumption with conservative current-state capacity evidence.
 2. Stop producing metrics/recommendations through an explicit, reversible migration; retain data.
 3. Delete dashboard/analyzer/tuner code and their packages after no Core call edge remains.
-4. Add compatibility discovery for page cache, private Redis, remote backup and staging before disabling any producer.
-5. Remove new-configuration paths for those optional clusters while preserving existing rendering and status warnings.
+4. Add compatibility discovery for cache-auto/custom cache rules, private Redis, remote backup and staging before disabling any producer.
+5. Replace new cache orchestration with default-off Page Cache Lite while preserving effective legacy/custom behavior; remove new-configuration paths for the other optional clusters.
 6. Migrate or externalize each installed optional feature independently; only then delete its compatibility renderer/handler.
 7. Implement conservative restore as its own later change, independent of the feature-removal work.
 

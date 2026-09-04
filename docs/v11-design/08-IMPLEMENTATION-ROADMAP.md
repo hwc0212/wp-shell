@@ -11,6 +11,18 @@
 - A roadmap stage may stop at a compatibility shim when safe ownership migration is not yet proven.
 - `10.0.4` remains the rollback/reference release; S0 makes no version change.
 
+## Branch and script policy during development
+
+```text
+main                         stable v10 line; root wp-shell.sh remains the default
+v10-maintenance              critical security/data-integrity/compatibility fixes only
+v11                          simplified development base
+legacy/wp-shell-v10.0.4.sh   immutable byte-for-byte v10.0.4 snapshot
+wp-shell-v11.sh              experimental v11 implementation, not production GA
+```
+
+S1-S6 feature branches target `v11`, never `main`. Until v11 GA, the root `wp-shell.sh` and existing raw-main download URL remain v10. A development installation may use `/usr/local/sbin/wp-shell-v11`, but normal v11 testing must not replace `/usr/local/sbin/wp-shell`. The development script shares existing production namespaces only on deliberately selected disposable/test systems; it does not create a second control plane merely for namespace symmetry.
+
 ## S0 - Design and frozen baseline
 
 Status: this documentation-only proposal.
@@ -100,14 +112,16 @@ S2 is a sequence of small PRs, not one broad deletion.
 - provide a separate externalization runbook; no shared-Redis fallback;
 - delete runtime creation/migration code only after compatibility fixtures prove existing site apply/status is safe.
 
-### S2c - FastCGI full-page cache and cache operations
+### S2c - FastCGI Page Cache Lite and cache orchestration removal
 
-- stop enabling full-page cache for new v11 sites;
-- preserve existing Nginx semantics during the compatibility window;
-- report rather than modify existing cache policy/invalidation state;
-- migrate/disable the operations timer explicitly;
+- retain Nginx-to-PHP-FPM FastCGI transport, per-site Unix sockets, required parameters, timeout/buffer compatibility and effective validation;
+- retain default-off Page Cache Lite with explicit per-site enable/disable/status/manual clear;
+- render one conservative generic WordPress bypass set and an additional WooCommerce set only when WooCommerce is an explicit site property;
+- remove plugin auto-discovery, Pretty Links/RFQ/theme-specific logic, arbitrary exclusion CLI, automatic Cloudflare/APO coordination, historical cache metrics and automatic tuning;
+- migrate/disable the automatic invalidation MU plugin/operations timer explicitly while preserving files and custom Nginx state;
+- preserve effective legacy public behavior or block the affected apply;
 - never delete cache data or MU plugins automatically;
-- retain static-resource cache headers independent of full-page caching.
+- retain static-resource browser cache headers independently.
 
 ### S2d - Remote backup transport
 
@@ -218,7 +232,7 @@ S6 begins only after measured S1-S5 complexity reduction.
 
 Questions:
 
-- Is the remaining approximately 4,000-4,600-line single file reviewable with current section boundaries?
+- Is the remaining approximately 4,200-4,800-line single file reviewable with current section boundaries?
 - Are repeated render/validate/transaction patterns already centralized enough?
 - Would a build step or multiple mandatory runtime files increase upgrade/rollback risk more than it helps maintenance?
 - Can static generated artifacts reduce duplication without changing single-file distribution?
@@ -231,7 +245,7 @@ Default answer: retain one distributed file. Refactor only duplicated, high-risk
 10.0.4 frozen reference
   -> S0 reviewed design
   -> S1 monitoring/tuner removal + capacity replacement
-  -> S2a..S2f independent optional-feature migrations
+  -> S2a..S2f independent optional-feature simplification/migrations, including Page Cache Lite
   -> S3 CLI/state consolidation
   -> S4 conservative restore
   -> S5 user documentation

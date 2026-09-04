@@ -10,9 +10,9 @@ The scorecard separates source size from operational complexity. The latter—pe
 
 | Measure | v10.0.4 measured | Post-S1-S5 target | Intended change |
 |---|---:|---:|---|
-| Main runtime lines | 7,303 | 4,000-4,600 | Down about 37-45% |
-| Main runtime bytes | 347,861 | 190-230KB | Down about 34-45% |
-| Main runtime functions | 320 | 180-220 | Fewer responsibility boundaries and feature handlers |
+| Main runtime lines | 7,303 | 4,200-4,800 | Down about 34-42% |
+| Main runtime bytes | 347,861 | 205-245KB | Down about 30-41% |
+| Main runtime functions | 320 | 190-230 | Fewer responsibility boundaries and feature handlers |
 | Compatibility wrapper lines | 34 | Approximately current for v11 | Preserve; warn, do not rewrite |
 | Documented public command forms | 60 | About 18 common Core forms plus 10-15 advanced/compatibility forms | Smaller normal operator surface |
 | Shell test files | 21 | Approximately 18-22 | Do not optimize test count; strong Core/migration tests replace feature tests |
@@ -24,7 +24,7 @@ The scorecard separates source size from operational complexity. The latter—pe
 | Other fixed generated service/timer files | 4 files | 0-2 optional Cloudflare updater files | Cache operations removed; real-IP updater remains optional |
 | Per-private-Redis units | 1 service per instance | 0 new; compatibility-only existing | No new private Redis orchestration |
 | Runtime implementation languages | Bash + embedded Python | Bash + small embedded Python validation | Remove curses application, retain justified safe parsers |
-| Base apt packages installed | 19 | About 17; optional features on demand | Likely remove SQLite/FastCGI-only dependency after evidence; do not churn packages for the metric |
+| Base apt packages installed | 19 | About 17; optional features on demand | Likely remove SQLite and an unneeded FastCGI diagnostic client after evidence; FastCGI transport itself remains Core |
 | PHP packages per version | 12 | About 12 | Site functionality, not a simplification target |
 | Hidden automatic mutation loops | Metrics, tuning, cache operations, remote upload and optional site/host schedules | None mandatory; only explicit/optional schedules | Operator-visible ownership |
 
@@ -37,13 +37,13 @@ These ranges overlap at shared helpers and should not be added as exact deletion
 | SQLite metrics, cursor/retention, analyzer, dashboard, automatic tuner | 1,050-1,250 lines | 100-180 lines for current capacity/status and v10 migration shims | Largest S1 reduction |
 | Advanced OPcache mutation/UI | 250-350 lines | 80-140 lines for conservative baseline/effective accounting | Keep capacity evidence only |
 | Private Redis and object-cache orchestration | 300-450 lines | 120-220 lines for existing-state detection/preservation | No new instances; long compatibility tail |
-| FastCGI page cache, invalidation MU plugin and operations queue/timer | 400-600 lines | 150-280 lines for existing public-behavior preservation | Remove only after explicit per-site migration |
+| FastCGI cache orchestration around Page Cache Lite | 250-400 lines | 180-300 lines for transport, Lite renderer/on/off/status/manual clear and legacy/custom preservation | Remove automation/plugin intelligence, not FastCGI or optional full-page caching |
 | Remote encrypted backup transport | 250-400 lines | 100-220 lines until off-host replacement is verified | Local integrity remains Core |
 | Staging, bulk updates and plugin-specific operations | 300-450 lines | 60-120 lines for detection/blocking | Application policy externalized |
 | Generic host extras, broad security/header policy and menu glue | 250-400 lines | 100-180 lines for SSH/UFW/Core compatibility | Distribution/administrator ownership |
 | CLI/state/documentation consolidation after deletion | 200-350 lines | Compatibility wrappers/aliases remain | S3/S5, not early refactoring |
 
-The total realistic net reduction remains about 2,700-3,300 runtime lines, yielding the 4,000-4,600 target. If compatibility evidence requires more code, safety wins and the target moves upward.
+The total realistic net reduction is about 2,500-3,100 runtime lines, yielding the 4,200-4,800 target. Retaining Page Cache Lite deliberately reduces the deletion estimate. If compatibility evidence requires more code, safety wins and the target moves upward.
 
 ## Operational-state reduction
 
@@ -88,7 +88,7 @@ The detailed file map is in `04-STATE-AND-CONFIG-MAP.md`. At a product level:
 | 1 | Metrics/dashboard/tuner | Persistent database, minute timer, embedded UI and automatic mutations tied into capacity | Removes the largest code/state/background cluster while making worker changes explicitly operator-owned |
 | 2 | Feature-rich per-site policy | Site repair/apply can own cache, Redis, staging, security, Cron and TLS simultaneously | Narrows blast radius and makes unknown/retained behavior visible |
 | 3 | Backup + remote transport + restore | Integrity, retention, encryption, scheduling and recovery have different failure semantics | Core focuses on verified local artifacts and conservative recovery; off-host tooling gets an explicit owner |
-| 4 | Private Redis + full-page cache | Services, sockets, secrets, drop-ins, Nginx routing, queues and invalidation | Large reduction in credentials, background work and application-plugin coupling |
+| 4 | Private Redis + cache orchestration | Services, sockets, secrets, drop-ins, arbitrary exclusions, queues and invalidation | Remove credentials/background/plugin coupling while retaining simple default-off Page Cache Lite |
 | 5 | Generic host and WordPress application operations | wp-shell becomes a control panel for unrelated system/plugin policy | Smaller contract, fewer surprising mutations and easier production review |
 
 ## Safety scorecard
@@ -133,7 +133,7 @@ v11 is simpler when all of the following are true:
 - a normal operator can understand install, status/audit/capacity, site lifecycle and backup/restore without navigating optional subsystem menus;
 - a Core apply has a smaller, explicit ownership set;
 - worker safety no longer depends on a minute collector but is not less conservative;
-- old page cache/private Redis/remote backup/staging behavior is detected and preserved or blocked, never silently changed;
+- Page Cache Lite remains deterministic and default off, while old cache-auto/custom rules, private Redis, remote backup and staging are detected and preserved or blocked;
 - rollback and restore are clearly different and both honest about their scope;
 - tests continue proving production invariants even if their total line count does not fall;
 - no new daemon, management port, framework or plugin assumption replaces the deleted complexity.

@@ -112,13 +112,16 @@ On failure it restores exact files and unit enablement/active states that the sa
 - Core apply must either preserve their compatible PHP/WordPress connection state or refuse the site change. It must not fall back silently to shared Redis, which could mix prefixes or expose credentials.
 - Migration to a plugin/vendor/external owner is a separate explicit runbook. Only after connection and cache behavior are verified may the old instance be stopped; files and secrets follow an administrator-approved retention policy.
 
-### FastCGI full-page cache and operations timer
+### FastCGI Page Cache Lite and legacy operations timer
 
-- New v11 sites do not receive full-page-cache orchestration.
-- Existing cache-enabled sites retain the v10 Nginx behavior during one major compatibility window unless the operator explicitly migrates it.
-- An operations-timer compatibility handler may remain only long enough to avoid broken scheduled commands. It cannot invent new policies or silently stop invalidation.
-- The migration report must distinguish detected Nginx cache directives from proof of working HIT/invalidation; public response behavior is verified before ownership changes.
-- Cache directories and the invalidation MU plugin are never automatically deleted.
+- FastCGI transport remains Core and is not a migration target: preserve per-site Unix sockets, required parameters, timeout/buffer compatibility and effective FPM/socket verification.
+- v11 offers Page Cache Lite as a default-off, explicit per-site option with on/off/status/manual clear.
+- Compatible v10 `page-cache` state is adopted without changing its enabled/disabled value. The v11 renderer uses one conservative generic WordPress bypass set and adds WooCommerce bypasses only when WooCommerce is an explicit site registry property.
+- Plugin/theme/RFQ/Pretty Links-specific exclusions, automatic Cloudflare/APO coordination, metrics and tuning are not imported into the generic policy. Existing custom Nginx exclusions remain administrator-owned and byte-preserved.
+- Existing cache-enabled sites retain effective v10 public behavior until a preflight proves the Lite candidate is equivalent or the operator confirms a reviewed difference. An unrepresentable custom behavior blocks affected apply rather than being silently dropped.
+- Automatic invalidation is separate from Page Cache Lite. An operations-timer compatibility handler may remain only long enough to avoid broken scheduled commands; confirmed migration disables its producer and preserves the MU plugin/marker/unit data unless the operator explicitly removes owned artifacts.
+- The migration report must distinguish configured cache directives from proof of working HIT/bypass behavior. It verifies representative anonymous HIT, admin/login bypass and explicit WooCommerce dynamic-route bypass before ownership changes.
+- Cache directories are never automatically deleted. A confirmed manual clear is bounded to the selected site's validated wp-shell-owned cache root and must not follow symlinks.
 
 ### Remote backup
 
@@ -187,7 +190,8 @@ After rollback, validate Nginx, every affected PHP-FPM version, MariaDB health, 
 | Read v10 config/site/policy schemas | Required | Only after an explicit later schema migration with rollback |
 | Legacy command wrappers | Warn and forward | v12 |
 | Retired timer entry-point handlers | Non-mutating compatibility plus status warning | After confirmed migration evidence; no earlier than a v11 minor release |
-| Existing page-cache renderer | Preserve or block affected apply | v12 or after per-site explicit migration |
+| Existing generic page-cache state | Adopt as Page Cache Lite without changing enabled state | Core; no planned removal |
+| Custom/plugin-specific cache rules and cache-auto | Preserve or block affected apply; explicit migration | v12 or after per-site ownership transfer |
 | Existing private Redis awareness | Preserve or block affected apply | No fixed date; only after explicit instance migration |
 | Existing remote backup upload | Preserve until verified external replacement | No fixed date; never time-expire protection silently |
 | Historic metrics database | Preserve as inactive data | Administrator retention decision only |
@@ -214,7 +218,7 @@ A migration succeeds only when:
 - unsafe effective MariaDB configuration under the current risk gate;
 - no verified backup before a behavior-changing site migration;
 - the only off-host backup would stop;
-- active page cache/private Redis/staging behavior cannot be preserved and no replacement is confirmed;
+- active custom cache/cache-auto, private Redis or staging behavior cannot be preserved and no reviewed ownership transition is confirmed;
 - a candidate fails syntax/semantic validation;
 - current files differ from fingerprints captured after planning;
 - inadequate disk space for exact transaction/configuration backups.

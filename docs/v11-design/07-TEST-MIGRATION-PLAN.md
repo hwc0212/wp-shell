@@ -24,7 +24,7 @@ This is the behavior reference, not evidence that every v11 behavior should rema
 |---|---|---|
 | `tests/static-checks.sh` | KEEP/ADAPT | Keep strict mode, trap, temp-file, quoting, secret and unsafe-write guards. Remove references only after corresponding code is gone. Add a docs/runtime scope guard while staged deletion is underway. |
 | `tests/config-roundtrip.sh` | KEEP/ADAPT | Preserve all v10 reader/round-trip cases and unknown fields. Add v10 preflight/confirmed migration/idempotency/corruption fixtures. |
-| `tests/render-nginx.sh` | KEEP/ADAPT | Retain default-host 444, static delivery, PHP `try_files`, uploads execution block, protected paths, safe headers and optional CF real IP. Move page-cache assertions to compatibility fixtures before eventual removal. |
+| `tests/render-nginx.sh` | KEEP/ADAPT | Retain default-host 444, static delivery, PHP `try_files`, uploads execution block, protected paths, safe headers, FastCGI transport, Page Cache Lite render/bypass and optional CF real IP. |
 | `tests/storage-layout.sh` | KEEP/ADAPT | Keep `/etc/wp-shell`, `/var/lib/wp-shell`, site-root, permissions and path ownership checks. Assert v11 creates no metrics/operations state on a clean install. |
 | `tests/metrics-roundtrip.sh` | REMOVE after S1 migration coverage | Before removal, extract worker-estimate safety cases to capacity tests and add preservation/disablement tests for the old database/timer. |
 | `tests/wordpress-core.sh` | KEEP/ADAPT | Keep WordPress download/checksum, safe config writes, permissions, constants and Cron semantics. Remove bulk upgrade/plugin-specific paths only with explicit negative tests. |
@@ -37,8 +37,8 @@ This is the behavior reference, not evidence that every v11 behavior should rema
 | `tests/reliability-regression.sh` | KEEP/ADAPT | Keep transaction, atomic replace, signal/error, permission, backup completeness and no-secret regressions. Remove feature-specific assertions only after equivalent Core/compatibility assertions exist. |
 | `tests/control-plane.sh` | KEEP/ADAPT | Narrow apply/dry-run/audit/rollback ownership; retain admission-before-write, candidate failure, fingerprint conflict and reload-only-if-changed behavior. |
 | `tests/cloudflare-policy.sh` | KEEP/NARROW | Retain official CIDR validation, atomic update/fallback, trusted-header and forged-header checks. Remove any future API/cache behavior rather than expanding it. |
-| `tests/compatibility-policies.sh` | KEEP/EXPAND | Become the main v10 compatibility/migration fixture set: wrappers, unknown keys, deprecated units, private Redis, page cache, remote backup and staging blockers. |
-| `tests/nginx-integration.sh` | KEEP/ADAPT | Continue real Nginx syntax/routes/TLS/static/protected/PHP-404 checks. Keep existing page-cache behavior as a compatibility test until migrated. |
+| `tests/compatibility-policies.sh` | KEEP/EXPAND | Become the main v10 compatibility/migration fixture set: wrappers, unknown keys, deprecated units, private Redis, legacy cache-auto/custom cache rules, remote backup and staging blockers. |
+| `tests/nginx-integration.sh` | KEEP/ADAPT | Continue real Nginx syntax/routes/TLS/static/protected/PHP-404 checks. Keep permanent Page Cache Lite anonymous HIT and bypass coverage plus legacy/custom preservation fixtures. |
 | `tests/service-config-integration.sh` | KEEP/ADAPT | Retain effective PHP pool, MariaDB/Redis loopback, config transaction and rollback checks. Remove metrics/private Redis creation from clean-v11 expectations. |
 | `tests/operations-integration.sh` | SPLIT/RETIRE in S2 | Move local backup/restore/Cron assertions to Core operations integration. Retain compatibility-handler cases until old operations/cache timers are migrated, then remove cache/staging/update paths. |
 | `tests/imported-site-integration.sh` | KEEP | Continue the Ubuntu 24.04 real-filesystem import reliability path; add v10-policy compatibility fixture where needed. |
@@ -114,7 +114,8 @@ Use fixture matrices, not the developer's live host:
 | Clean v10 Core-only configuration | Preflight `CLEAN`/`COMPATIBLE`; confirmed migration succeeds and repeats as no-op |
 | Metrics timer and populated SQLite DB | Timer disabled only with confirmation; database/unit files retained; rollback restores unit state |
 | Automatic tuning history plus current manual limits | History retained inactive; desired limits preserved; aggregate capacity revalidated |
-| Existing page-cache site | Public behavior preserved or affected apply blocked; cache data/MU plugin not deleted |
+| Existing generic page-cache site | Enabled/disabled state adopted as Page Cache Lite; effective HIT/bypass behavior verified; cache data retained |
+| Existing custom cache rules or cache-auto | Custom includes and MU plugin/data retained; affected apply preserves behavior or blocks; timer disablement is explicit and reversible |
 | Existing private Redis site | Instance/config/secret retained; no fallback to shared Redis; affected apply blocked if preservation cannot be proven |
 | Existing remote backup as only off-host copy | `EXTERNAL_REPLACEMENT_REQUIRED`; timer/upload not silently disabled |
 | Existing staging route | Route/root/data retained and reported; no production conversion |
@@ -125,6 +126,20 @@ Use fixture matrices, not the developer's live host:
 | Low disk during migration backup | Failure before live writes/unit changes |
 
 ## CI shape by stage
+
+### Page Cache Lite permanent coverage
+
+- FastCGI transport uses the selected site's Unix socket and required parameters/timeouts/buffers.
+- A nonexistent PHP script returns 404 before FastCGI execution.
+- Page Cache Lite defaults off and repeated status/apply does not enable it.
+- Explicit enable, disable and manual clear are transactional and idempotent.
+- Anonymous generic WordPress `GET`/`HEAD` requests can reach HIT.
+- POST, authorization, query-string, admin, login, Cron, REST, XML-RPC, feed, sitemap, preview and WordPress authenticated/password/commenter state bypass cache.
+- WooCommerce cart/checkout/account/API paths and session/cart cookies bypass only when WooCommerce is an explicit site property.
+- A normal WordPress site does not gain plugin/theme/RFQ/Pretty Links-specific assumptions.
+- Manual clear cannot escape the selected validated cache root, follow a symlink, flush Redis/OPcache or purge Cloudflare.
+- No Page Cache Lite action installs an MU plugin, starts an invalidation timer, writes metrics or performs automatic tuning.
+- Existing custom exclusions remain byte-identical or the affected apply fails before Nginx writes/reload.
 
 ### Required for every PR
 

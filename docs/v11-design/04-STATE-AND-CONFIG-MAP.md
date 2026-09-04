@@ -9,6 +9,8 @@ The current runtime uses two primary state roots:
 
 There is no single fixed file count because most state is per-site or per-transaction. This document counts **file classes** and gives formulas where possible. It also lists related managed files outside those roots because migration decisions cannot be made safely without them.
 
+The experimental `wp-shell-v11.sh` does not casually install over `/usr/local/sbin/wp-shell`; its optional development path is `/usr/local/sbin/wp-shell-v11`. It intentionally does not duplicate every configuration namespace. Consequently `/etc/wp-shell`, `/var/lib/wp-shell`, existing wp-shell systemd units/timers, Nginx/PHP-FPM/MariaDB/Redis files and `/var/www/<domain>` remain collision points. Mutating v11 bootstrap runs require explicit opt-in and disposable/test hosts until the migration stage defines production ownership.
+
 Migration actions mean:
 
 - **read**: v11 must parse and validate it;
@@ -41,7 +43,7 @@ Current `set_site_policy()` stores one root-only file per key. Not every site ha
 | Key | v10 owner/meaning | v11 disposition | Migration behavior |
 |---|---|---|---|
 | `user` | non-root site runtime identity | KEEP | Required; validate account/home/group and preserve. |
-| `page-cache` | FastCGI page cache enabled/disabled | DEPRECATE | Compatibility renderer preserves active behavior; no silent change. |
+| `page-cache` | FastCGI page cache enabled/disabled | KEEP optional | Reuse for Page Cache Lite; default off, explicit on/off, generic or explicit-WooCommerce bypass profile. |
 | `object-cache` | Redis Object Cache integration state | EXTERNALIZE | Observe/preserve; do not install, disable, or rewrite plugin automatically. |
 | `redis-mode` | shared or isolated instance | DEPRECATE for isolated | Preserve service/connection; block automatic downgrade. |
 | `redis-memory` | private Redis limit | DEPRECATE | Preserve with isolated instance; report only. |
@@ -58,7 +60,7 @@ Current `set_site_policy()` stores one root-only file per key. Not every site ha
 | `cron-mode` | request/system WP-Cron | KEEP optional | Reuse; cross-check owned Cron file and WordPress constant. |
 | `cron-prior` | prior `DISABLE_WP_CRON` value | KEEP supporting state | Reuse to make disable reversible. |
 
-Current maximum known policy leaves: 17 per site. v11 Core target after completed migrations: typically two (`user`, optionally `cron-mode`/`cron-prior`) plus optional `login-limit` and `xmlrpc`. Compatibility leaves may remain readable for at least one major version.
+Current maximum known policy leaves: 17 per site. v11 Core target after completed migrations: `user`, optional `page-cache`, optionally `cron-mode`/`cron-prior`, plus optional `login-limit` and `xmlrpc`. Compatibility leaves may remain readable for at least one major version.
 
 Do not consolidate these into one file in S1-S3 merely to reduce filenames. Separate leaves permit narrow ownership and rollback. The semantic reduction comes from fewer active policies, not a format rewrite.
 
@@ -134,7 +136,7 @@ The exact count varies with site activity and crashes. v11 Core target is no his
 | `/etc/nginx/conf.d/wp-shell-global.conf` | KEEP minimal `server_tokens` and login-limit primitives. |
 | `/etc/nginx/sites-available/00-wp-shell-default` and enabled link | KEEP unknown-Host fail-closed behavior. |
 | `/etc/nginx/sites-available/<domain>` and enabled link | KEEP Core routing/security/TLS; compatibility renderer must preserve active v10 optional behavior. |
-| `/etc/nginx/conf.d/wp-cache-<domain>.conf` | DEPRECATE; preserve while legacy page cache active, explicit migration only. |
+| `/etc/nginx/conf.d/wp-cache-<domain>.conf` | KEEP optional as Page Cache Lite's per-site cache path/zone; adopt compatible v10 state without discarding custom exclusions. |
 | `/etc/nginx/wp-shell-custom/<domain>/*.conf` | PRESERVE as administrator/compatibility extension surface; never delete wholesale. |
 | `/etc/nginx/wp-shell-custom/<domain>/10-staging.conf` | EXTERNALIZED legacy state; preserve. |
 | `/etc/nginx/wp-shell-custom/<domain>/20-cache-exclusions.conf` | EXTERNALIZED legacy state; preserve. |
@@ -198,7 +200,7 @@ Although outside the requested primary roots, these paths are required for safe 
 | `/var/www/<domain>/public` or imported root | WordPress authority | KEEP with path/symlink boundaries. |
 | `/var/www/<domain>/logs` | site logs | KEEP. |
 | `/var/www/<domain>/backups` | local backups | KEEP. |
-| `/var/www/<domain>/cache` | FastCGI data | legacy when page cache removed | preserve until explicit cache retirement; safe to delete contents only by confirmed operator action. |
+| `/var/www/<domain>/cache` | FastCGI Page Cache Lite data | KEEP optional | use only the validated per-site root; manual clear requires confirmation and must not follow symlinks. |
 | `/var/www/<domain>/.wp-cli` | isolated WP-CLI home/cache | KEEP. |
 | `/var/www/<domain>/.wp-shell-maintenance` | fail-closed maintenance marker | KEEP. |
 | `/var/www/<domain>/.wp-shell/cache-dirty` | cache-auto event marker | retire explicitly with feature. |
@@ -215,6 +217,7 @@ After all explicit migrations, a typical v11 managed site should require:
 /etc/wp-shell/databases/<domain>.v1
 /etc/wp-shell/tuning.v1              # manual worker targets only, optional
 /etc/wp-shell/site-policy/<domain>/user
+/etc/wp-shell/site-policy/<domain>/page-cache   # optional, Page Cache Lite
 /etc/wp-shell/site-policy/<domain>/cron-*       # optional
 /etc/wp-shell/site-policy/<domain>/login-limit  # optional
 /etc/wp-shell/site-policy/<domain>/xmlrpc       # optional
