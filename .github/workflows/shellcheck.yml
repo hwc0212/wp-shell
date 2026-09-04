@@ -19,6 +19,9 @@ jobs:
           sudo apt-get update >/dev/null
           sudo apt-get install -y sqlite3 jq >/dev/null
           bash tests/v11-bootstrap.sh
+          bash tests/v11-capacity.sh
+          bash tests/v11-manual-workers.sh
+          bash tests/v11-metrics-migration.sh
           bash tests/static-checks.sh
           bash tests/config-roundtrip.sh
           bash tests/render-nginx.sh
@@ -48,6 +51,10 @@ jobs:
           /mnt/deploy-single-wordpress.sh
           /mnt/tests/static-checks.sh
           /mnt/tests/v11-bootstrap.sh
+          /mnt/tests/v11-capacity.sh
+          /mnt/tests/v11-manual-workers.sh
+          /mnt/tests/v11-metrics-migration.sh
+          /mnt/tests/v11-fpm-integration.sh
           /mnt/tests/config-roundtrip.sh
           /mnt/tests/render-nginx.sh
           /mnt/tests/storage-layout.sh
@@ -99,6 +106,16 @@ jobs:
           'apt-get update >/dev/null &&
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends sudo ca-certificates >/dev/null &&
           bash /mnt/tests/imported-site-integration.sh'
+
+      - name: V11 manual capacity / real PHP-FPM integration
+        run: >-
+          docker run --rm
+          -v "$PWD:/mnt:ro"
+          ubuntu:24.04
+          bash -c
+          'apt-get update >/dev/null &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends php8.3-fpm ca-certificates >/dev/null &&
+          bash /mnt/tests/v11-fpm-integration.sh'
 
   mariadb-legacy:
     name: MariaDB legacy migration / Ubuntu ${{ matrix.ubuntu }}

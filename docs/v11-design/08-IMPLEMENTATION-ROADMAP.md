@@ -25,7 +25,7 @@ S1-S6 feature branches target `v11`, never `main`. Until v11 GA, the root `wp-sh
 
 ## S0 - Design and frozen baseline
 
-Status: this documentation-only proposal.
+Status: completed on the reviewed `v11` base.
 
 Scope:
 
@@ -52,6 +52,8 @@ Exit gate:
 ## S1 - Remove historical monitoring and automatic tuning
 
 Primary result: delete the largest self-contained complexity cluster while preserving the PHP hard-safety invariant.
+
+Status: implemented for review on `codex/v11-s1-manual-capacity`; not merged and not production GA. The implementation details and measured reduction are recorded in `10-S1-MANUAL-CAPACITY-IMPLEMENTATION.md`.
 
 ### Add before deleting
 

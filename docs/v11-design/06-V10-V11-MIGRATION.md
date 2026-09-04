@@ -26,6 +26,8 @@ wp-shell migrate v10
 
 The unconfirmed command performs no initialization or repair. It reports:
 
+> S1 implementation boundary: the current command reports only legacy metrics/tuner producer state, preserved historical artifacts, and the managed PHP limits that will become manual desired state. The broader cache, private Redis, remote backup, staging and host-policy inventory below remains the contract for later stages and is intentionally not implemented in S1.
+
 - executable version and known configuration schemas;
 - valid and invalid site records, absolute roots, PHP versions and effective pool ownership;
 - legacy wrappers and known automation command forms;
@@ -97,6 +99,8 @@ On failure it restores exact files and unit enablement/active states that the sa
 - A minimal one-major-version compatibility route for an already scheduled `metrics collect` invocation may exit successfully with a deprecation warning and no state mutation until confirmed migration disables the unit. It must not print `collector OK` or create empty samples.
 - `/etc/wp-shell/tuning.v1` is adopted as manual desired worker state. Recommendation provenance/history is not needed to honor an explicit current value.
 - `dashboard`, `report`, `analyze` and automatic `tune --apply` become deprecation errors with the replacement command where one exists; no synthetic history is generated.
+- The S1 migration record is `/etc/wp-shell/v10-metrics-migration.v1`. It records prior metrics service/timer enabled and active states without credentials. Repeated confirmed migration is a no-op when the record exists and the producer remains inactive.
+- Safe effective managed pool values are copied into the unchanged `tuning.v1` format only when the managed fragment agrees with `php-fpm -tt` and the whole current aggregate is safe. Unknown, conflicting, or overcommitted state blocks migration before unit changes.
 
 ### PHP-FPM and OPcache
 
