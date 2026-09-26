@@ -32,7 +32,11 @@ The scorecard separates source size from operational complexity. The latter—pe
 
 The S1 review branch measures 6,588 lines, 308,823 bytes and 311 Shell functions in `wp-shell-v11.sh`, versus 7,326 lines, 349,060 bytes and 322 functions at v11 base `40844a7e46006057721686d329acd53388f2e619`. Runtime source fell by 738 lines (10.1%) and 40,237 bytes (11.5%). Function counts include both brace-bodied functions and subshell-bodied transaction helpers. More importantly, clean v11 ownership fell from six SQLite tables, two generated metrics producer units and one embedded curses application to zero. No replacement daemon, persistent history store or runtime dependency was added. Full details are in `10-S1-MANUAL-CAPACITY-IMPLEMENTATION.md`.
 
-The function-count reduction is intentionally small because fail-closed current capacity, manual transaction and explicit migration boundaries replace one large automated cluster. This does not meet the final post-S1-S5 size target by itself and must not be presented as if later stages were complete.
+The function-count reduction is intentionally small because fail-closed current
+capacity, the manual transaction and a small fresh-deploy guard replace one
+large automated cluster. There is no V10 migration state machine. This does not
+meet the final post-S1-S5 size target by itself and must not be presented as if
+later stages were complete.
 
 ## Runtime reduction estimate by responsibility
 
@@ -40,7 +44,7 @@ These ranges overlap at shared helpers and should not be added as exact deletion
 
 | Responsibility | Estimated removable/simplifiable runtime | Compatibility cost retained in v11 | Net intent |
 |---|---:|---:|---|
-| SQLite metrics, cursor/retention, analyzer, dashboard, automatic tuner | 1,050-1,250 lines | 100-180 lines for current capacity/status and v10 migration shims | Largest S1 reduction |
+| SQLite metrics, cursor/retention, analyzer, dashboard, automatic tuner | 1,050-1,250 lines | Current capacity plus a small read-only fresh-deploy guard; no migration state machine | Largest S1 reduction |
 | Advanced OPcache mutation/UI | 250-350 lines | 80-140 lines for conservative baseline/effective accounting | Keep capacity evidence only |
 | Private Redis and object-cache orchestration | 300-450 lines | 120-220 lines for existing-state detection/preservation | No new instances; long compatibility tail |
 | FastCGI cache orchestration around Page Cache Lite | 250-400 lines | 180-300 lines for transport, Lite renderer/on/off/status/manual clear and legacy/custom preservation | Remove automation/plugin intelligence, not FastCGI or optional full-page caching |

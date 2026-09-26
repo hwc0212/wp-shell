@@ -36,7 +36,7 @@ The host estimate is `ceil(max_current_worker_PSS * 1.25)` with a 96MB floor. Cu
 
 1. validates the selected wp-shell-owned pool, including a pool for a registered imported site when ownership and effective semantics are proven;
 2. requires its managed value and effective `ondemand` value to agree;
-3. refuses legacy migration blockers and unknown capacity;
+3. refuses unknown capacity and is separately blocked before runtime on a detected v10-managed host;
 4. replaces only the selected site's current value in the prospective aggregate;
 5. requires the result to fit the hard RAM-derived worker budget;
 6. renders one candidate and updates the existing `tuning.v1` manual desired state in the managed transaction;
@@ -47,17 +47,18 @@ The host estimate is `ceil(max_current_worker_PSS * 1.25)` with a 96MB floor. Cu
 
 An exact repeated request does not create a transaction or reload PHP. A later administrator override blocks the write and remains byte-identical.
 
-## V10 metrics migration
+## Fresh-deploy v10 boundary
 
-`wp-shell-v11 migrate v10` is a read-only preview. `--confirm` adopts safe, effective managed pool values as manual desired state and stops/disables only `wp-shell-metrics.timer` plus its service. The migration preserves:
+V11-A deliberately has no in-place v10 metrics migration. Before any mutating
+command creates runtime paths, logs or a transaction, a small read-only guard
+checks for a stable v10 entry point plus managed configuration and for known v10
+metrics database/unit artifacts. Detection blocks the write and recommends
+continuing stable v10 or using a fresh VPS plus a reviewed WordPress migration
+plugin/provider snapshot.
 
-- `metrics.sqlite3`, WAL/SHM sidecars;
-- collector cursor/state/lock and recommendation files;
-- wp-shell logs;
-- systemd unit files;
-- administrator files.
-
-Prior unit enabled/active states are recorded in root-only `/etc/wp-shell/v10-metrics-migration.v1`. A failure while stopping/disabling restores those prior unit states and the managed transaction restores configuration files. A completed inactive migration repeats as a no-op. The compatibility form `metrics collect` exits successfully with a warning but never creates or changes a sample, database, cursor or log.
+The guard never executes the old script, calls `systemctl`, adopts pool values,
+creates a migration record, or deletes/disables historical state. Read-only
+status, audit and capacity remain available. See `06-V10-V11-MIGRATION.md`.
 
 ## Removed runtime responsibilities
 
@@ -69,7 +70,10 @@ Prior unit enabled/active states are recorded in root-only `/etc/wp-shell/v10-me
 - automatic recommendations, pressure-history gates and `tune --apply`;
 - SQLite as a clean-v11 package dependency.
 
-The old commands return explicit deprecation errors. No replacement daemon, database, management port, framework or dependency was added.
+The old commands return explicit deprecation errors. There is no successful
+`metrics collect` compatibility no-op and no `migrate v10` command. No
+replacement daemon, database, management port, framework or dependency was
+added.
 
 ## Measured complexity
 
@@ -77,10 +81,10 @@ Measured against v11 base `40844a7e46006057721686d329acd53388f2e619`:
 
 | Measure | v11 base | S1 implementation | Change |
 |---|---:|---:|---:|
-| `wp-shell-v11.sh` lines | 7,326 | 6,588 | -738 (-10.1%) |
-| Runtime bytes | 349,060 | 308,823 | -40,237 (-11.5%) |
-| Shell functions | 322 | 311 | -11 |
-| Documented public CLI forms | 60 | 58 | -2 |
+| `wp-shell-v11.sh` lines | 7,326 | 6,434 | -892 (-12.2%) |
+| Runtime bytes | 349,060 | 299,883 | -49,177 (-14.1%) |
+| Shell functions | 322 | 307 | -15 |
+| Documented public CLI forms | 60 | 56 | -4 |
 | SQLite tables owned | 6 | 0 | -6 |
 | Metrics producer units created on clean install | 2 | 0 | -2 |
 | Embedded curses applications | 1 | 0 | -1 |
@@ -88,7 +92,12 @@ Measured against v11 base `40844a7e46006057721686d329acd53388f2e619`:
 | Shell test files | 22 | 26 | +4 safety suites |
 | New runtime dependencies | 0 | 0 | 0 |
 
-Function counts include brace-bodied functions and subshell-bodied transaction helpers. S1 replaces broad automated behavior with smaller fail-closed capacity, transaction and migration boundaries. The operational reduction—no minute producer, SQLite state, dashboard or auto-mutation loop—is more material than source size alone. Tests grow intentionally to preserve safety evidence.
+Function counts include brace-bodied functions and subshell-bodied transaction
+helpers. S1 replaces broad automated behavior with smaller fail-closed capacity,
+manual transaction and fresh-deploy boundaries. The operational reduction—no
+minute producer, SQLite state, dashboard, auto-mutation loop or migration state
+machine—is more material than source size alone. Tests grow intentionally to
+preserve safety evidence.
 
 Python remains a clean-v11 dependency because retained Cloudflare CIDR/address validation and backup archive-member validation still use 37 embedded Python lines. Removing those security parsers merely to eliminate the dependency would weaken retained Core behavior and is outside S1.
 
@@ -96,7 +105,10 @@ Python remains a clean-v11 dependency because retained Cloudflare CIDR/address v
 
 - `tests/v11-capacity.sh`: 1/2/4/8/16GB profiles, normal/WooCommerce/mixed/imported sites, zero/nonzero Swap, multiple PHP versions, aggregate overrides, current PSS upward-only and read-only/unknown/overcommit behavior.
 - `tests/v11-manual-workers.sh`: preview zero-write, aggregate refusal, exact target-only change, administrator override, post-write mismatch, reload-failure rollback and idempotent no-reload.
-- `tests/v11-metrics-migration.sh`: historical/admin artifact preservation, producer-only disablement, manual-state adoption, compatibility no-op, failure restoration, idempotency and no runtime SQLite producer.
+- `tests/v11-fresh-deploy-boundary.sh`: read-only v10-footprint detection,
+  pre-runtime mutation refusal, byte-identical historical/admin artifacts, no
+  synthesized tuning state, fresh-host admission and complete removal of the
+  in-place metrics migration/collector surface.
 - `tests/v11-fpm-integration.sh`: real Ubuntu 24.04 `php-fpm8.3 -t/-tt`, confirmed transaction and later administrator override detection.
 
 Existing v10 test suites remain because stable v10 behavior is intentionally unchanged. No test is weakened to make v11 pass.
@@ -107,5 +119,6 @@ Existing v10 test suites remain because stable v10 behavior is intentionally unc
 - The MariaDB reserve shown by capacity is planning information, not proof of MariaDB's actual maximum memory. `mariadb audit` remains the effective source.
 - On a 1GB profile, the retained reserves may refuse even one managed site plus its distribution default pool. S1 refuses rather than silently overcommitting or treating Swap as RAM.
 - A host already overcommitted across several sites cannot use sequential changes that leave an unsafe intermediate/final aggregate. S1 deliberately does not add a multi-site mutation interface.
-- V10 historical data retention/deletion remains administrator-owned. Package removal is not automated.
+- V10 historical data retention/deletion remains administrator-owned. V11 does
+  not migrate, stop, disable or remove it; package removal is not automated.
 - S2, restore/Phase 2C and all unrelated optional-feature redesigns are intentionally not started.

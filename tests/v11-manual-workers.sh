@@ -47,7 +47,6 @@ site_php_pool_file() { printf '%s/pools/%s.conf' "$TEST_ROOT" "$1"; }
 unique_php_versions() { printf '8.3\n'; }
 opcache_effective_values() { printf '128 16\n'; }
 read_effective_default_pool_limit() { printf '1'; }
-legacy_metrics_status() { printf ABSENT; }
 ADMIN_OVERRIDE=""
 POST_WRITE_OVERRIDE=no
 read_effective_site_pool_limit() {

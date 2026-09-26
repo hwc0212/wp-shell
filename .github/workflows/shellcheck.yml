@@ -21,7 +21,7 @@ jobs:
           bash tests/v11-bootstrap.sh
           bash tests/v11-capacity.sh
           bash tests/v11-manual-workers.sh
-          bash tests/v11-metrics-migration.sh
+          bash tests/v11-fresh-deploy-boundary.sh
           bash tests/static-checks.sh
           bash tests/config-roundtrip.sh
           bash tests/render-nginx.sh
@@ -53,7 +53,7 @@ jobs:
           /mnt/tests/v11-bootstrap.sh
           /mnt/tests/v11-capacity.sh
           /mnt/tests/v11-manual-workers.sh
-          /mnt/tests/v11-metrics-migration.sh
+          /mnt/tests/v11-fresh-deploy-boundary.sh
           /mnt/tests/v11-fpm-integration.sh
           /mnt/tests/config-roundtrip.sh
           /mnt/tests/render-nginx.sh

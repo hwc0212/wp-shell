@@ -20,8 +20,6 @@ readonly ENVIRONMENT_CONFIG_FILE="$CONFIG_DIR/environment.v1"
 readonly DATABASE_CONFIG_DIR="$CONFIG_DIR/databases"
 readonly REDIS_SECRET_FILE="$CONFIG_DIR/redis.secret"
 readonly STATE_DIR="${WP_SHELL_STATE_DIR:-/var/lib/wp-shell}"
-readonly LEGACY_METRICS_DB="$STATE_DIR/metrics.sqlite3"
-readonly V10_METRICS_MIGRATION_FILE="$CONFIG_DIR/v10-metrics-migration.v1"
 readonly TUNING_CONFIG_FILE="$CONFIG_DIR/tuning.v1"
 readonly OPCACHE_CONFIG_FILE="$CONFIG_DIR/opcache.v1"
 readonly SITE_POLICY_DIR="$CONFIG_DIR/site-policy"
@@ -1314,13 +1312,7 @@ calculate_resource_budget_values() {
 }
 
 calculate_resource_budget() {
-    local output_mode="${1:-}" admission_mode="${2:-enforce}" migration_status
-    migration_status="$(legacy_metrics_status)"
-    if [[ "$migration_status" == LEGACY_METRICS_PRESENT || "$migration_status" == UNKNOWN_* ]]; then
-        PHP_CAPACITY_ERROR="Legacy v10 metrics/automatic-tuning state is $migration_status. Run the read-only preview 'wp-shell-v11 migrate v10', then explicitly confirm migration before any managed PHP pool apply."
-        [[ "$admission_mode" == advisory ]] && return 1
-        die "$PHP_CAPACITY_ERROR"
-    fi
+    local output_mode="${1:-}" admission_mode="${2:-enforce}"
     calculate_resource_budget_values "$output_mode" planned || {
         [[ "$admission_mode" == advisory ]] && return 1
         die "$PHP_CAPACITY_ERROR"
@@ -1575,8 +1567,6 @@ site_workers_command() {
             "$PHP_MANUAL_DOMAIN" "$requested"
         return 0
     fi
-    [[ "$(legacy_metrics_status)" != LEGACY_METRICS_PRESENT && "$(legacy_metrics_status)" != UNKNOWN_* ]] ||
-        die "Migrate the v10 metrics/automatic-tuning state before writing manual worker desired state: wp-shell-v11 migrate v10 --confirm"
     CURRENT_STEP="set manual PHP-FPM workers for $PHP_MANUAL_DOMAIN"
     pool_file="$(site_php_pool_file "$PHP_MANUAL_DOMAIN" "$PHP_MANUAL_VERSION")"
     php_site_pool_ownership_check "$PHP_MANUAL_DOMAIN" "$PHP_MANUAL_VERSION" || die "$PHP_CURRENT_CAPACITY_ERROR"
@@ -4165,8 +4155,7 @@ show_environment_summary() {
     printf 'Services       nginx:%s php:%s mariadb:%s redis:%s fail2ban:%s\n' \
         "$(service_state nginx)" "$(service_state "php${DEFAULT_PHP_VERSION}-fpm")" \
         "$(service_state mariadb)" "$(service_state redis-server)" "$(service_state fail2ban)"
-    printf 'Automation     backups:%s legacy-metrics:%s\n' \
-        "$(service_state wp-shell-backup.timer)" "$(legacy_metrics_status)"
+    printf 'Automation     backups:%s\n' "$(service_state wp-shell-backup.timer)"
 
     printf '\nDNS required before adding a WordPress website:\n'
     if [[ -n "$public_ip" ]]; then
@@ -5138,176 +5127,60 @@ backup_all_sites() {
     ((failures == 0)) || die "$failures site backup(s) failed."
 }
 
-legacy_metrics_artifacts_present() {
-    local path
+v10_stable_entrypoint_path() {
+    if [[ "${WP_SHELL_TEST_ROOT_WRITES:-no}" == yes && -n "${WP_SHELL_TEST_V10_ENTRYPOINT:-}" ]]; then
+        printf '%s' "$WP_SHELL_TEST_V10_ENTRYPOINT"
+    else
+        printf '/usr/local/sbin/wp-shell'
+    fi
+}
+
+v10_systemd_unit_dir() {
+    if [[ "${WP_SHELL_TEST_ROOT_WRITES:-no}" == yes && -n "${WP_SHELL_TEST_SYSTEMD_DIR:-}" ]]; then
+        printf '%s' "$WP_SHELL_TEST_SYSTEMD_DIR"
+    else
+        printf '/etc/systemd/system'
+    fi
+}
+
+v10_host_footprint_details() {
+    local detected=no entrypoint unit_dir path
+    entrypoint="$(v10_stable_entrypoint_path)"
+    unit_dir="$(v10_systemd_unit_dir)"
+    if [[ ( -f "$ENVIRONMENT_CONFIG_FILE" || -f "$SITES_CONFIG_FILE" ) &&
+          ( -e "$entrypoint" || -L "$entrypoint" ) ]]; then
+        printf 'legacy wp-shell entrypoint plus managed configuration: %s\n' "$entrypoint"
+        detected=yes
+    fi
     for path in \
-        "$LEGACY_METRICS_DB" "$LEGACY_METRICS_DB-wal" "$LEGACY_METRICS_DB-shm" \
-        "$STATE_DIR/collector.lock" "$STATE_DIR/last-recommendations.tsv" \
-        "$STATE_DIR/pending-tuning-recommendations.tsv" \
-        /etc/systemd/system/wp-shell-metrics.service \
-        /etc/systemd/system/wp-shell-metrics.timer; do
-        [[ -e "$path" || -L "$path" ]] && return 0
-    done
-    compgen -G "$STATE_DIR/*.state" >/dev/null 2>&1 && return 0
-    compgen -G "$STATE_DIR/nginx-*.offset" >/dev/null 2>&1 && return 0
-    systemctl is-active --quiet wp-shell-metrics.timer 2>/dev/null && return 0
-    systemctl is-enabled --quiet wp-shell-metrics.timer 2>/dev/null && return 0
-    return 1
-}
-
-legacy_metrics_status() {
-    if [[ -L "$V10_METRICS_MIGRATION_FILE" ]]; then
-        printf 'UNKNOWN_UNSAFE_MIGRATION_STATE'
-    elif [[ -f "$V10_METRICS_MIGRATION_FILE" ]]; then
-        if systemctl is-active --quiet wp-shell-metrics.timer 2>/dev/null ||
-           systemctl is-active --quiet wp-shell-metrics.service 2>/dev/null ||
-           systemctl is-enabled --quiet wp-shell-metrics.timer 2>/dev/null; then
-            printf 'LEGACY_METRICS_PRESENT'
-        else
-            printf 'MIGRATED_INACTIVE_DATA_PRESERVED'
+        "$STATE_DIR/metrics.sqlite3" \
+        "$unit_dir/wp-shell-metrics.service" \
+        "$unit_dir/wp-shell-metrics.timer"; do
+        if [[ -e "$path" || -L "$path" ]]; then
+            printf 'legacy v10 artifact: %s\n' "$path"
+            detected=yes
         fi
-    elif legacy_metrics_artifacts_present; then
-        printf 'LEGACY_METRICS_PRESENT'
+    done
+    [[ "$detected" == yes ]]
+}
+
+v10_host_footprint_summary() {
+    local details
+    if details="$(v10_host_footprint_details)"; then
+        details="${details//$'\n'/; }"
+        printf 'DETECTED (%s)' "${details%; }"
     else
-        printf 'ABSENT'
+        printf 'none'
     fi
 }
 
-systemd_unit_enabled_state() {
-    local state
-    state="$(systemctl is-enabled "$1" 2>/dev/null || true)"
-    [[ "$state" =~ ^[a-z-]+$ ]] || state=not-found
-    printf '%s' "$state"
-}
-
-systemd_unit_active_state() {
-    local state
-    state="$(systemctl is-active "$1" 2>/dev/null || true)"
-    [[ "$state" =~ ^[a-z-]+$ ]] || state=not-found
-    printf '%s' "$state"
-}
-
-systemd_unit_exists() {
-    local unit="$1" state
-    state="$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)"
-    [[ -n "$state" && "$state" != not-found ]] && return 0
-    [[ -e "/etc/systemd/system/$unit" || -L "/etc/systemd/system/$unit" ]]
-}
-
-restore_metrics_unit_state() {
-    local unit="$1" enabled="$2" active="$3" ok=yes
-    case "$enabled" in
-        enabled|enabled-runtime|linked|linked-runtime|alias) systemctl enable "$unit" >/dev/null 2>&1 || ok=no ;;
-        disabled) systemctl disable "$unit" >/dev/null 2>&1 || ok=no ;;
-    esac
-    case "$active" in
-        active|activating|reloading) systemctl start "$unit" >/dev/null 2>&1 || ok=no ;;
-        inactive|failed|deactivating) systemctl stop "$unit" >/dev/null 2>&1 || ok=no ;;
-    esac
-    [[ "$ok" == yes ]]
-}
-
-v10_metrics_migration_report() {
-    local status timer_enabled timer_active service_enabled service_active
-    status="$(legacy_metrics_status)"
-    timer_enabled="$(systemd_unit_enabled_state wp-shell-metrics.timer)"
-    timer_active="$(systemd_unit_active_state wp-shell-metrics.timer)"
-    service_enabled="$(systemd_unit_enabled_state wp-shell-metrics.service)"
-    service_active="$(systemd_unit_active_state wp-shell-metrics.service)"
-    printf 'V10 metrics migration preview (read-only)\n'
-    printf 'Status: %s\n' "$status"
-    printf 'Producer: timer enabled=%s active=%s; service enabled=%s active=%s\n' \
-        "$timer_enabled" "$timer_active" "$service_enabled" "$service_active"
-    printf 'Preserved data: %s and sidecars, cursor/state files, recommendations, logs, and unit files are never deleted.\n' "$LEGACY_METRICS_DB"
-    if [[ "$status" == LEGACY_METRICS_PRESENT ]]; then
-        printf 'Confirmed migration will adopt safe current managed pool limits as manual desired state, then stop/disable only the wp-shell metrics producer.\n'
-    else
-        printf 'No active v10 producer migration is required.\n'
+enforce_v11_fresh_deploy_boundary() {
+    local details
+    v11_development_command_is_read_only "$@" && return 0
+    if details="$(v10_host_footprint_details)"; then
+        details="${details//$'\n'/; }"
+        die "Refusing to modify a host with a detected v10/legacy wp-shell footprint. Evidence: ${details%; }. V11 does not support in-place v10 adoption. No legacy file, service, database, tuning state, or timer was changed. Continue using stable v10 on this host, or deploy v11 on a fresh VPS and migrate WordPress with a reviewed plugin/provider snapshot."
     fi
-}
-
-migrate_v10_metrics() {
-    local confirmation="${1:-}" i domain version current existing
-    local timer_enabled timer_active service_enabled service_active stage record
-    v10_metrics_migration_report
-    [[ "$confirmation" == --confirm ]] || {
-        printf 'No changes were made. Apply with: sudo env WP_SHELL_V11_EXPERIMENTAL=yes wp-shell-v11 migrate v10 --confirm\n'
-        return 0
-    }
-    [[ ! -L "$V10_METRICS_MIGRATION_FILE" ]] || die "Unsafe migration-state symlink; no unit or configuration changes were made."
-    if [[ "$(legacy_metrics_status)" == ABSENT ]]; then
-        log_message SUCCESS "No legacy metrics producer or state was detected; no changes were made."
-        return 0
-    fi
-    if [[ -f "$V10_METRICS_MIGRATION_FILE" ]] &&
-       ! systemctl is-active --quiet wp-shell-metrics.timer 2>/dev/null &&
-       ! systemctl is-active --quiet wp-shell-metrics.service 2>/dev/null &&
-       ! systemctl is-enabled --quiet wp-shell-metrics.timer 2>/dev/null; then
-        log_message SUCCESS "V10 metrics producer migration is already complete; historical data remains preserved and no changes were made."
-        return 0
-    fi
-    CURRENT_STEP="migrate v10 metrics producer to v11 manual capacity"
-    if [[ ! -f "$V10_METRICS_MIGRATION_FILE" ]]; then
-        php_prepare_current_capacity || die "Cannot migrate while current PHP capacity is UNKNOWN: ${PHP_CURRENT_CAPACITY_ERROR:-$PHP_CAPACITY_ERROR}"
-        [[ "$PHP_CAPACITY_STATUS" == SAFE ]] || die "Cannot adopt an overcommitted PHP configuration. Reduce effective pools before migration."
-        for ((i=1; i<=SITE_COUNT; i++)); do
-            domain="${SITE_DOMAINS[$i]}"; version="${SITE_PHP_VERSIONS[$i]}"
-            php_site_pool_ownership_check "$domain" "$version" || die "$PHP_CURRENT_CAPACITY_ERROR"
-            current="$PHP_SITE_POOL_EFFECTIVE"
-            existing="${PHP_CHILD_OVERRIDES[$domain]:-}"
-            [[ -z "$existing" || "$existing" == "$current" ]] ||
-                die "Manual desired state for $domain is $existing but effective managed state is $current; resolve this conflict before migration."
-            PHP_CHILD_OVERRIDES["$domain"]="$current"
-        done
-    fi
-    timer_enabled="$(systemd_unit_enabled_state wp-shell-metrics.timer)"
-    timer_active="$(systemd_unit_active_state wp-shell-metrics.timer)"
-    service_enabled="$(systemd_unit_enabled_state wp-shell-metrics.service)"
-    service_active="$(systemd_unit_active_state wp-shell-metrics.service)"
-    transaction_begin "$CURRENT_STEP"
-    if [[ ! -f "$V10_METRICS_MIGRATION_FILE" ]]; then
-        save_tuning_config
-        stage="$(safe_temp_dir)"; register_temp_path "$stage"; record="$stage/migration.v1"
-        {
-            printf 'version|1\n'
-            printf 'migrated-at|%s\n' "$(date --iso-8601=seconds)"
-            printf 'timer-enabled|%s\n' "$timer_enabled"
-            printf 'timer-active|%s\n' "$timer_active"
-            printf 'service-enabled|%s\n' "$service_enabled"
-            printf 'service-active|%s\n' "$service_active"
-            printf 'legacy-data|preserved\n'
-        } > "$record"
-        write_managed_file "$V10_METRICS_MIGRATION_FILE" 0600 root root < "$record"
-    fi
-    local producer_change_ok=yes
-    if systemd_unit_exists wp-shell-metrics.timer; then
-        systemctl stop wp-shell-metrics.timer 2>/dev/null || producer_change_ok=no
-        systemctl disable wp-shell-metrics.timer >/dev/null 2>&1 || producer_change_ok=no
-    fi
-    if systemd_unit_exists wp-shell-metrics.service; then
-        systemctl stop wp-shell-metrics.service 2>/dev/null || producer_change_ok=no
-    fi
-    if [[ "$producer_change_ok" != yes ]]; then
-        restore_metrics_unit_state wp-shell-metrics.service "$service_enabled" "$service_active" || true
-        restore_metrics_unit_state wp-shell-metrics.timer "$timer_enabled" "$timer_active" || true
-        die "Failed to disable the legacy metrics producer; exact configuration files were rolled back and prior unit states were restored."
-    fi
-    if systemctl is-active --quiet wp-shell-metrics.timer 2>/dev/null ||
-       systemctl is-active --quiet wp-shell-metrics.service 2>/dev/null ||
-       systemctl is-enabled --quiet wp-shell-metrics.timer 2>/dev/null; then
-        restore_metrics_unit_state wp-shell-metrics.service "$service_enabled" "$service_active" || true
-        restore_metrics_unit_state wp-shell-metrics.timer "$timer_enabled" "$timer_active" || true
-        die "Legacy metrics producer verification failed; prior unit states were restored."
-    fi
-    log_message SUCCESS "Legacy metrics producer is inactive. Historical database, logs, cursor/state files, recommendations, and unit files were preserved."
-}
-
-retired_metrics_command() {
-    if [[ "${1:-status}" == collect ]]; then
-        printf 'WARNING: wp-shell-v11 metrics collect is retired; no database, cursor, log, or sample was written. Use: wp-shell-v11 capacity\n'
-        return 0
-    fi
-    die "The historical metrics subsystem is retired in v11. Use 'wp-shell-v11 capacity' and 'wp-shell-v11 migrate v10'."
 }
 
 retired_automatic_command() {
@@ -5525,7 +5398,7 @@ host_audit_line() {
 }
 
 system_audit() {
-    local ssh_config listeners unsafe timer value i domain user_id
+    local ssh_config listeners unsafe timer value i domain user_id v10_footprint
     printf 'wp-shell host audit (read-only; UNKNOWN means not verified)\n\n'
     if ssh_config="$(sshd -T 2>/dev/null)"; then
         value="$(awk '$1=="permitrootlogin" {print $2}' <<< "$ssh_config")"
@@ -5552,10 +5425,11 @@ system_audit() {
         if systemctl is-active --quiet "$timer"; then host_audit_line PASS "$timer" active
         else host_audit_line WARN "$timer" 'inactive or not installed'; fi
     done
-    if [[ "$(legacy_metrics_status)" == LEGACY_METRICS_PRESENT ]]; then
-        host_audit_line WARN Legacy-metrics 'V10 metrics artifacts or producer are present; review: wp-shell-v11 migrate v10'
+    v10_footprint="$(v10_host_footprint_summary)"
+    if [[ "$v10_footprint" == DETECTED* ]]; then
+        host_audit_line WARN V10-boundary "$v10_footprint; v11 mutations are blocked and no in-place migration is offered."
     else
-        host_audit_line INFO Legacy-metrics "$(legacy_metrics_status)"
+        host_audit_line PASS V10-boundary 'No known v10 management footprint detected.'
     fi
     if dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -Fq 'install ok installed'; then
         value="$(apt-config dump | grep -E 'APT::Periodic::Unattended-Upgrade|Unattended-Upgrade::(Allowed-Origins|Origins-Pattern|Automatic-Reboot)' || true)"
@@ -5783,8 +5657,7 @@ control_plane_status() {
     printf 'Timers: backup=%s certificate=%s Cloudflare=%s\n' \
         "$(service_state wp-shell-backup.timer)" \
         "$(service_state certbot.timer)" "$(service_state wp-shell-cloudflare-ips.timer)"
-    printf 'Legacy metrics: %s (producer timer=%s service=%s)\n' \
-        "$(legacy_metrics_status)" "$(service_state wp-shell-metrics.timer)" "$(service_state wp-shell-metrics.service)"
+    printf 'V10 compatibility boundary: %s\n' "$(v10_host_footprint_summary)"
     printf 'Failed units: '
     systemctl --failed --no-legend --plain 2>/dev/null | awk 'END{print NR+0}'
     printf 'Last transaction: %s\n' "$(if [[ -s "$LAST_TRANSACTION_FILE" ]]; then head -n1 "$LAST_TRANSACTION_FILE"; else printf none; fi)"
@@ -6218,9 +6091,9 @@ management_menu() {
     printf '\nwp-shell v%s\n' "$WP_SHELL_VERSION"
     printf 'Environment: installed | Mode: %s | PHP: %s | Sites: %s\n\n' \
         "$ENVIRONMENT_MODE" "$DEFAULT_PHP_VERSION" "$SITE_COUNT"
-    printf '1) Capacity\n2) Set site PHP workers\n3) Add a new website\n4) Website list\n5) Website status\n6) Deploy or repair a website\n7) Back up one website\n8) Back up all websites\n9) Restore a website\n10) Import existing websites\n11) Apply audited configuration baseline\n12) Security scan\n13) Repair backup timer\n14) OPcache settings\n15) Host security and pressure audit\n16) Migrate v10 metrics producer\n17) Advanced operations help\n0) Exit\n'
+    printf '1) Capacity\n2) Set site PHP workers\n3) Add a new website\n4) Website list\n5) Website status\n6) Deploy or repair a website\n7) Back up one website\n8) Back up all websites\n9) Restore a website\n10) Import existing websites\n11) Apply audited configuration baseline\n12) Security scan\n13) Repair backup timer\n14) OPcache settings\n15) Host security and pressure audit\n16) Advanced operations help\n0) Exit\n'
     local choice domain backup_id workers
-    read -r -p "Select [0-17]: " choice
+    read -r -p "Select [0-16]: " choice
     case "$choice" in
         1) php_capacity_status_report ;;
         2)
@@ -6274,8 +6147,7 @@ management_menu() {
         13) install_self; install_backup_timer ;;
         14) opcache_menu ;;
         15) system_audit ;;
-        16) migrate_v10_metrics ;;
-        17) show_help ;;
+        16) show_help ;;
         0) return ;;
         *) die "Invalid selection." ;;
     esac
@@ -6300,8 +6172,8 @@ WP_SHELL_V11_EXPERIMENTAL=yes. A development self-install uses
 /usr/local/sbin/wp-shell-v11 and never replaces /usr/local/sbin/wp-shell.
 
 S1 uses current-state, manual PHP-FPM capacity management. Capacity, audit,
-status, dry-run, migration preview, and the retired metrics compatibility no-op
-bypass the bootstrap safety gate. For every mutating command, add the explicit
+status, dry-run, and retired-command guidance bypass the bootstrap safety gate.
+For every mutating command, add the explicit
 test-only prefix:
   sudo env WP_SHELL_V11_EXPERIMENTAL=yes wp-shell-v11 COMMAND
 
@@ -6328,8 +6200,6 @@ Usage:
   sudo wp-shell-v11 site import                      Discover existing WordPress sites
   sudo wp-shell-v11 site DOMAIN workers N [--confirm]  Preview or transactionally set manual workers
   sudo wp-shell-v11 site DOMAIN|ID ACTION            Run a compatibility site action
-  sudo wp-shell-v11 migrate v10 [--confirm]          Retire producer; preserve historical metrics data
-  sudo wp-shell-v11 metrics collect                  Retired compatibility no-op; never writes
   sudo wp-shell-v11 backup-all                       Back up all sites
   sudo wp-shell-v11 restore DOMAIN|ID BACKUP_ID      Restore one backup
   sudo wp-shell-v11 optimize --confirm               Compatibility alias for the audited baseline apply
@@ -6367,9 +6237,9 @@ Usage:
 
 Site actions: status, info, summary, core-verify, core-repair, cache-clear,
 backup, backups, restore, update --confirm-updates, restart. Historical dashboard,
-report, analyze, automatic tune, and metrics installation are intentionally retired.
-The explicit v10 migration preserves existing metrics databases, cursor/state files,
-logs, recommendations, and systemd unit files as inactive historical data.
+report, analyze, automatic tune, and metrics commands are intentionally retired.
+V11 is fresh-deploy-first. It never migrates, deletes, disables, or adopts v10
+metrics/configuration state in place; detected v10 footprints block all v11 writes.
 EOF
 }
 
@@ -6439,7 +6309,7 @@ execute_command() {
             install_or_repair_environment
             ;;
         capacity) php_capacity_status_report ;;
-        dashboard|report|analyze|tune) retired_automatic_command ;;
+        dashboard|report|analyze|tune|metrics) retired_automatic_command ;;
         audit) control_plane_audit ;;
         apply) apply_control_plane "${2:-}" ;;
         rollback) rollback_command "${2:-}" "${3:-}" ;;
@@ -6447,7 +6317,6 @@ execute_command() {
         opcache) shift; opcache_command "$@" ;;
         mariadb) shift; mariadb_command "$@" ;;
         site) shift; site_command "$@" ;;
-        metrics) retired_metrics_command "${2:-status}" ;;
         list) list_sites ;;
         status) control_plane_status ;;
         add-site) add_site_command ;;
@@ -6464,10 +6333,6 @@ execute_command() {
         cron-run) [[ -n "${2:-}" ]] || die "A managed domain is required."; run_site_cron "$2" ;;
         ops) [[ "${2:-}" == run ]] || die "Use ops run."; run_operations ;;
         install-backup-timer) install_self; install_backup_timer ;;
-        migrate)
-            [[ "${2:-}" == v10 ]] || die "Usage: wp-shell-v11 migrate v10 [--confirm]"
-            migrate_v10_metrics "${3:-}"
-            ;;
         legacy-vps) shift; execute_command "$@" ;;
         legacy-single) shift; legacy_single_command "$@" ;;
         *) die "Unknown command: $command. Use --help for usage." ;;
@@ -6478,7 +6343,6 @@ v11_development_command_is_read_only() {
     case "${1:-}" in
         audit|status|dry-run|capacity|dashboard|report|analyze|tune|metrics) return 0 ;;
         mariadb) [[ "${2:-audit}" == audit ]] ;;
-        migrate) [[ "${2:-}" == v10 && "${3:-}" != --confirm ]] ;;
         *) return 1 ;;
     esac
 }
@@ -6509,6 +6373,7 @@ main() {
     ensure_root "$@"
     check_platform
     require_command base64
+    enforce_v11_fresh_deploy_boundary "$@"
     case "${1:-}" in
         audit|status|dry-run|capacity|dashboard|report|analyze|tune|metrics)
             # These control-plane commands are contractually read-only.  In
@@ -6524,25 +6389,6 @@ main() {
             if [[ "${2:-audit}" == audit ]]; then
                 # MariaDB audit is contractually read-only and must not create
                 # wp-shell state or migrate unrelated legacy configuration.
-                load_sites_config
-                load_environment_config
-                load_tuning_config
-                load_opcache_config
-                execute_command "$@"
-            else
-                init_runtime
-                TRANSACTION_CONTEXT=yes
-                migrate_legacy_configs
-                load_sites_config
-                ensure_environment_config
-                load_tuning_config
-                load_opcache_config
-                execute_command "$@"
-                transaction_commit
-            fi
-            ;;
-        migrate)
-            if [[ "${2:-}" == v10 && "${3:-}" != --confirm ]]; then
                 load_sites_config
                 load_environment_config
                 load_tuning_config

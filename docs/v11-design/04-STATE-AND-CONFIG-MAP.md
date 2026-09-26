@@ -82,16 +82,16 @@ Transaction history is unbounded by design in 10.0.4. S0 does not introduce auto
 
 | Path/class | Owning feature | Core? | Historical/derived? | v11 need | Migration | Eventual removal |
 |---|---|---:|---:|---|---|---|
-| `metrics.sqlite3` | historical monitoring/tuner/dashboard | no | historical | no | stop writer explicitly; retain DB | manual after desired export/retention |
-| `metrics.sqlite3-wal` | SQLite WAL sidecar | no | derived | no | checkpoint/stop writer before migration; do not delete blindly | manual with DB after service stopped |
-| `metrics.sqlite3-shm` | SQLite shared-memory sidecar | no | derived | no | same as WAL | manual |
-| `cpu.state` | collector delta cursor | no | derived | no | preserve after timer disabled | manual |
-| `pressure.state` | collector CPU delta cursor | no | derived | no | preserve after timer disabled | manual |
-| `nginx-<hash>.offset` | per-site log cursor | no | derived | no | preserve after timer disabled | manual |
-| `size-<hash>.state` | cached directory-size reading | no | derived | no | preserve after timer disabled | manual |
-| `collector.lock` | collector flock inode | no | derived | no | harmless after stop; preserve | manual |
-| `last-recommendations.tsv` | analysis output | no | derived | no | preserve as historical operator evidence only | manual |
-| `pending-tuning-recommendations.tsv` | tuner confirmation plan | no | derived | no | invalidate with warning; never apply in v11 | manual |
+| `metrics.sqlite3` | historical monitoring/tuner/dashboard | no | historical | no | V11 detects the known footprint and blocks writes; it never reads, stops or deletes it | stable v10/administrator only |
+| `metrics.sqlite3-wal` | SQLite WAL sidecar | no | derived | no | V11 leaves it untouched | stable v10/administrator only |
+| `metrics.sqlite3-shm` | SQLite shared-memory sidecar | no | derived | no | V11 leaves it untouched | stable v10/administrator only |
+| `cpu.state` | collector delta cursor | no | derived | no | V11 leaves it untouched | stable v10/administrator only |
+| `pressure.state` | collector CPU delta cursor | no | derived | no | V11 leaves it untouched | stable v10/administrator only |
+| `nginx-<hash>.offset` | per-site log cursor | no | derived | no | V11 leaves it untouched | stable v10/administrator only |
+| `size-<hash>.state` | cached directory-size reading | no | derived | no | V11 leaves it untouched | stable v10/administrator only |
+| `collector.lock` | collector flock inode | no | derived | no | V11 leaves it untouched | stable v10/administrator only |
+| `last-recommendations.tsv` | analysis output | no | derived | no | V11 never imports or applies it | stable v10/administrator only |
+| `pending-tuning-recommendations.tsv` | tuner confirmation plan | no | derived | no | V11 never imports or applies it | stable v10/administrator only |
 | `cron-<pool>.lock` | old internal cron route lock | no for current Cron file | derived | no | current Cron uses site-root lock; preserve | manual |
 | `cron-<pool>.success` | old internal Cron success timestamp | no | derived | no | site status stops depending on it | manual |
 | `operations.lock` | page-cache event worker | no | derived | no | stop operations timer first | manual |

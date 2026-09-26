@@ -14,7 +14,13 @@ The v11 CLI should be predictable enough for both an SSH operator and automation
 
 ## Global behavior
 
-During development these contracts are exercised through `./wp-shell-v11.sh`; they do not change the stable root `wp-shell.sh` or public `/usr/local/sbin/wp-shell`. Mutating development execution requires an explicit experimental opt-in and is limited to disposable/test systems. S1 implements `capacity`, manual per-site workers, and the narrow v10 metrics-producer migration; later-stage command descriptions remain design contracts rather than current GA routing.
+During development these contracts are exercised through `./wp-shell-v11.sh`;
+they do not change the stable root `wp-shell.sh` or public
+`/usr/local/sbin/wp-shell`. Mutating development execution requires an explicit
+experimental opt-in and is limited to disposable/test systems. S1 implements
+`capacity`, manual per-site workers, and a read-only fresh-deploy guard; it has
+no v10 in-place migration. Later-stage command descriptions remain design
+contracts rather than current GA routing.
 
 ### Read-only commands
 
@@ -198,26 +204,17 @@ Restores only files/symlinks recorded by the managed-configuration transaction a
 
 Rollback is not a WordPress content/database restore and must never be described as one.
 
-### Explicit v10 migration
+### Fresh-deploy compatibility boundary
 
-```text
-wp-shell migrate v10
-wp-shell migrate v10 --confirm
-```
+V11 has no `migrate v10` command. Read-only `status` and `audit` report a
+detected stable v10 entry point/configuration or known metrics artifacts. Every
+mutating command then fails before runtime initialization with guidance to keep
+using stable v10 or deploy V11 on a fresh VPS and move WordPress with a reviewed
+plugin/provider snapshot.
 
-Without confirmation, report only:
-
-- schemas and wrappers detected;
-- deprecated units active;
-- metrics database/cursors;
-- automatic tuning state;
-- Page Cache Lite state, legacy automatic invalidation, custom cache exclusions and object-cache policies;
-- private Redis instances;
-- remote backup policies and timer;
-- staging/custom Nginx state;
-- exact actions that require confirmation or manual replacement.
-
-Confirmed migration performs only approved, reversible ownership changes. It does not delete historical data, unit files, Nginx custom configuration, remote data, Redis instances, or administrator files. Compatible generic page-cache state is adopted by Page Cache Lite; custom/plugin-specific rules remain preserved compatibility state. Remote backups and other unresolved external ownership remain blockers rather than being silently stopped.
+The boundary never stops units, adopts tuning values, deletes historical data,
+or creates a migration record. Removing legacy evidence merely to bypass the
+guard is unsupported.
 
 ## Site commands
 

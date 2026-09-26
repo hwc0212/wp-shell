@@ -146,8 +146,8 @@ Remote transfer is not part of the integrity chain. It is a separate retention t
 | Automatic tuner | SQLite history, recommendations, `tuning.v1`, current pools | Pool edits, recommendation files | Shares the hard admission path; deletion must not delete admission or manual desired state | Remove automation; keep manual worker state and admission |
 | Advanced OPcache management | PHP INI, FPM status/CGI probes, metrics | Generated override, status and tuning commands | Capacity needs effective per-version reserve, not a mutation UI | Remove UI/mutation; retain conservative baseline and read-only accounting |
 | Private Redis | site policy, credentials, sockets, systemd template instances | Per-site configs, secrets, services and metrics | WordPress object-cache state and existing plugin config can depend on it | No new instances; preserve existing state until explicit external migration |
-| FastCGI Page Cache Lite | explicit per-site state, WordPress/WooCommerce property, Nginx template | per-site cache directory and deterministic bypass rules | FastCGI transport and optional simple page caching remain useful Core behavior | Keep default-off on/off/status/manual-clear; no plugin discovery, MU plugin, timer, metrics or tuning |
-| Legacy cache orchestration | MU plugin, arbitrary exclusions and plugin-aware route/cookie policy | invalidation events and operations timer | Existing public behavior/custom rules must not disappear during upgrade | Remove producer only through explicit migration; preserve administrator rules |
+| FastCGI Page Cache Lite | explicit per-site state, WordPress/WooCommerce property, Nginx template, `nginx-helper` during initial provisioning | per-site cache directory and deterministic bypass rules | FastCGI transport and optional simple page caching remain useful Core behavior | Keep default-off on/off/status/manual-clear; V11-C uses the selected plugin's supported interface, with no custom MU plugin, later plugin discovery, timer, metrics or tuning |
+| Redis Object Cache integration | shared local Redis, per-site prefix/database, `redis-cache` during initial provisioning | plugin-managed object-cache drop-in and per-site constants | Object caching remains useful without wp-shell owning the later plugin ecosystem | V11-C provisions/verifies once through supported WP-CLI/config; no replacement or future scanning |
 | Cloudflare | official CIDRs and optional updater | trusted real-IP include and two units | Login limits/logs need the real visitor IP | Keep only verified real-IP trust; no API/DNS/APO/cache ownership |
 | Remote backup | local verified backup, encryption policy, rclone | encrypted remote objects, timer/log state | It may be the operator's only off-host recovery copy | Externalize only after explicit replacement/acknowledgement |
 | Staging | production site state, path/database transformations | cloned files/database/Nginx/site policy | Plugin behavior, mail and Cron assumptions are application-specific | Remove/externalize; preserve detected existing routes |
@@ -166,7 +166,10 @@ Removing a CLI verb is not sufficient when any of these still exist:
 - a SQLite database, recommendation file, or cursor that may be needed for audit/rollback evidence;
 - a compatibility wrapper or automation using the old command form.
 
-The v10 migration preflight must enumerate these edges. Confirmed migration may stop or disable a retired producer, but it preserves files/data and records the previous enablement state for rollback.
+V11 does not resolve these edges through in-place migration. A known V10 host is
+rejected before mutation and stays on stable V10; V11 is installed on a fresh
+host. Later stages remove only V11 creation paths and must not add code that
+stops or deletes V10-owned producers/data.
 
 ## Package and runtime dependencies
 
@@ -204,11 +207,14 @@ No new daemon, database, language, package repository, or public port is justifi
 ## Safe edge-cutting order
 
 1. Replace historical PSS consumption with conservative current-state capacity evidence.
-2. Stop producing metrics/recommendations through an explicit, reversible migration; retain data.
-3. Delete dashboard/analyzer/tuner code and their packages after no Core call edge remains.
-4. Add compatibility discovery for cache-auto/custom cache rules, private Redis, remote backup and staging before disabling any producer.
-5. Replace new cache orchestration with default-off Page Cache Lite while preserving effective legacy/custom behavior; remove new-configuration paths for the other optional clusters.
-6. Migrate or externalize each installed optional feature independently; only then delete its compatibility renderer/handler.
-7. Implement conservative restore as its own later change, independent of the feature-removal work.
+2. Delete the metrics producer/schema, dashboard/analyzer/tuner and successful
+   collector compatibility routes from V11; do not migrate or stop V10 state.
+3. Add a small pre-runtime fresh-deploy guard that detects known V10 footprints,
+   blocks V11 writes and leaves every legacy artifact untouched.
+4. In V11-C, provision `nginx-helper` and `redis-cache` through supported
+   interfaces only during initial site creation; do not build a custom MU
+   plugin/framework or later plugin scanner.
+5. Remove other out-of-scope operations in their separately reviewed stages;
+   existing V10 hosts remain on stable V10 rather than being adopted in place.
 
 At every step, a successful Core apply must remain unable to alter an out-of-scope administrator or compatibility-owned file.

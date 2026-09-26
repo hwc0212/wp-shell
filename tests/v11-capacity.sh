@@ -59,7 +59,6 @@ read_effective_site_pool_limit() {
 }
 read_managed_site_pool_limit() { read_effective_site_pool_limit "$1"; }
 redis_effective_maxmemory_summary() { printf '96MB'; }
-legacy_metrics_status() { printf ABSENT; }
 
 set_sites
 write_meminfo 2048 0 0
