@@ -1,4 +1,4 @@
-# 03 - Proposed v11 CLI Contract
+# 03 - v11 CLI Contract
 
 ## Goals
 
@@ -14,11 +14,17 @@ The v11 CLI should be predictable enough for both an SSH operator and automation
 
 ## Global behavior
 
-During development these contracts are exercised through `./wp-shell-v11.sh`; they do not change the stable root `wp-shell.sh` or public `/usr/local/sbin/wp-shell`. Mutating development execution requires an explicit experimental opt-in and is limited to disposable/test systems. The production command spelling below describes the eventual v11 interface, not current GA routing.
+During development these contracts are exercised through `./wp-shell-v11.sh`;
+they do not change the stable root `wp-shell.sh` or public
+`/usr/local/sbin/wp-shell`. Mutating development execution requires an explicit
+experimental opt-in and is limited to disposable/test systems. S1 implements
+`capacity`, manual per-site workers, and a read-only fresh-deploy guard; it has
+no v10 in-place migration. Later-stage command descriptions remain design
+contracts rather than current GA routing.
 
 ### Read-only commands
 
-The following must not call `init_paths()`, `migrate_legacy_configs()`, `install_self()`, package management, service reload/restart, or a mutating WP-CLI wrapper:
+The following must not call `init_paths()`, `install_self()`, package management, service reload/restart, or a mutating WP-CLI wrapper. V11 has no legacy-config migration call:
 
 ```text
 wp-shell --help
@@ -198,26 +204,17 @@ Restores only files/symlinks recorded by the managed-configuration transaction a
 
 Rollback is not a WordPress content/database restore and must never be described as one.
 
-### Explicit v10 migration
+### Fresh-deploy compatibility boundary
 
-```text
-wp-shell migrate v10
-wp-shell migrate v10 --confirm
-```
+V11 has no `migrate v10` command. Read-only `status` and `audit` report a
+detected stable v10 entry point/configuration or known metrics artifacts. Every
+mutating command then fails before runtime initialization with guidance to keep
+using stable v10 or deploy V11 on a fresh VPS and move WordPress with a reviewed
+plugin/provider snapshot.
 
-Without confirmation, report only:
-
-- schemas and wrappers detected;
-- deprecated units active;
-- metrics database/cursors;
-- automatic tuning state;
-- Page Cache Lite state, legacy automatic invalidation, custom cache exclusions and object-cache policies;
-- private Redis instances;
-- remote backup policies and timer;
-- staging/custom Nginx state;
-- exact actions that require confirmation or manual replacement.
-
-Confirmed migration performs only approved, reversible ownership changes. It does not delete historical data, unit files, Nginx custom configuration, remote data, Redis instances, or administrator files. Compatible generic page-cache state is adopted by Page Cache Lite; custom/plugin-specific rules remain preserved compatibility state. Remote backups and other unresolved external ownership remain blockers rather than being silently stopped.
+The boundary never stops units, adopts tuning values, deletes historical data,
+or creates a migration record. Removing legacy evidence merely to bypass the
+guard is unsupported.
 
 ## Site commands
 
@@ -256,7 +253,7 @@ Interactive inputs remain limited to infrastructure/lifecycle facts:
 
 Do not ask about page cache, object-cache plugin, CDN, staging, HSTS, or theme/plugin behavior during site creation. Page Cache Lite remains a separate explicit post-deployment action and defaults off.
 
-The new site is first built in memory with one ondemand worker. Global capacity admission runs before `sites.v3`, database credentials, site policy, user, package, service, Nginx, certificate, or WordPress writes.
+The new site is first built in memory and receives only the deterministic initial sizing policy: normal WordPress targets 2 ondemand workers and an explicitly selected WooCommerce site targets 3. Automatic site workers are capped at two slots per CPU, with one worker per site as the minimum, and the existing hard RAM admission may reduce the target or refuse the host. Swap is never capacity. Global admission runs before `sites.v3`, database credentials, site policy, user, package, service, Nginx, certificate, or WordPress writes.
 
 ### Import
 
@@ -311,9 +308,9 @@ With confirmation:
 8. Use the managed-file transaction, reload only the affected PHP version, then re-read the effective value.
 9. Roll back pool and desired state if validation/reload/effective verification fails.
 
-There is no automatic recommendation, WooCommerce weighting, silent clamping, or redistribution of other sites.
+The command performs no automatic recommendation, silent clamping, or redistribution of other sites. The normal/WooCommerce distinction applies only to first-deployment sizing; confirmed manual values remain exact operator intent.
 
-If a legacy host is already overcommitted across multiple sites, a single-site command may be unable to produce a safe final aggregate. S1 must decide between an explicit atomic multi-site form or a confirmed `apply` plan that sets all unpinned sites to one; it must not allow a sequence of successful-but-still-unsafe pool writes.
+If a legacy host is already overcommitted across multiple sites, a single-site change succeeds only when that one transaction produces a safe final aggregate. S1 does not add an atomic multi-site setter and does not permit a sequence of successful-but-still-unsafe writes. The operator must first reduce the requested scope outside wp-shell under an independently reviewed recovery plan, reduce site count, move sites, or add physical RAM.
 
 ### Core verify and repair
 
@@ -420,7 +417,7 @@ The namespace means real-IP compatibility only. Help must explicitly say it does
 
 ## Compatibility aliases
 
-Keep for v11 with a warning and canonical replacement:
+Retain only these V11 aliases with a warning and canonical replacement:
 
 | Alias | Canonical replacement |
 |---|---|
@@ -431,7 +428,9 @@ Keep for v11 with a warning and canonical replacement:
 | `optimize --confirm` | `apply --confirm` |
 | `security-scan` | `audit --strict` |
 | `backup drill ...` | `backup verify ... --deep` |
-| `wp-vps-manager.sh` | `wp-shell` through `legacy-vps` |
-| `deploy-single-wordpress.sh` / `wp-single-manager` | unambiguous `site` command through `legacy-single` |
+
+Stable V10 wrappers remain part of the stable distribution, but V11 exposes no
+`legacy-vps`, `legacy-single`, or basename-triggered adoption route. A detected
+`/etc/wp-vps-manager` or `/etc/wp-single-deploy` tree blocks V11 writes.
 
 Removed monitoring/cache/staging/update commands should not pretend success. They print a concise deprecation/removal message, state whether legacy configuration is still active, and point to migration/standard-tool guidance.

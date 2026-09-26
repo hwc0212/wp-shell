@@ -25,7 +25,7 @@ S1-S6 feature branches target `v11`, never `main`. Until v11 GA, the root `wp-sh
 
 ## S0 - Design and frozen baseline
 
-Status: this documentation-only proposal.
+Status: completed on the reviewed `v11` base.
 
 Scope:
 
@@ -53,15 +53,18 @@ Exit gate:
 
 Primary result: delete the largest self-contained complexity cluster while preserving the PHP hard-safety invariant.
 
+Status: implemented for review on `codex/v11-s1-manual-capacity`; not merged and not production GA. The implementation details and measured reduction are recorded in `10-S1-MANUAL-CAPACITY-IMPLEMENTATION.md`.
+
 ### Add before deleting
 
 - current-state `capacity` output;
 - explicit `site DOMAIN workers N --confirm` using `/etc/wp-shell/tuning.v1` as manual desired state;
 - conservative current managed-pool PSS estimator that may only raise the baseline;
 - effective OPcache accounting per active PHP version;
-- read-only v10 migration preflight for metrics/tuner state;
-- confirmed, reversible disablement of metrics producer with unit-state recording;
-- non-mutating compatibility route for retired scheduled entry points during the compatibility window;
+- read-only detection of known V10 management/metrics footprints;
+- pre-runtime refusal of every V11 mutation on a detected V10 host;
+- explicit guidance to keep stable V10 or use a fresh VPS; no unit-state
+  adoption, producer disablement or successful retired timer handler;
 - direct `status` output replacing only essential current-state dashboard facts.
 
 ### Remove
@@ -158,7 +161,8 @@ Scope:
 - implement the noun-based CLI contract in `03-CLI-CONTRACT.md`;
 - reduce interactive menu to Core lifecycle/backup/audit/capacity actions;
 - retain numeric site selectors and legacy wrappers as one-major compatibility paths;
-- repurpose the former no-op migration command as explicit `migrate v10` preflight/confirmation;
+- keep V11 fresh-deploy-first: no `migrate v10` command or metrics producer
+  compatibility handler; known V10 footprints block writes before runtime;
 - separate read-only loading from path initialization and migration;
 - stop writing removed derived state on clean installs;
 - preserve unknown fields and inactive historical data;
@@ -173,7 +177,7 @@ Tests/gates:
 - read-only commands produce no filesystem/service mutations;
 - wrapper forwarding and argument fidelity;
 - corrupt/unknown state fail-closed behavior;
-- v10 migration and rollback idempotency;
+- fresh-deploy boundary is read-only/idempotent and never mutates V10 state;
 - no change to site routing, effective pools or backups from CLI translation alone.
 
 ## S4 - Conservative restore transaction

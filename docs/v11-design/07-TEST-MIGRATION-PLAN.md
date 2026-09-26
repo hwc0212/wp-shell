@@ -61,7 +61,11 @@ S1 removes metrics/dashboard/automatic tuning. Before that deletion lands, tests
 
 ### Manual workers and hard admission
 
-- A new low-traffic site may receive one ondemand worker.
+- Initial sizing targets 2 ondemand workers for normal WordPress and 3 for an
+  explicit WooCommerce site, but CPU and hard RAM admission may reduce a site
+  to one worker or refuse an unsafe host.
+- 1/2/4/8/16GB matrices prove normal, WooCommerce and mixed-site defaults,
+  the CPU ceiling, non-use of Swap and the aggregate memory invariant.
 - Aggregate manual overrides are validated together, including values that are individually valid but collectively exceed budget.
 - Imported sites run admission before `sites.v3`, credentials, policy, users, pools, Nginx or service writes.
 - `site DOMAIN workers N --confirm` fails before pool writes/reload when unsafe.
@@ -75,14 +79,20 @@ S1 removes metrics/dashboard/automatic tuning. Before that deletion lands, tests
 - Missing pressure files are reported as unknown/conservative, not converted to zero pressure.
 - A shrink can remain admissible when expansion is vetoed, provided effective state and transaction safety are known.
 
-### Retired feature migration
+### Fresh-deploy boundary and retired features
 
-- Unconfirmed `migrate v10` is read-only.
-- Confirmed migration disables the exact metrics producer, retains the SQLite database/logs/units, and records previous unit state.
-- Retired timer entry-point compatibility writes no samples and does not claim success data.
-- Dashboard/analyze/tuner commands return explicit deprecation output without state mutation.
-- Existing `/etc/wp-shell/tuning.v1` values remain the manual desired state.
-- Migration is idempotent and rollback restores exact prior unit state.
+- Stable v10 entry point plus managed configuration is detected without
+  executing the old script or reading secret contents.
+- Known metrics database/unit artifacts also trigger the boundary.
+- Read-only status/audit/capacity remain available and produce no state.
+- Every mutating V11 command is rejected before log, path or transaction
+  creation on a detected V10 host.
+- Historical/admin artifacts remain byte-identical; no service is stopped or
+  disabled and no tuning value is adopted.
+- `migrate v10`, migration records and successful `metrics collect`
+  compatibility behavior do not exist.
+- Dashboard/analyze/tuner/metrics commands return explicit retired guidance
+  without state mutation.
 
 ## Restore test migration
 

@@ -36,7 +36,12 @@ wp-shell-v11.sh              experimental v11 artifact, not production GA
 
 v11 is derived from the proven v10 source rather than rewritten. It is invoked as `./wp-shell-v11.sh` on disposable/test systems and, if explicitly installed for development, uses `/usr/local/sbin/wp-shell-v11`. It must not replace `/usr/local/sbin/wp-shell`, redirect the root script, change existing raw-main URLs, or publish a v11 Release before GA.
 
-The two versions do not create parallel configuration control planes by default. `/etc/wp-shell`, `/var/lib/wp-shell`, systemd units, Nginx/PHP/MariaDB/Redis files and site backup roots can still collide if the experimental script is deliberately run mutating commands on a v10 host. The bootstrap therefore requires an explicit development mutation opt-in and prominently limits use to disposable/test systems; a later migration design must own production transition.
+The two versions do not create parallel configuration control planes by
+default. In addition to the experimental mutation opt-in, V11-A now detects
+known V10 footprints before runtime initialization and blocks every V11 write.
+There is no in-place production transition: existing hosts stay on stable V10;
+V11 is deployed on a fresh VPS and WordPress is moved with a reviewed
+plugin/provider snapshot.
 
 ## Decision
 
@@ -70,13 +75,20 @@ The proposed Core contains:
 3. Automatic PHP tuning, historical recommendation files, sample gates, and automatic expansion logic.
 4. OPcache tuning UI and mutation workflow; capacity retains only effective OPcache accounting and a conservative install baseline.
 5. Per-site private Redis services, sockets, credentials, migration workflow, and private Redis metrics.
-6. FastCGI cache orchestration: automatic invalidation MU plugin, cache event timer, arbitrary route-exclusion CLI, plugin/theme intelligence, historical cache metrics, and automatic cache tuning. The small Page Cache Lite capability remains Core.
+6. Custom FastCGI/Redis cache orchestration: no wp-shell MU plugin, cache event
+   timer, arbitrary plugin/theme intelligence, historical cache metrics or
+   automatic cache tuning. V11-C will provision WordPress.org `nginx-helper`
+   and `redis-cache` through their supported interfaces during initial site
+   creation only; infrastructure, simple status/clear and Page Cache Lite remain
+   Core.
 7. Staging orchestration and Action Scheduler-specific inspection.
 8. Remote encrypted backup orchestration; standard external tools should own off-host retention.
 9. WordPress core/plugin/theme bulk-update orchestration.
 10. AIDE, Postfix, and unattended-upgrades management commands; these are standard host-administration concerns and should be documented, not reimplemented as wp-shell product features.
 
-Existing v10 configuration must not be deleted or silently neutralized. Some removed features need one-major-version compatibility readers or an explicit migration gate.
+Existing v10 configuration must not be deleted or silently neutralized. Known
+v10 footprints block V11 writes; V11 does not carry an in-place migration state
+machine or background-command compatibility success paths.
 
 ## Safety features that remain non-negotiable
 
@@ -121,15 +133,17 @@ Use the conservative design, not the persistent Phase 2C state machine:
 
 This is intentionally not Shell-level ACID across the filesystem and MariaDB. It removes the most dangerous behavior in 10.0.4—partial restore without an actionable recovery pointer—without adding the 600-plus runtime lines and multi-state recovery surface of the proposed Phase 2C branch.
 
-## Migration principles
+## Fresh-deploy principles
 
-- Treat 10.0.4 as the frozen/LTS behavioral reference.
-- Require a read-only v10 preflight before v11 makes managed changes.
-- Never delete optional v10 files, units, databases, policies, private Redis instances, remote backup settings, or custom Nginx includes automatically.
-- Preserve current site routing and cache behavior during the transition. Existing generic v10 page-cache state can be adopted by Page Cache Lite; custom/plugin-specific exclusions remain administrator-owned and are never discarded.
-- Disable a retired background task only in an explicit confirmed migration, and leave its unit/config/data for manual retention or later removal.
-- Block upgrade completion when removing behavior would silently stop off-host backups or alter public page-cache semantics.
-- Keep both compatibility wrappers for v11, emit deprecation warnings, and remove them no earlier than v12.
+- Treat 10.0.4 as the frozen/LTS behavioral reference for existing hosts.
+- Detect high-confidence V10 footprints read-only before any V11 mutation.
+- Fail closed and recommend a fresh VPS instead of adopting V10 configuration,
+  workers, timers or historical state.
+- Never delete, stop, disable or rewrite V10 files, units, databases, policies,
+  private Redis instances, backup settings or custom Nginx includes.
+- Do not provide a successful compatibility handler that makes an old metrics
+  timer appear healthy.
+- Keep the stable V10 executable and the experimental V11 executable separate.
 
 ## Estimated outcome
 
@@ -139,11 +153,19 @@ After S1-S5, the realistic target is approximately 4,200-4,800 lines and 205-245
 - historical SQLite tables: six to zero;
 - normal operator command forms: from 60 documented forms to roughly 18 Core forms plus a small compatibility/advanced surface;
 - mutable derived state: metrics DB/cursors/recommendations removed;
-- hidden automation: automatic tuning, cache event processing, remote upload, staging mutation, and bulk WordPress updates removed. Page Cache Lite has no background invalidation process.
+- hidden automation: automatic tuning, custom cache event daemons, remote
+  upload, staging mutation, and bulk WordPress updates removed. Later V11-C
+  invalidation uses supported `nginx-helper` WordPress hooks, not a wp-shell
+  daemon or framework.
 
 ## Recommended S1
 
-S1 should remove historical monitoring, dashboard, and automatic tuner only. It must also add the manual `capacity` and worker-setting contracts before removing metrics, preserve `/etc/wp-shell/tuning.v1` as manual state, explicitly migrate/disable the metrics timer without deleting units or data, and retain every existing PHP admission/effective-FPM/import/transaction regression that does not depend on historical monitoring.
+S1 removes historical monitoring, dashboard, and automatic tuner only. It also
+adds the manual `capacity` and worker-setting contracts, preserves
+`/etc/wp-shell/tuning.v1` as fresh-V11 manual state, removes the v10 metrics
+migration/compatibility state machine, and blocks known V10 hosts before any V11
+write. Existing PHP admission/effective-FPM/import/transaction regressions that
+do not depend on historical monitoring remain.
 
 S1 must not change restore, private Redis, page cache, staging, remote backup, Cloudflare trust, README structure, or source packaging. Those decisions belong to later independent PRs.
 
@@ -154,7 +176,7 @@ S1 must not change restore, private Redis, page cache, staging, remote backup, C
 - `03-CLI-CONTRACT.md`: proposed Core CLI and behavior.
 - `04-STATE-AND-CONFIG-MAP.md`: all `/etc/wp-shell` and `/var/lib/wp-shell` state classes.
 - `05-DEPENDENCY-MAP.md`: feature/data/service coupling.
-- `06-V10-V11-MIGRATION.md`: preservation and explicit migration rules.
+- `06-V10-V11-MIGRATION.md`: fresh-deploy detection and no in-place migration boundary.
 - `07-TEST-MIGRATION-PLAN.md`: test-by-test disposition.
 - `08-IMPLEMENTATION-ROADMAP.md`: small PR sequence S1-S6.
 - `09-SIMPLIFICATION-SCORECARD.md`: measured baseline and target estimates.

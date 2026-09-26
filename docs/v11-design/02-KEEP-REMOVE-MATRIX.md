@@ -5,10 +5,14 @@
 - **KEEP**: remains a supported v11 Core behavior.
 - **MERGE**: behavior remains, but moves into a smaller Core command or becomes an internal step.
 - **DEPRECATE**: retained temporarily for deployed v10 compatibility, warns, and has a documented removal release.
-- **REMOVE**: implementation and entry point leave v11 after an explicit migration handles live state.
+- **REMOVE**: implementation and entry point leave v11. Existing v10 hosts stay
+  on stable v10; V11 does not migrate or delete their state in place.
 - **EXTERNALIZE**: another standard tool or the application/plugin owner should provide the behavior; wp-shell documents the boundary and does not configure it for new sites.
 
-Classification is about product ownership, not immediate deletion. Any row with existing on-host state must follow `06-V10-V11-MIGRATION.md`.
+Classification is about product ownership, not permission to mutate an existing
+host. Issue #9 is authoritative. V11 is fresh-deploy-first and the detection
+boundary in `06-V10-V11-MIGRATION.md` blocks known v10 hosts instead of adopting
+their state.
 
 ## Feature-level decision matrix
 
@@ -22,22 +26,22 @@ Classification is about product ownership, not immediate deletion. Any row with 
 | Imported-site discovery/admission | KEEP | Core lifecycle behavior with important no-partial-persist guarantees. | Read v3 and legacy state; do not infer plugin settings. |
 | Effective PHP-FPM semantic validation | KEEP | Required to prove pool limits after include precedence. | Preserve fail-closed `php-fpm -tt` checks. |
 | Hard aggregate PHP memory admission | KEEP | Host survival requirement. | Preserve Swap-not-RAM and aggregate override checks. |
-| Automatic weighted slot distribution | REMOVE | It is an automatic optimizer. New sites start at one ondemand worker; operators make explicit changes. | Preserve current effective limits as desired/manual limits during migration. |
-| Historical PSS estimator | MERGE | Replace DB history with baseline plus current PSS that can only raise the estimate. | Existing metrics may be read during migration but are not required after it. |
-| SQLite metrics collector/history | REMOVE | Monitoring database is outside installer/basic-ops scope. | Explicitly disable timer; retain units/database until manual cleanup. |
+| Unbounded weighted slot distribution | REMOVE | V11 uses only a small deterministic install baseline: normal sites target 2 workers, explicit WooCommerce sites target 3, and automatic site concurrency is capped by CPU plus the hard RAM admission. It never fills all safe slots. Later changes are manual. | Stable v10 remains responsible for the existing host; V11 does not adopt limits in place. |
+| Historical PSS estimator | MERGE | Replace DB history with baseline plus current PSS that can only raise the estimate. | Existing metrics are not read or imported by V11. |
+| SQLite metrics collector/history | REMOVE | Monitoring database is outside installer/basic-ops scope. | V11 does not stop/delete the producer or data; a known v10 footprint blocks V11 writes. |
 | Terminal dashboard | REMOVE | Depends entirely on historical metrics and embedded curses UI. | Command warns with replacement `status/audit/capacity` during compatibility period. |
 | Historical report/analyze | REMOVE | Monitoring/reporting product surface. | No data deletion; document standard OS/monitoring alternatives. |
 | Automatic PHP tuner | REMOVE | Hidden policy decisions and cross-coupling exceed Core value. | Reinterpret `tuning.v1` as manual worker state; do not discard limits. |
-| Manual PHP workers | KEEP | Explicit operator intent with host-wide admission is a Core capacity need. | Adopt effective v10 limits; never silently clamp or increase. |
+| Manual PHP workers | KEEP | Explicit operator intent with host-wide admission is a Core capacity need. | Fresh V11 state only; never import or rewrite v10 limits in place. |
 | OPcache conservative baseline | KEEP | PHP requires a sensible install default and capacity must reserve effective OPcache. | Preserve administrator and v10 managed values. |
 | OPcache runtime dashboard/set workflow | DEPRECATE then EXTERNALIZE | Dedicated tuning UI is outside Core. `capacity` reports effective memory only. | Keep compatibility reader; do not remove INI/state or reload FPM automatically. |
 | Shared loopback Redis service | KEEP | Small common host baseline; WordPress integration remains opt-in. | Preserve auth and existing DB assignments. |
-| Redis Object Cache plugin automation | EXTERNALIZE | Plugin install/drop-in/config semantics belong to the plugin/operator. | Preserve existing enabled sites and constants; no automatic disable. |
+| Redis Object Cache provisioning | KEEP in V11-C | Install/configure `redis-cache` only during initial site provisioning through its supported WP-CLI/config interface; afterward wp-shell does not manage the plugin ecosystem. | No in-place adoption in V11-A. |
 | Private per-site Redis | DEPRECATE then EXTERNALIZE | Per-site services, secrets, sockets and budgets create a mini service orchestrator. | Keep existing services untouched until explicit site migration is reviewed. |
 | Redis secret rotation | KEEP temporarily | Still needed to recover safely from a leaked shared v10 credential. | Continue redacted, rollback-capable rotation while v10 shared-auth deployments exist. |
 | FastCGI transport | KEEP | Required PHP request path. Retain per-site Unix-socket `fastcgi_pass`, required parameters, compatible timeouts/buffers, and effective FPM/FastCGI validation. | Preserve `try_files`, socket routing and validated transport semantics. |
 | FastCGI Page Cache Lite | KEEP optional | Default off; explicit per-site on/off/manual clear; one conservative WordPress bypass set plus WooCommerce rules only for sites explicitly marked WooCommerce. No plugin discovery or cache tuning. | Reuse compatible v10 `page-cache` state; preserve custom exclusions outside Lite ownership. |
-| Cache invalidation MU plugin/timer | REMOVE | Application event intelligence and hidden background work. | Explicit migration disables timer/plugin only with confirmation; keep files/data otherwise. |
+| FastCGI invalidation plugin | KEEP in V11-C | Provision `nginx-helper` only during initial site creation and use its supported purge/config interfaces; no custom MU plugin/framework or later plugin scanning. | No in-place adoption in V11-A. |
 | Manual page-cache clear | KEEP | A Lite cache without automatic invalidation needs an explicit bounded clear operation. | Clear only the selected site's owned FastCGI cache root after path validation. |
 | Arbitrary cache exclusions and object/OPcache clear orchestration | EXTERNALIZE | Plugin routes and non-page caches have different owners and safety semantics. | Preserve existing custom Nginx includes; warn and do not delete. |
 | Cloudflare real-IP trust | KEEP optional | Correct client IP is required for logs and rate limits behind the proxy. | Current implementation already avoids DNS/API/APO/cache control. |
@@ -88,7 +92,7 @@ Classification is about product ownership, not immediate deletion. Any row with 
 | `wp-shell mariadb audit` | KEEP | Same read-only effective/runtime/definition audit. |
 | `wp-shell mariadb migrate-legacy --confirm` | KEEP | Same conservative transactional migration. |
 | `wp-shell site ...` | KEEP | Primary lifecycle namespace. |
-| `wp-shell metrics ...` | REMOVE | Explicit migration handles timer; data retained. |
+| `wp-shell metrics ...` | REMOVE | No V11 collector or successful compatibility no-op; v10 remains untouched. |
 | `wp-shell list` | DEPRECATE | Alias to `site list` for v11; remove no earlier than v12. |
 | `wp-shell add-site` | DEPRECATE | Alias to `site add`. |
 | `wp-shell deploy DOMAIN` | DEPRECATE | Alias to `site deploy DOMAIN`. |
@@ -104,23 +108,23 @@ Classification is about product ownership, not immediate deletion. Any row with 
 | `wp-shell cron-run DOMAIN` | REMOVE | Unused legacy internal route; current Cron runs WP-CLI directly. |
 | `wp-shell ops run` | REMOVE | Cache-invalidation timer worker leaves with cache-auto. |
 | `wp-shell install-backup-timer` | DEPRECATE/EXTERNALIZE | Existing timer preserved; new installs do not create it. |
-| `wp-shell migrate` | KEEP/REPURPOSE | Becomes explicit `migrate v10 --confirm`; must not remain a no-op success message. |
-| `wp-shell legacy-vps ...` | KEEP for v11 | Internal compatibility wrapper target; warning, then route supported operations. |
-| `wp-shell legacy-single ...` | KEEP for v11 | Internal compatibility wrapper target; warning, then route unambiguous site operations. |
+| `wp-shell migrate` | REMOVE | V11 is fresh-deploy-first; known v10 footprints block writes and direct the operator to stable v10 or a fresh VPS. |
+| `wp-shell legacy-vps ...` | REMOVE | V11 does not expose an in-place legacy adoption route. Stable wrappers continue to target stable v10. |
+| `wp-shell legacy-single ...` | REMOVE | V11 does not reinterpret the legacy single-site entry point. Stable wrappers continue to target stable v10. |
 
 ## Metrics commands
 
 | Current command | Decision | Notes |
 |---|---|---|
 | `metrics collect` | REMOVE | No historical collector in v11. |
-| `metrics install` | REMOVE | Explicit migration disables the old timer; it does not delete units/data. |
-| `metrics status` | REMOVE | `status` reports whether deprecated units still exist/are active. |
+| `metrics install` | REMOVE | V11 does not create, disable or delete the old timer/units. |
+| `metrics status` | REMOVE | `status` reports only the fresh-deploy compatibility boundary. |
 
 ## Site namespace and actions
 
 | Current command/action | Decision | v11 destination / compatibility behavior |
 |---|---|---|
-| `site add` | KEEP | New site starts with one ondemand worker and explicit optional choices only. |
+| `site add` | KEEP | Initial pool sizing is deterministic and conservative: normal target 2, explicit WooCommerce target 3, reduced as needed by CPU and hard RAM admission; later changes are explicit. |
 | `site list` | KEEP | Show domain, path, PHP, mode, effective workers, and compatibility flags. |
 | `site status [DOMAIN]` | KEEP | Current health only; domain form becomes canonical `site DOMAIN status`. |
 | `site deploy DOMAIN` | KEEP | Idempotent Core deploy/repair with capacity preflight. |
@@ -219,7 +223,6 @@ wp-shell capacity
 wp-shell dry-run apply
 wp-shell apply --confirm
 wp-shell rollback [ID] --confirm
-wp-shell migrate v10 --confirm
 wp-shell site list
 wp-shell site add
 wp-shell site import

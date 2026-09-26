@@ -12,6 +12,14 @@ help_output="$($SCRIPT --help)"
 grep -Fq "EXPERIMENTAL V11 DEVELOPMENT - NOT FOR PRODUCTION" <<<"$help_output"
 grep -Fq "/usr/local/sbin/wp-shell-v11 and never replaces /usr/local/sbin/wp-shell" <<<"$help_output"
 grep -Fq "sudo env WP_SHELL_V11_EXPERIMENTAL=yes wp-shell-v11 COMMAND" <<<"$help_output"
+grep -Fq "sudo wp-shell-v11 capacity" <<<"$help_output"
+grep -Fq "site DOMAIN workers N [--confirm]" <<<"$help_output"
+grep -Fq "V11 is fresh-deploy-first" <<<"$help_output"
+grep -Fq "/etc/wp-vps-manager or /etc/wp-single-deploy footprints block all v11 writes" <<<"$help_output"
+if grep -Eq 'migrate v10|metrics collect' <<<"$help_output"; then
+    printf 'v11 must not advertise in-place metrics migration or a collector compatibility command.\n' >&2
+    exit 1
+fi
 
 set +e
 blocked_output="$($SCRIPT install 2>&1)"
@@ -26,5 +34,21 @@ if grep -Eq '/usr/local/(bin|sbin)/(wp-shell|wp-vps-manager|wp-single-manager)' 
     printf 'v11 install_self must not replace stable v10 entry points or wrappers.\n' >&2
     exit 1
 fi
+
+if grep -Eq '^init_metrics_database\(\)|^collect_metrics\(\)|^install_metrics_timer\(\)|^dashboard\(\)|^metrics_report\(\)|^analyze_metrics\(\)|^apply_tuning\(\)|^migrate_v10_metrics\(\)|^legacy_metrics_status\(\)' "$SCRIPT"; then
+    printf 'v11 S1 must not retain the legacy metrics/dashboard/automatic-tuning runtime.\n' >&2
+    exit 1
+fi
+if grep -Eq 'V10_METRICS_MIGRATION_FILE|LEGACY_METRICS_DB|v10-metrics-migration[.]v1' "$SCRIPT"; then
+    printf 'v11 must not retain the abandoned in-place metrics migration state.\n' >&2
+    exit 1
+fi
+if grep -Eq '^migrate_legacy_configs\(\)|^migrate_legacy_vps_config\(\)|^migrate_legacy_single_config\(\)|^legacy_single_command\(\)|legacy-vps|legacy-single' "$SCRIPT"; then
+    printf 'v11 must not retain legacy in-place adoption functions or routes.\n' >&2
+    exit 1
+fi
+
+[[ "$(sha256sum "$ROOT_DIR/wp-shell.sh" | awk '{print $1}')" == 926632c0bc629127f1b196c6ab64b62c519d17ad06bc7dae83cd464868a6a302 ]]
+[[ "$(sha256sum "$ROOT_DIR/legacy/wp-shell-v10.0.4.sh" | awk '{print $1}')" == 926632c0bc629127f1b196c6ab64b62c519d17ad06bc7dae83cd464868a6a302 ]]
 
 printf 'v11 bootstrap safety checks passed.\n'
