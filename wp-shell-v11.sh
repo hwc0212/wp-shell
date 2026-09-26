@@ -42,6 +42,9 @@ readonly MANAGED_SCRIPT="/usr/local/sbin/wp-shell-v11"
 readonly WP_CLI_VERSION="${WP_CLI_VERSION:-2.12.0}"
 readonly WORDPRESS_LOCALE="${WORDPRESS_LOCALE:-en_US}"
 readonly WORDPRESS_VERSION_API="https://api.wordpress.org/core/version-check/1.7/"
+readonly PHP_INITIAL_NORMAL_WORKERS=2
+readonly PHP_INITIAL_WOO_WORKERS=3
+readonly PHP_INITIAL_WORKERS_PER_CPU=2
 # Automatic deletion is opt-in. A zero value keeps every completed backup.
 readonly BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-0}"
 readonly TERMINAL_DEVICE="${WP_SHELL_TERMINAL_DEVICE:-/dev/tty}"
@@ -70,7 +73,6 @@ declare -A PHP_CHILD_OVERRIDES=()
 declare -A OPCACHE_MEMORY_OVERRIDES=()
 declare -A OPCACHE_STRINGS_OVERRIDES=()
 SITE_COUNT=0
-LEGACY_SINGLE_DOMAIN=""
 ENVIRONMENT_MODE=""
 DEFAULT_PHP_VERSION="8.3"
 ENVIRONMENT_UFW="no"
@@ -87,6 +89,7 @@ PHP_DEFAULT_POOL_WORKERS=1
 PHP_SAFE_AGGREGATE_WORKERS=0
 PHP_REQUESTED_AGGREGATE_WORKERS=0
 PHP_ESTIMATED_ALLOCATION_MB=0
+PHP_INITIAL_AUTO_WORKER_CEILING=0
 PHP_NORMAL_SITE_COUNT=0
 PHP_WOO_SITE_COUNT=0
 PHP_CAPACITY_ERROR=""
@@ -1048,98 +1051,6 @@ opcache_menu() {
     set_opcache "$version" "$memory" "$strings"
 }
 
-migrate_legacy_vps_config() {
-    local source="$LEGACY_VPS_CONFIG_DIR/sites.v2"
-    [[ -f "$source" ]] || return 1
-    local record domain php woo www redis_db admin_b64 email_b64 title_b64 path_b64 path mode
-    while IFS='|' read -r record domain php woo www redis_db admin_b64 email_b64 title_b64 path_b64; do
-        [[ "$record" == "site" ]] || continue
-        validate_domain "$domain" || die "Invalid domain in legacy configuration: $domain"
-        site_index_by_domain "$domain" >/dev/null 2>&1 && continue
-        path="/var/www/$domain/public"
-        [[ -n "$path_b64" ]] && path="$(b64_decode "$path_b64")"
-        mode="managed"
-        [[ "$path" == "/var/www/$domain/public" ]] || mode="imported"
-        SITE_COUNT=$((SITE_COUNT + 1))
-        SITE_DOMAINS[SITE_COUNT]="$domain"
-        SITE_PRIMARY_DOMAINS[SITE_COUNT]="$domain"
-        SITE_PHP_VERSIONS[SITE_COUNT]="$php"
-        SITE_WOOCOMMERCE[SITE_COUNT]="$woo"
-        SITE_WWW[SITE_COUNT]="$www"
-        SITE_REDIS_DATABASES[SITE_COUNT]="$redis_db"
-        SITE_MODES[SITE_COUNT]="$mode"
-        SITE_ADMIN_USERS[SITE_COUNT]="$(b64_decode "$admin_b64")"
-        SITE_ADMIN_EMAILS[SITE_COUNT]="$(b64_decode "$email_b64")"
-        SITE_TITLES[SITE_COUNT]="$(b64_decode "$title_b64")"
-        SITE_PATHS[SITE_COUNT]="$path"
-    done < "$source"
-    return 0
-}
-
-migrate_legacy_single_config() {
-    local source="$LEGACY_SINGLE_CONFIG_DIR/site.v2"
-    [[ -f "$source" ]] || return 1
-    local record version domain primary www php woo title_b64 email_b64 user_b64 redis_db
-    IFS='|' read -r record version domain primary www php woo title_b64 email_b64 user_b64 < "$source"
-    [[ "$record" == "site" && "$version" == "2" ]] || die "Invalid legacy single-site configuration."
-    validate_domain "$domain" || die "Invalid domain in legacy single-site configuration: $domain"
-    if site_index_by_domain "$domain" >/dev/null 2>&1; then
-        return 0
-    fi
-    LEGACY_SINGLE_DOMAIN="$domain"
-    if [[ "$primary" != "$domain" && "$primary" != "www.$domain" ]]; then
-        primary="$domain"
-    fi
-    [[ "$primary" == "www.$domain" ]] && www=yes
-    redis_db="$(first_available_redis_database)" || die "No Redis database is available for $domain"
-    SITE_COUNT=$((SITE_COUNT + 1))
-    SITE_DOMAINS[SITE_COUNT]="$domain"
-    SITE_PRIMARY_DOMAINS[SITE_COUNT]="$primary"
-    SITE_PHP_VERSIONS[SITE_COUNT]="$php"
-    SITE_WOOCOMMERCE[SITE_COUNT]="$woo"
-    SITE_WWW[SITE_COUNT]="$www"
-    SITE_REDIS_DATABASES[SITE_COUNT]="$redis_db"
-    SITE_MODES[SITE_COUNT]="managed"
-    SITE_ADMIN_USERS[SITE_COUNT]="$(b64_decode "$user_b64")"
-    SITE_ADMIN_EMAILS[SITE_COUNT]="$(b64_decode "$email_b64")"
-    SITE_TITLES[SITE_COUNT]="$(b64_decode "$title_b64")"
-    SITE_PATHS[SITE_COUNT]="/var/www/$domain/public"
-}
-
-migrate_legacy_configs() {
-    [[ -f "$SITES_CONFIG_FILE" ]] && return 0
-    reset_sites
-    local migrated="no" timestamp backup_dir database_file
-    migrate_legacy_vps_config && migrated="yes"
-    migrate_legacy_single_config && migrated="yes"
-    [[ "$migrated" == "yes" ]] || return 0
-
-    timestamp="$(date +%Y%m%d-%H%M%S)"
-    backup_dir="$CONFIG_DIR/migration-backup/$timestamp"
-    install -d -m 0700 "$backup_dir"
-    [[ -d "$LEGACY_VPS_CONFIG_DIR" ]] && cp -a "$LEGACY_VPS_CONFIG_DIR" "$backup_dir/wp-vps-manager"
-    [[ -d "$LEGACY_SINGLE_CONFIG_DIR" ]] && cp -a "$LEGACY_SINGLE_CONFIG_DIR" "$backup_dir/wp-single-deploy"
-
-    for database_file in "$LEGACY_VPS_CONFIG_DIR"/databases/*.v1; do
-        [[ -f "$database_file" ]] || continue
-        install_private_file "$database_file" "$DATABASE_CONFIG_DIR/$(basename "$database_file")"
-    done
-    if [[ -f "$LEGACY_SINGLE_CONFIG_DIR/database.v1" ]]; then
-        [[ -n "$LEGACY_SINGLE_DOMAIN" && ! -f "$DATABASE_CONFIG_DIR/$LEGACY_SINGLE_DOMAIN.v1" ]] && install_private_file \
-            "$LEGACY_SINGLE_CONFIG_DIR/database.v1" \
-            "$DATABASE_CONFIG_DIR/$LEGACY_SINGLE_DOMAIN.v1"
-    fi
-    if [[ ! -f "$REDIS_SECRET_FILE" ]]; then
-        if [[ -f "$LEGACY_VPS_CONFIG_DIR/redis.secret" ]]; then
-            install_private_file "$LEGACY_VPS_CONFIG_DIR/redis.secret" "$REDIS_SECRET_FILE"
-        elif [[ -f "$LEGACY_SINGLE_CONFIG_DIR/redis.secret" ]]; then
-            install_private_file "$LEGACY_SINGLE_CONFIG_DIR/redis.secret" "$REDIS_SECRET_FILE"
-        fi
-    fi
-    save_sites_config
-    log_message SUCCESS "Migrated $SITE_COUNT site(s) to $SITES_CONFIG_FILE. Legacy files were preserved in $backup_dir."
-}
-
 memory_mb() {
     awk '/^MemTotal:/ {print int($2 / 1024)}' "$PROC_ROOT/meminfo"
 }
@@ -1240,7 +1151,11 @@ php_capacity_failure_message() {
     printf 'Swap: total %sMB, used %sMB (emergency protection only; not counted as worker capacity)\n' "$(swap_memory_mb)" "$(swap_used_mb)"
     printf 'PHP total worker budget: %sMB\n' "$PHP_TOTAL_BUDGET_MB"
     printf 'Worker memory estimate: %sMB (%s)\n' "$PHP_WORKER_ESTIMATE_MB" "$PHP_WORKER_EVIDENCE"
-    printf 'Sites: %s total; normal=%s; WooCommerce=%s (reported only; manual worker limits are not auto-weighted)\n' "$SITE_COUNT" "$PHP_NORMAL_SITE_COUNT" "$PHP_WOO_SITE_COUNT"
+    printf 'Sites: %s total; normal=%s initial-target=%s; WooCommerce=%s initial-target=%s\n' \
+        "$SITE_COUNT" "$PHP_NORMAL_SITE_COUNT" "$PHP_INITIAL_NORMAL_WORKERS" \
+        "$PHP_WOO_SITE_COUNT" "$PHP_INITIAL_WOO_WORKERS"
+    printf 'Initial automatic site-worker ceiling: %s (at most %s worker slots per CPU; one per site remains the hard minimum)\n' \
+        "$PHP_INITIAL_AUTO_WORKER_CEILING" "$PHP_INITIAL_WORKERS_PER_CPU"
     printf 'Sites involved: %s\n' "$(php_site_capacity_summary)"
     printf 'Requested aggregate workers: %s (includes %s one-worker default PHP pool reserve(s))\n' "$PHP_REQUESTED_AGGREGATE_WORKERS" "$PHP_DEFAULT_POOL_WORKERS"
     printf 'Safely available aggregate workers: %s\n' "$PHP_SAFE_AGGREGATE_WORKERS"
@@ -1324,11 +1239,13 @@ calculate_resource_budget() {
 }
 
 calculate_site_php_allocations() {
-    local i children domain requested
+    local i children domain requested target remaining progress level cores
+    local unoverridden=0 auto_workers=0 override_workers=0 memory_auto_ceiling
     SITE_PHP_MAX_CHILDREN=()
     PHP_CAPACITY_ERROR=""
     PHP_REQUESTED_AGGREGATE_WORKERS=0
     PHP_ESTIMATED_ALLOCATION_MB=0
+    PHP_INITIAL_AUTO_WORKER_CEILING=0
     PHP_NORMAL_SITE_COUNT=0
     PHP_WOO_SITE_COUNT=0
     php_worker_memory_estimate
@@ -1350,9 +1267,12 @@ calculate_site_php_allocations() {
                 return 1
             fi
             requested=$((requested + children))
+            override_workers=$((override_workers + children))
             SITE_PHP_MAX_CHILDREN[i]="$children"
         else
             requested=$((requested + 1))
+            unoverridden=$((unoverridden + 1))
+            auto_workers=$((auto_workers + 1))
             SITE_PHP_MAX_CHILDREN[i]=1
         fi
     done
@@ -1362,6 +1282,50 @@ calculate_site_php_allocations() {
         SITE_PHP_MAX_CHILDREN=()
         return 1
     fi
+
+    # Initial sizing is deterministic and intentionally small. It gives a
+    # normal WordPress site up to two workers and an explicitly identified
+    # WooCommerce site up to three, but never fills every memory-safe slot.
+    # Extra automatic concurrency is limited to two site workers per CPU.
+    # The one-worker-per-site floor may exceed that CPU target when many cold
+    # sites share a host; in that case no automatic extras are added.
+    cores="$(cpu_count)"
+    [[ "$cores" =~ ^[1-9][0-9]*$ ]] || cores=1
+    PHP_INITIAL_AUTO_WORKER_CEILING=$((cores * PHP_INITIAL_WORKERS_PER_CPU))
+    ((unoverridden > 0)) || PHP_INITIAL_AUTO_WORKER_CEILING=0
+    ((PHP_INITIAL_AUTO_WORKER_CEILING < unoverridden)) &&
+        PHP_INITIAL_AUTO_WORKER_CEILING="$unoverridden"
+    memory_auto_ceiling=$((PHP_SAFE_AGGREGATE_WORKERS - PHP_DEFAULT_POOL_WORKERS - override_workers))
+    ((memory_auto_ceiling < unoverridden)) && memory_auto_ceiling="$unoverridden"
+    ((PHP_INITIAL_AUTO_WORKER_CEILING > memory_auto_ceiling)) &&
+        PHP_INITIAL_AUTO_WORKER_CEILING="$memory_auto_ceiling"
+    remaining=$((PHP_INITIAL_AUTO_WORKER_CEILING - auto_workers))
+
+    # First make every unoverridden site practical at two workers, then grant
+    # the third worker only to explicit WooCommerce sites. Array order is the
+    # stable sites.v3 order; neither phase can cross the CPU or memory ceiling.
+    for level in 2 3; do
+        progress=no
+        for ((i = 1; i <= SITE_COUNT && remaining > 0; i++)); do
+            domain="${SITE_DOMAINS[$i]}"
+            [[ -z "${PHP_CHILD_OVERRIDES[$domain]:-}" ]] || continue
+            target="$PHP_INITIAL_NORMAL_WORKERS"
+            [[ "${SITE_WOOCOMMERCE[$i]}" == yes ]] && target="$PHP_INITIAL_WOO_WORKERS"
+            ((level <= target)) || continue
+            children="${SITE_PHP_MAX_CHILDREN[$i]}"
+            ((children < level)) || continue
+            SITE_PHP_MAX_CHILDREN[i]="$level"
+            remaining=$((remaining - 1))
+            progress=yes
+        done
+        [[ "$progress" == yes || "$remaining" -eq 0 ]] || break
+    done
+
+    requested="$PHP_DEFAULT_POOL_WORKERS"
+    for ((i = 1; i <= SITE_COUNT; i++)); do
+        requested=$((requested + SITE_PHP_MAX_CHILDREN[i]))
+    done
+    PHP_REQUESTED_AGGREGATE_WORKERS="$requested"
     PHP_ESTIMATED_ALLOCATION_MB=$((requested * PHP_WORKER_ESTIMATE_MB))
     if ((PHP_ESTIMATED_ALLOCATION_MB > PHP_TOTAL_BUDGET_MB)); then
         PHP_CAPACITY_ERROR="$(php_capacity_failure_message "Internal allocation invariant violation: estimated aggregate worker memory exceeds the hard budget.")"
@@ -1492,7 +1456,7 @@ php_capacity_status_report() {
     printf '\n%-32s %-5s %-8s %-9s %-7s\n' Domain PHP Desired Managed Effective
     for ((i=1; i<=SITE_COUNT; i++)); do
         domain="${SITE_DOMAINS[$i]}"; version="${SITE_PHP_VERSIONS[$i]}"
-        desired="${PHP_CHILD_OVERRIDES[$domain]:-1}"
+        desired="${PHP_CHILD_OVERRIDES[$domain]:-initial}"
         managed="$(read_managed_site_pool_limit "$domain" "$version" 2>/dev/null || printf UNKNOWN)"
         effective="$(read_effective_site_pool_limit "$domain" "$version" 2>/dev/null || printf UNKNOWN)"
         printf '%-32s %-5s %-8s %-9s %-7s\n' "$domain" "$version" "$desired" "$managed" "$effective"
@@ -5153,11 +5117,13 @@ v10_host_footprint_details() {
         detected=yes
     fi
     for path in \
+        "$LEGACY_VPS_CONFIG_DIR" \
+        "$LEGACY_SINGLE_CONFIG_DIR" \
         "$STATE_DIR/metrics.sqlite3" \
         "$unit_dir/wp-shell-metrics.service" \
         "$unit_dir/wp-shell-metrics.timer"; do
         if [[ -e "$path" || -L "$path" ]]; then
-            printf 'legacy v10 artifact: %s\n' "$path"
+            printf 'legacy wp-shell artifact: %s\n' "$path"
             detected=yes
         fi
     done
@@ -5657,7 +5623,7 @@ control_plane_status() {
     printf 'Timers: backup=%s certificate=%s Cloudflare=%s\n' \
         "$(service_state wp-shell-backup.timer)" \
         "$(service_state certbot.timer)" "$(service_state wp-shell-cloudflare-ips.timer)"
-    printf 'V10 compatibility boundary: %s\n' "$(v10_host_footprint_summary)"
+    printf 'V10/legacy compatibility boundary: %s\n' "$(v10_host_footprint_summary)"
     printf 'Failed units: '
     systemctl --failed --no-legend --plain 2>/dev/null | awk 'END{print NR+0}'
     printf 'Last transaction: %s\n' "$(if [[ -s "$LAST_TRANSACTION_FILE" ]]; then head -n1 "$LAST_TRANSACTION_FILE"; else printf none; fi)"
@@ -6239,7 +6205,8 @@ Site actions: status, info, summary, core-verify, core-repair, cache-clear,
 backup, backups, restore, update --confirm-updates, restart. Historical dashboard,
 report, analyze, automatic tune, and metrics commands are intentionally retired.
 V11 is fresh-deploy-first. It never migrates, deletes, disables, or adopts v10
-metrics/configuration state in place; detected v10 footprints block all v11 writes.
+or legacy configuration state in place; detected v10 metrics/entrypoint and
+/etc/wp-vps-manager or /etc/wp-single-deploy footprints block all v11 writes.
 EOF
 }
 
@@ -6279,28 +6246,6 @@ site_command() {
     esac
 }
 
-legacy_single_command() {
-    local command="${1:-deploy}" domain="" record version legacy_domain _rest
-    ((SITE_COUNT > 0)) || { new_server_wizard; return; }
-    if [[ -r "$LEGACY_SINGLE_CONFIG_DIR/site.v2" ]]; then
-        IFS='|' read -r record version legacy_domain _rest < "$LEGACY_SINGLE_CONFIG_DIR/site.v2"
-        if [[ "$record" == "site" && "$version" == "2" ]] && site_index_by_domain "$legacy_domain" >/dev/null 2>&1; then
-            domain="$legacy_domain"
-        fi
-    fi
-    if [[ -z "$domain" && "$SITE_COUNT" -eq 1 ]]; then
-        domain="${SITE_DOMAINS[1]}"
-    fi
-    [[ -n "$domain" ]] || die "The legacy single-site command is ambiguous; use 'wp-shell-v11 site DOMAIN|ID ACTION'."
-    case "$command" in
-        deploy|--reconfigure) deploy_domain "$domain" ;;
-        manage) site_action "$domain" "${2:-status}" "${3:-}" ;;
-        --version|-v) printf 'wp-shell %s\n' "$WP_SHELL_VERSION" ;;
-        --help|-h) show_help ;;
-        *) die "Unknown legacy single-site command: $command" ;;
-    esac
-}
-
 execute_command() {
     local command="${1:-}"
     case "$command" in
@@ -6333,8 +6278,6 @@ execute_command() {
         cron-run) [[ -n "${2:-}" ]] || die "A managed domain is required."; run_site_cron "$2" ;;
         ops) [[ "${2:-}" == run ]] || die "Use ops run."; run_operations ;;
         install-backup-timer) install_self; install_backup_timer ;;
-        legacy-vps) shift; execute_command "$@" ;;
-        legacy-single) shift; legacy_single_command "$@" ;;
         *) die "Unknown command: $command. Use --help for usage." ;;
     esac
 }
@@ -6360,9 +6303,6 @@ require_v11_development_mutation_opt_in() {
 }
 
 main() {
-    if [[ "$(basename "$0")" == "wp-single-manager" ]]; then
-        set -- legacy-single "$@"
-    fi
     case "${1:-}" in
         --help|-h) show_help; return ;;
         --version|-v) printf 'wp-shell %s\n' "$WP_SHELL_VERSION"; return ;;
@@ -6397,7 +6337,6 @@ main() {
             else
                 init_runtime
                 TRANSACTION_CONTEXT=yes
-                migrate_legacy_configs
                 load_sites_config
                 ensure_environment_config
                 load_tuning_config
@@ -6408,7 +6347,6 @@ main() {
             ;;
         cron-run|ops)
             init_paths
-            migrate_legacy_configs
             load_sites_config
             ensure_environment_config
             load_tuning_config
@@ -6418,7 +6356,6 @@ main() {
         *)
             init_runtime
             TRANSACTION_CONTEXT=yes
-            migrate_legacy_configs
             load_sites_config
             ensure_environment_config
             load_tuning_config

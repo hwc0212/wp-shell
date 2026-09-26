@@ -50,7 +50,9 @@ declare -A TEST_EFFECTIVE=(
 )
 
 TEST_PHP_VERSIONS=$'8.3\n'
+TEST_CPU_COUNT=2
 unique_php_versions() { printf '%s' "$TEST_PHP_VERSIONS"; }
+cpu_count() { printf '%s' "$TEST_CPU_COUNT"; }
 opcache_effective_values() { printf '128 16\n'; }
 read_effective_default_pool_limit() { printf '1'; }
 read_effective_site_pool_limit() {
@@ -107,16 +109,20 @@ write_meminfo 2048 2048 1024
 calculate_resource_budget_values quiet effective
 [[ "$PHP_TOTAL_BUDGET_MB" == "$budget_without_swap" ]]
 
-# S1 does not auto-fill spare slots and WooCommerce does not receive an implicit weight.
+# Initial sizing is useful but conservative: two workers for a normal site and
+# up to three for explicit WooCommerce, bounded here to four automatic site
+# workers by two CPUs. It does not consume every memory-safe slot.
 calculate_site_php_allocations
-[[ "${SITE_PHP_MAX_CHILDREN[1]}" == 1 ]]
-[[ "${SITE_PHP_MAX_CHILDREN[2]}" == 1 ]]
-[[ "$PHP_REQUESTED_AGGREGATE_WORKERS" == 3 ]]
+[[ "${SITE_PHP_MAX_CHILDREN[1]}" == 2 ]]
+[[ "${SITE_PHP_MAX_CHILDREN[2]}" == 2 ]]
+[[ "$PHP_INITIAL_AUTO_WORKER_CEILING" == 4 ]]
+[[ "$PHP_REQUESTED_AGGREGATE_WORKERS" == 5 ]]
+((PHP_REQUESTED_AGGREGATE_WORKERS < PHP_SAFE_AGGREGATE_WORKERS))
 PHP_CHILD_OVERRIDES["one.example.com"]=3
 calculate_site_php_allocations
 [[ "${SITE_PHP_MAX_CHILDREN[1]}" == 3 ]]
-[[ "${SITE_PHP_MAX_CHILDREN[2]}" == 1 ]]
-[[ "$PHP_REQUESTED_AGGREGATE_WORKERS" == 5 ]]
+[[ "${SITE_PHP_MAX_CHILDREN[2]}" == 2 ]]
+[[ "$PHP_REQUESTED_AGGREGATE_WORKERS" == 6 ]]
 
 # Capacity is strictly current-state and read-only.
 PHP_CHILD_OVERRIDES=()
@@ -129,8 +135,10 @@ grep -Fq 'Aggregate effective workers: 6' <<< "$capacity_output"
 grep -Fq 'Swap: total=2048MB used=1024MB' <<< "$capacity_output"
 grep -Fq 'Effective OPcache: PHP 8.3 memory=128MB strings=16MB' <<< "$capacity_output"
 
-# Matrix: successful profiles always satisfy the hard invariant; a 1GB host is
-# conservatively refused when the default pool plus one site cannot fit.
+# Matrix: practical initial defaults are deterministic across 1/2/4/8/16GB,
+# site types and site counts. Every success satisfies both the CPU policy and
+# hard aggregate memory invariant. A 1GB host is conservatively refused when
+# even the default pool plus one site cannot fit; Swap does not change that.
 model_sites() {
     local count="$1" mix="$2" imported_last="${3:-no}" i domain
     SITE_COUNT="$count"
@@ -149,24 +157,47 @@ model_sites() {
     [[ "$imported_last" != yes ]] || SITE_MODES[$count]=imported
 }
 
-for profile in '2048 2 normal' '2048 2 woo' '4096 4 mixed' '8192 8 woo' '16384 12 mixed'; do
-    read -r profile_ram profile_sites profile_mix <<< "$profile"
-    model_sites "$profile_sites" "$profile_mix"
+assert_initial_profile() {
+    local ram="$1" cpus="$2" count="$3" mix="$4" expected="$5" actual i
+    model_sites "$count" "$mix"
     TEST_PHP_VERSIONS=$'8.3\n'
-    write_meminfo "$profile_ram" 0 0
+    TEST_CPU_COUNT="$cpus"
+    write_meminfo "$ram" 0 0
     calculate_resource_budget quiet
+    actual=""
+    for ((i=1; i<=SITE_COUNT; i++)); do
+        actual+="${actual:+,}${SITE_PHP_MAX_CHILDREN[$i]}"
+    done
+    [[ "$actual" == "$expected" ]]
     ((PHP_ESTIMATED_ALLOCATION_MB <= PHP_TOTAL_BUDGET_MB))
+    ((PHP_REQUESTED_AGGREGATE_WORKERS <= PHP_SAFE_AGGREGATE_WORKERS))
+    ((PHP_INITIAL_AUTO_WORKER_CEILING <= cpus * PHP_INITIAL_WORKERS_PER_CPU || SITE_COUNT > cpus * PHP_INITIAL_WORKERS_PER_CPU))
+}
+
+for one_gb_mix in normal woo; do
+    model_sites 1 "$one_gb_mix"
+    TEST_CPU_COUNT=1
+    write_meminfo 1024 0 0
+    if calculate_resource_budget quiet advisory; then one_gb_status=0; else one_gb_status=$?; fi
+    [[ "$one_gb_status" -ne 0 ]]
+    grep -Fq 'cannot fit the PHP worker budget' <<< "$PHP_CAPACITY_ERROR"
 done
-model_sites 1 normal
-write_meminfo 1024 0 0
-if calculate_resource_budget quiet advisory; then one_gb_status=0; else one_gb_status=$?; fi
-[[ "$one_gb_status" -ne 0 ]]
-grep -Fq 'cannot fit the PHP worker budget' <<< "$PHP_CAPACITY_ERROR"
+
+assert_initial_profile 2048 2 1 normal 2
+assert_initial_profile 2048 2 1 woo 3
+assert_initial_profile 2048 2 2 normal 2,2
+assert_initial_profile 2048 2 2 woo 2,2
+assert_initial_profile 2048 2 2 mixed 2,2
+assert_initial_profile 4096 2 2 mixed 2,2
+assert_initial_profile 8192 4 3 mixed 2,3,2
+assert_initial_profile 16384 8 6 mixed 2,3,2,3,2,3
+((PHP_REQUESTED_AGGREGATE_WORKERS < PHP_SAFE_AGGREGATE_WORKERS))
 
 # Multiple PHP versions reserve an effective default pool and OPcache per version.
 model_sites 2 mixed
 SITE_PHP_VERSIONS[2]=8.4
 TEST_PHP_VERSIONS=$'8.3\n8.4\n'
+TEST_CPU_COUNT=2
 write_meminfo 4096 256 256
 calculate_resource_budget quiet
 [[ "$PHP_DEFAULT_POOL_WORKERS" == 2 ]]
@@ -177,9 +208,10 @@ calculate_resource_budget quiet
 # overrides cannot pass merely because each per-site value is within 1..50.
 model_sites 3 mixed yes
 TEST_PHP_VERSIONS=$'8.3\n'
+TEST_CPU_COUNT=2
 write_meminfo 2048 2048 2048
 calculate_resource_budget quiet
-[[ "$PHP_REQUESTED_AGGREGATE_WORKERS" == 4 ]]
+[[ "$PHP_REQUESTED_AGGREGATE_WORKERS" == 5 ]]
 PHP_CHILD_OVERRIDES["site1.example.com"]=50
 PHP_CHILD_OVERRIDES["site2.example.com"]=50
 if calculate_resource_budget quiet advisory; then override_status=0; else override_status=$?; fi

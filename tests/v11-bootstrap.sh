@@ -15,7 +15,7 @@ grep -Fq "sudo env WP_SHELL_V11_EXPERIMENTAL=yes wp-shell-v11 COMMAND" <<<"$help
 grep -Fq "sudo wp-shell-v11 capacity" <<<"$help_output"
 grep -Fq "site DOMAIN workers N [--confirm]" <<<"$help_output"
 grep -Fq "V11 is fresh-deploy-first" <<<"$help_output"
-grep -Fq "detected v10 footprints block all v11 writes" <<<"$help_output"
+grep -Fq "/etc/wp-vps-manager or /etc/wp-single-deploy footprints block all v11 writes" <<<"$help_output"
 if grep -Eq 'migrate v10|metrics collect' <<<"$help_output"; then
     printf 'v11 must not advertise in-place metrics migration or a collector compatibility command.\n' >&2
     exit 1
@@ -41,6 +41,10 @@ if grep -Eq '^init_metrics_database\(\)|^collect_metrics\(\)|^install_metrics_ti
 fi
 if grep -Eq 'V10_METRICS_MIGRATION_FILE|LEGACY_METRICS_DB|v10-metrics-migration[.]v1' "$SCRIPT"; then
     printf 'v11 must not retain the abandoned in-place metrics migration state.\n' >&2
+    exit 1
+fi
+if grep -Eq '^migrate_legacy_configs\(\)|^migrate_legacy_vps_config\(\)|^migrate_legacy_single_config\(\)|^legacy_single_command\(\)|legacy-vps|legacy-single' "$SCRIPT"; then
+    printf 'v11 must not retain legacy in-place adoption functions or routes.\n' >&2
     exit 1
 fi
 

@@ -61,7 +61,11 @@ S1 removes metrics/dashboard/automatic tuning. Before that deletion lands, tests
 
 ### Manual workers and hard admission
 
-- A new low-traffic site may receive one ondemand worker.
+- Initial sizing targets 2 ondemand workers for normal WordPress and 3 for an
+  explicit WooCommerce site, but CPU and hard RAM admission may reduce a site
+  to one worker or refuse an unsafe host.
+- 1/2/4/8/16GB matrices prove normal, WooCommerce and mixed-site defaults,
+  the CPU ceiling, non-use of Swap and the aggregate memory invariant.
 - Aggregate manual overrides are validated together, including values that are individually valid but collectively exceed budget.
 - Imported sites run admission before `sites.v3`, credentials, policy, users, pools, Nginx or service writes.
 - `site DOMAIN workers N --confirm` fails before pool writes/reload when unsafe.

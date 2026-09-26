@@ -32,10 +32,12 @@ Fresh deployment is the smaller and safer boundary:
 ## Detection and fail-closed behavior
 
 Before any V11 mutating command initializes runtime paths or a transaction, it
-checks for small, high-confidence legacy footprints:
+checks for high-confidence legacy footprints:
 
 - an existing stable `/usr/local/sbin/wp-shell` together with
   `/etc/wp-shell/environment.v1` or `/etc/wp-shell/sites.v3`;
+- the recognized `/etc/wp-vps-manager` configuration tree;
+- the recognized `/etc/wp-single-deploy` configuration tree;
 - `/var/lib/wp-shell/metrics.sqlite3`;
 - `wp-shell-metrics.service` or `wp-shell-metrics.timer` unit files.
 
@@ -61,6 +63,8 @@ V11-A has no:
 - `v10-metrics-migration.v1` record;
 - metrics unit enabled/active-state capture or restoration;
 - automatic adoption of effective pools into `tuning.v1`;
+- automatic `sites.v2`/`site.v2`, database-config or Redis-secret migration;
+- `legacy-vps`, `legacy-single` or `wp-single-manager` dispatcher route;
 - `metrics collect` compatibility success/no-op;
 - SQLite metrics schema, collector, dashboard, analyzer or automatic tuner.
 
@@ -85,8 +89,11 @@ The regression suite proves that:
 4. V10 files, units, historical data and administrator files remain
    byte-identical;
 5. no manual tuning state is synthesized or adopted;
-6. removal of all test-only footprints permits the fresh-deploy path;
-7. no metrics producer manipulation, migration command/record, SQLite runtime,
+6. `/etc/wp-vps-manager` and `/etc/wp-single-deploy` independently block all
+   writes without creating `sites.v3`, database config, Redis state or a
+   migration backup;
+7. removal of all test-only footprints permits the fresh-deploy path;
+8. no metrics producer manipulation, migration command/record, SQLite runtime,
    dashboard or automatic tuner remains.
 
 There is deliberately no rollback procedure for V10 adoption because V11 does

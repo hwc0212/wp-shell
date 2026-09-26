@@ -47,18 +47,37 @@ The host estimate is `ceil(max_current_worker_PSS * 1.25)` with a 96MB floor. Cu
 
 An exact repeated request does not create a transaction or reload PHP. A later administrator override blocks the write and remains byte-identical.
 
+## Conservative initial sizing
+
+Removing historical auto-tuning does not reduce every fresh site to a
+single-worker performance baseline. For sites without an explicit manual
+override, V11 starts from one worker each, then deterministically targets:
+
+- 2 ondemand workers for normal WordPress;
+- 3 ondemand workers only for an explicitly selected WooCommerce site.
+
+Automatic site concurrency stops at two worker slots per CPU and never exceeds
+the aggregate hard RAM budget after default pools, current PSS estimate and all
+other reserves. When the site count already exceeds that CPU target, each site
+keeps only its one-worker minimum; no extra slots are assigned. Explicit manual
+overrides are not silently CPU-clamped, but still must pass the whole-host hard
+memory admission. Swap never raises either limit. There is no history,
+recommendation loop or later automatic resizing.
+
 ## Fresh-deploy v10 boundary
 
 V11-A deliberately has no in-place v10 metrics migration. Before any mutating
-command creates runtime paths, logs or a transaction, a small read-only guard
-checks for a stable v10 entry point plus managed configuration and for known v10
-metrics database/unit artifacts. Detection blocks the write and recommends
+command creates runtime paths, logs or a transaction, a read-only guard checks
+for a stable v10 entry point plus managed configuration, both recognized legacy
+configuration trees, and known v10 metrics database/unit artifacts. Detection blocks the write and recommends
 continuing stable v10 or using a fresh VPS plus a reviewed WordPress migration
 plugin/provider snapshot.
 
 The guard never executes the old script, calls `systemctl`, adopts pool values,
 creates a migration record, or deletes/disables historical state. Read-only
 status, audit and capacity remain available. See `06-V10-V11-MIGRATION.md`.
+The V11 runtime contains no legacy config migration function, compatibility
+dispatcher route, or basename-triggered single-site adoption behavior.
 
 ## Removed runtime responsibilities
 
@@ -81,10 +100,10 @@ Measured against v11 base `40844a7e46006057721686d329acd53388f2e619`:
 
 | Measure | v11 base | S1 implementation | Change |
 |---|---:|---:|---:|
-| `wp-shell-v11.sh` lines | 7,326 | 6,434 | -892 (-12.2%) |
-| Runtime bytes | 349,060 | 299,883 | -49,177 (-14.1%) |
-| Shell functions | 322 | 307 | -15 |
-| Documented public CLI forms | 60 | 56 | -4 |
+| `wp-shell-v11.sh` lines | 7,326 | 6,371 | -955 (-13.0%) |
+| Runtime bytes | 349,060 | 297,196 | -51,864 (-14.9%) |
+| Shell functions | 322 | 303 | -19 |
+| Documented public CLI forms | 60 | 54 | -6 |
 | SQLite tables owned | 6 | 0 | -6 |
 | Metrics producer units created on clean install | 2 | 0 | -2 |
 | Embedded curses applications | 1 | 0 | -1 |
@@ -103,12 +122,12 @@ Python remains a clean-v11 dependency because retained Cloudflare CIDR/address v
 
 ## Verification map
 
-- `tests/v11-capacity.sh`: 1/2/4/8/16GB profiles, normal/WooCommerce/mixed/imported sites, zero/nonzero Swap, multiple PHP versions, aggregate overrides, current PSS upward-only and read-only/unknown/overcommit behavior.
+- `tests/v11-capacity.sh`: exact conservative initial sizing across 1/2/4/8/16GB profiles, normal/WooCommerce/mixed/imported sites, CPU ceilings, zero/nonzero Swap, multiple PHP versions, aggregate overrides, current PSS upward-only and read-only/unknown/overcommit behavior.
 - `tests/v11-manual-workers.sh`: preview zero-write, aggregate refusal, exact target-only change, administrator override, post-write mismatch, reload-failure rollback and idempotent no-reload.
-- `tests/v11-fresh-deploy-boundary.sh`: read-only v10-footprint detection,
+- `tests/v11-fresh-deploy-boundary.sh`: read-only v10/legacy-footprint detection,
   pre-runtime mutation refusal, byte-identical historical/admin artifacts, no
-  synthesized tuning state, fresh-host admission and complete removal of the
-  in-place metrics migration/collector surface.
+  synthesized tuning/sites/database/Redis state, fresh-host admission and
+  complete removal of in-place metrics and legacy-config migration surfaces.
 - `tests/v11-fpm-integration.sh`: real Ubuntu 24.04 `php-fpm8.3 -t/-tt`, confirmed transaction and later administrator override detection.
 
 Existing v10 test suites remain because stable v10 behavior is intentionally unchanged. No test is weakened to make v11 pass.

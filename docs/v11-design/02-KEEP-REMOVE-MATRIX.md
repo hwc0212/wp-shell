@@ -26,7 +26,7 @@ their state.
 | Imported-site discovery/admission | KEEP | Core lifecycle behavior with important no-partial-persist guarantees. | Read v3 and legacy state; do not infer plugin settings. |
 | Effective PHP-FPM semantic validation | KEEP | Required to prove pool limits after include precedence. | Preserve fail-closed `php-fpm -tt` checks. |
 | Hard aggregate PHP memory admission | KEEP | Host survival requirement. | Preserve Swap-not-RAM and aggregate override checks. |
-| Automatic weighted slot distribution | REMOVE | It is an automatic optimizer. New sites start at one ondemand worker; operators make explicit changes. | Stable v10 remains responsible for the existing host; V11 does not adopt limits in place. |
+| Unbounded weighted slot distribution | REMOVE | V11 uses only a small deterministic install baseline: normal sites target 2 workers, explicit WooCommerce sites target 3, and automatic site concurrency is capped by CPU plus the hard RAM admission. It never fills all safe slots. Later changes are manual. | Stable v10 remains responsible for the existing host; V11 does not adopt limits in place. |
 | Historical PSS estimator | MERGE | Replace DB history with baseline plus current PSS that can only raise the estimate. | Existing metrics are not read or imported by V11. |
 | SQLite metrics collector/history | REMOVE | Monitoring database is outside installer/basic-ops scope. | V11 does not stop/delete the producer or data; a known v10 footprint blocks V11 writes. |
 | Terminal dashboard | REMOVE | Depends entirely on historical metrics and embedded curses UI. | Command warns with replacement `status/audit/capacity` during compatibility period. |
@@ -109,8 +109,8 @@ their state.
 | `wp-shell ops run` | REMOVE | Cache-invalidation timer worker leaves with cache-auto. |
 | `wp-shell install-backup-timer` | DEPRECATE/EXTERNALIZE | Existing timer preserved; new installs do not create it. |
 | `wp-shell migrate` | REMOVE | V11 is fresh-deploy-first; known v10 footprints block writes and direct the operator to stable v10 or a fresh VPS. |
-| `wp-shell legacy-vps ...` | KEEP for v11 | Internal compatibility wrapper target; warning, then route supported operations. |
-| `wp-shell legacy-single ...` | KEEP for v11 | Internal compatibility wrapper target; warning, then route unambiguous site operations. |
+| `wp-shell legacy-vps ...` | REMOVE | V11 does not expose an in-place legacy adoption route. Stable wrappers continue to target stable v10. |
+| `wp-shell legacy-single ...` | REMOVE | V11 does not reinterpret the legacy single-site entry point. Stable wrappers continue to target stable v10. |
 
 ## Metrics commands
 
@@ -124,7 +124,7 @@ their state.
 
 | Current command/action | Decision | v11 destination / compatibility behavior |
 |---|---|---|
-| `site add` | KEEP | New site starts with one ondemand worker and explicit optional choices only. |
+| `site add` | KEEP | Initial pool sizing is deterministic and conservative: normal target 2, explicit WooCommerce target 3, reduced as needed by CPU and hard RAM admission; later changes are explicit. |
 | `site list` | KEEP | Show domain, path, PHP, mode, effective workers, and compatibility flags. |
 | `site status [DOMAIN]` | KEEP | Current health only; domain form becomes canonical `site DOMAIN status`. |
 | `site deploy DOMAIN` | KEEP | Idempotent Core deploy/repair with capacity preflight. |
